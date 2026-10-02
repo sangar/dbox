@@ -1,0 +1,29 @@
+# Two MinIO instances so migrating between stores can be tried locally.
+# minio-a: API http://localhost:9200, console http://localhost:9201
+# minio-b: API http://localhost:9300, console http://localhost:9301
+# Both use minioadmin / minioadmin. `make minio` starts them and creates a "dbox" bucket in each.
+services:
+  minio-a:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    ports: ["9200:9000", "9201:9001"]
+    environment: &creds
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes: [minio-a:/data]
+    healthcheck: &health
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      retries: 30
+
+  minio-b:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    ports: ["9300:9000", "9301:9001"]
+    environment: *creds
+    volumes: [minio-b:/data]
+    healthcheck: *health
+
+volumes:
+  minio-a:
+  minio-b:

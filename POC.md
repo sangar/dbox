@@ -1,0 +1,557 @@
+# dbox — folder-to-S3 sync daemon (POC plan)
+
+A small Go daemon that keeps a local folder in sync with one or more stores:
+S3-compatible buckets (AWS, MinIO, R2, Backblaze B2) or plain directories.
+Sync-folder style: files live on disk, are always available offline, and changes are
+pushed in the background. Remote changes are pulled on a poll interval.
+
+Stores follow the immish model: any number of named stores, exactly one is the
+**primary**, the rest are **mirrors** or **detached**. Every file is pushed to
+the primary and fanned out to every mirror. Migrating backends is "add the new
+store as a mirror, wait for backfill, promote it, detach the old one", with no
+downtime and no re-upload from scratch.
+
+Targets Linux and macOS from one binary.
+
+## Goals
+
+- Watch one or more local folders and push creates, modifies, renames and
+  deletes to S3 shortly after they happen.
+- Pull changes made elsewhere (another machine, the S3 console) down to disk.
+- Survive restarts: reconcile on startup so nothing is lost while the daemon
+  was down.
+- Several stores at once with one primary, so a backend can be swapped by
+  promoting a mirror. Per-file replica state so backfill and migration are
+  resumable and verifiable.
+- Single static binary, no root, no kernel extensions.
+
+## Non-goals (for the POC)
+
+- Real conflict resolution. Last writer wins, with the loser kept as a
+  `name.conflict-<host>-<timestamp>` sibling.
+- Sharing, permissions, selective sync, bandwidth throttling.
+- Block-level delta upload. Whole files are uploaded, multipart above a
+  threshold.
+- Windows.
+
+## Was mounting S3 as a filesystem considered?
+
+Yes. The candidates are FUSE-based mounts:
+
+| Tool | Linux | macOS | Notes |
+|---|---|---|---|
+| `mountpoint-s3` (AWS) | yes | no | Sequential writes only, no rename, no edit in place. |
+| `s3fs-fuse` | yes | needs macFUSE | Full POSIX-ish, slow metadata, weak caching. |
+| `goofys` | yes | needs macFUSE | Fast, but relaxed POSIX semantics, unmaintained. |
+| `rclone mount` | yes | needs macFUSE | Best of the bunch. `--vfs-cache-mode full` gives a local write-back cache. |
+
+Why a mount does not fit the sync-folder model:
+
+1. **Files are remote, not local.** Offline you have nothing, or only whatever
+   the VFS cache happened to keep. Sync-folder semantics are the inverse: disk is
+   the source of truth, S3 is the backup/transport.
+2. **Every `stat` is a network call** unless aggressively cached, which makes
+   Finder, `ls -l`, editors and IDE indexers crawl.
+3. **macOS requires macFUSE**, a third-party kernel extension that needs a
+   reboot and a Security & Privacy approval. Apple's FSKit replacement is only
+   on macOS 15+ and rclone/s3fs do not ship FSKit backends yet. On Linux FUSE
+   is fine but still a root-installed dependency.
+4. **Editor save patterns break.** Vim, VS Code, Xcode and most IDEs save by
+   writing a temp file and renaming over the original. S3 has no rename, so
+   FUSE layers either reject it (mountpoint-s3) or emulate it with a copy and
+   delete, doubling traffic and leaving windows where the file is missing.
+5. **Conflict handling is nil.** Two machines writing the same key via a mount
+   silently clobber each other. A sync daemon at least sees both versions.
+
+Where a mount *is* the better answer: a single machine that needs read-mostly
+access to a huge bucket that will never fit on local disk (media libraries,
+datasets). That is a different product. If that use case shows up later,
+shelling out to `rclone mount` is the pragmatic answer, not writing FUSE in Go.
+
+Decision: **watcher + local index + uploader**, no mount.
+
+## Stores and roles
+
+Borrowed from immish (`docs/MULTIPLE_STORE.md` there). A store is a named
+backend with a `kind` (`s3` or `disk`) and a `role`:
+
+| role | receives new files | pulled from | backfilled |
+|---|---|---|---|
+| `primary` (exactly one) | yes | yes | n/a |
+| `mirror` | yes, fan-out after primary | no | yes, to full copy |
+| `detached` | no | no | no |
+
+Rules:
+
+- The store `name` is stable and is what the index records. Renaming a store
+  in config is treated as removing one and adding another.
+- Only the primary is polled for remote changes. Mirrors are write-only from
+  the daemon's point of view; a second machine syncing the same folder talks
+  to the same primary.
+- A mirror that falls behind never blocks the primary. Each store gets its own
+  queue and workers, so a slow B2 mirror cannot delay the MinIO primary.
+- A `disk` store in any role. Useful for tests (no MinIO needed), and as a
+  mirror onto a NAS mount.
+- Promotion is a config edit plus restart, or `SIGHUP`. The daemon refuses to
+  promote a store whose replica table shows unverified files and says how
+  many. `--force` overrides.
+- The old primary becomes a mirror on promotion, same as immish. Change it to
+  `detached` once you are happy, then delete it from config when you no
+  longer want the daemon to know about it.
+
+### Migration walkthrough
+
+Moving from MinIO at home to Cloudflare R2:
+
+1. Add `r2` to `stores` with `role: mirror`. Restart or `SIGHUP`.
+2. The daemon backfills: every file whose replica row for `r2` is missing or
+   `pending` is copied from the primary (not from disk, so a file that was
+   deleted locally but is still remote also travels). Progress is visible in
+   `dbox status` and on `/metrics`.
+3. When `dbox status` shows `r2` at 100% verified, set `r2` to `primary` and
+   `minio` to `mirror`. Restart or `SIGHUP`.
+4. New files now go to R2 first. Polling comes from R2. MinIO still receives
+   copies.
+5. Set `minio` to `detached`, then remove it. Its objects are left in place;
+   dbox never deletes a bucket's contents when a store is removed.
+
+Rollback at any step is the reverse edit.
+
+## Architecture
+
+```
+            ┌────────────┐   events    ┌───────────┐  paths   ┌──────────┐
+ local fs ─►│  watcher   │────────────►│ debouncer │─────────►│  queue   │
+            │ (fsnotify) │             │ per path  │          │ (chan)   │
+            └────────────┘             └───────────┘          └────┬─────┘
+                                                                   │
+            ┌────────────┐                                    ┌────▼─────┐
+            │  poller    │──── primary listing diff ─────────►│ primary  │◄─► primary store
+            │ (interval) │                                    │ workers  │
+            └────────────┘                                    └────┬─────┘
+                                                                   │ replica rows
+            ┌────────────┐                                    ┌────▼─────┐
+            │ backfiller │──── unverified replicas ──────────►│ mirror   │──► mirror A
+            │ (per store)│                                    │ workers  │──► mirror B
+            └────────────┘                                    └────┬─────┘
+                                                                   │
+                                                             ┌─────▼─────┐
+                                                             │   index   │
+                                                             │ (sqlite)  │
+                                                             └───────────┘
+```
+
+### Components
+
+**watcher** — `github.com/fsnotify/fsnotify`. Backends: inotify on Linux,
+kqueue on macOS. fsnotify is not recursive, so walk the tree at start and add
+every directory; add new directories as they appear in Create events. Ignore
+patterns (`.git`, `.DS_Store`, `*.swp`, `~$*`, the index file itself) are
+applied here so noise never enters the pipeline.
+
+Platform caveats:
+
+- Linux: `fs.inotify.max_user_watches` defaults to 8192 on some distros. The
+  daemon logs a clear error pointing at `sysctl` if `AddWatch` fails with
+  `ENOSPC`.
+- macOS: kqueue holds one file descriptor per watched directory. Raise the
+  soft `RLIMIT_NOFILE` to the hard limit at startup. For trees beyond ~10k
+  directories swap the backend for FSEvents (`github.com/fsnotify/fsevents`)
+  behind the same `Watcher` interface. Not needed for the POC.
+
+**debouncer** — map of path to `*time.Timer`. Each event resets the timer;
+when it fires (default 750ms) the path is sent to the queue. Coalesces the
+burst of Write events during a save, and the Rename+Create pair from
+atomic-save editors. On expiry the path is re-stated so the pipeline acts on
+what is actually on disk now, not on what the event said.
+
+**index** — SQLite via `modernc.org/sqlite` (pure Go, no cgo, so cross-compile
+works). Two tables:
+
+```sql
+CREATE TABLE files (
+  path        TEXT PRIMARY KEY,   -- relative, forward slashes
+  size        INTEGER NOT NULL,
+  mtime_ns    INTEGER NOT NULL,
+  sha256      TEXT    NOT NULL,
+  synced_at   INTEGER NOT NULL,
+  deleted     INTEGER NOT NULL DEFAULT 0  -- tombstone until every store dropped its copy
+);
+
+CREATE TABLE replicas (
+  path        TEXT    NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+  store       TEXT    NOT NULL,   -- store name from config
+  state       TEXT    NOT NULL,   -- pending | verified | failed
+  etag        TEXT,               -- as returned by the store, opaque
+  verified_at INTEGER,
+  last_error  TEXT,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (path, store)
+);
+```
+
+Stored at `<root>/.dbox/index.db`. `files` answers "has this file actually
+changed since we last hashed it" (compare size+mtime first, hash only if they
+differ) and "what did we have last time" (so deletes made while the daemon was
+down are detected on reconcile). `replicas` is immish's `blob_replicas`: one
+row per file per store, so backfill, promotion checks and `dbox status` are
+plain queries.
+
+**primary workers** — N goroutines reading from the queue. Per path:
+
+1. `stat`. Missing → delete from primary, turn the `files` row into a
+   tombstone and every mirror row `pending`, so mirrors delete their copies.
+   The tombstone is removed once no replica row is left. A path with no row
+   of its own but rows under it was a directory, and each file under it is
+   queued.
+2. size+mtime match index → skip.
+3. Hash. Hash matches index → update mtime in index, skip.
+4. Upload to the primary with `manager.Uploader`, which sends one
+   `PutObject` below `part_size` and multipart above it. Set metadata `x-amz-meta-sha256` and
+   `x-amz-meta-mtime` so the remote side carries enough to compare without
+   downloading.
+5. Update `files`, set the primary replica row `verified`, and insert a
+   `pending` row for every mirror.
+
+A path already in flight is marked so a second event for it re-queues once
+the current operation finishes rather than racing.
+
+**mirror workers** — one small pool per mirror, fed by that store's `pending`
+replica rows. Each job copies the object from the primary store to the mirror
+(not from disk, see migration above), `Head`s it on the mirror to confirm size
+and the sha256 metadata, then marks the row `verified`. Failures go to
+`failed` with `last_error` and retry with backoff, five attempts, then stay
+`failed` until `dbox retry <store>` or the next backfill pass.
+
+**backfiller** — runs at startup, on `SIGHUP`, and every `backfill_interval`
+for each mirror. It inserts `pending` rows for any file in `files` that has no
+replica row for that store, then lets the mirror workers drain them. It is
+idempotent and resumable. This is how a freshly added mirror gets a full copy
+and how a mirror that was offline for a week catches up.
+
+**poller** — every `pull_interval` lists the **primary** with `ListObjectsV2`
+and diffs against the index:
+
+- key not in index → download to a temp file in `.dbox/tmp`, rename into
+  place, add to index with the primary replica `verified` and mirrors
+  `pending`. The watcher sees the rename; the debouncer re-stats, finds
+  size+mtime match the fresh index row and skips. No echo upload.
+- key in index with different ETag and local file unchanged since
+  `synced_at` → download, same as above.
+- key in index with different ETag and local file *also* changed → conflict.
+  Local wins; remote copy is downloaded as `name.conflict-<host>-<ts>` and
+  local is uploaded.
+- key in index but missing remotely → deleted elsewhere. Delete local file,
+  remove index row.
+
+S3 has no change feed without SNS/SQS/EventBridge, so polling is the portable
+choice. 30s to 60s is fine for a POC. Listing a 100k-key bucket costs about
+100 requests, which is cheap.
+
+**reconcile** — runs once at startup before the watcher starts accepting
+events. It is the poller diff plus a local walk, in both directions, against
+the primary. Then for each mirror it lists the store and corrects the replica
+rows: objects present with matching sha256 metadata become `verified` (adopts
+copies made by rclone or bucket replication), rows for objects that are gone
+go back to `pending`. This is what recovers from a crash, a laptop lid close,
+or a first run on a second machine with an empty folder.
+
+**store registry** — builds one client per store from config and hands them
+out by name. Config is re-read on `SIGHUP`; a changed store is rebuilt, a
+removed store's workers are stopped and its replica rows left in place (they
+are harmless and come back if the store is re-added under the same name).
+
+**daemon** — `signal.NotifyContext` for SIGINT/SIGTERM, structured logs via
+`log/slog`, a `/healthz` and `/metrics` HTTP listener on localhost (optional).
+Supervised by launchd on macOS and systemd on Linux; no self-daemonising.
+
+## Sync algorithm summary
+
+| Event | Local state | Remote state | Action |
+|---|---|---|---|
+| fs event, file exists, hash changed | changed | — | upload |
+| fs event, file missing | gone | — | delete remote |
+| poll, key new | absent | present | download |
+| poll, etag changed | unchanged | changed | download |
+| poll, etag changed | changed | changed | conflict copy, upload local |
+| poll, key gone | present, synced | absent | delete local |
+| reconcile, local newer than index | changed | ? | upload |
+| reconcile, in index, missing locally | gone | present | delete remote |
+
+Keys are `prefix + relative path` with `/` separators, where `prefix` is per
+store. No encoding of the path beyond that; paths that S3 rejects (very long,
+control characters) are logged and skipped.
+
+Mirror actions follow from replica rows rather than events:
+
+| replica state | action |
+|---|---|
+| `pending`, file exists in `files` | copy primary → mirror, verify, `verified` |
+| `pending`, file is a tombstone | delete on mirror, drop row |
+| `failed`, under 5 attempts | retry with backoff |
+| `failed`, 5 attempts | leave, surface in `dbox status` |
+
+## Configuration
+
+`~/.config/dbox/config.yaml` on both platforms (`$XDG_CONFIG_HOME` respected).
+`gopkg.in/yaml.v3` for parsing. Secrets can also come from the standard AWS
+environment variables or `~/.aws/credentials`, which the SDK picks up by
+default when `access_key`/`secret_key` are omitted on a store. Any value can
+be `${ENV_VAR}` and is expanded at load, so secrets stay out of the file.
+
+```yaml
+# ~/.config/dbox/config.yaml
+
+stores:
+  minio:                      # name; stable, recorded in the index
+    kind: s3
+    role: primary             # primary | mirror | detached
+    bucket: dbox
+    prefix: gard/laptop/      # optional; keys are prefix + relative path
+    region: us-east-1
+    endpoint: http://localhost:9200
+    path_style: true
+    access_key: minioadmin
+    secret_key: ${MINIO_SECRET}
+    workers: 4
+
+  r2:
+    kind: s3
+    role: mirror
+    bucket: dbox-gard
+    region: auto
+    endpoint: https://<account>.eu.r2.cloudflarestorage.com
+    access_key: ${R2_ACCESS_KEY}
+    secret_key: ${R2_SECRET_KEY}
+    workers: 2
+
+  aws:
+    kind: s3
+    role: detached            # known to the daemon, receives nothing, objects stay readable
+    bucket: dbox-archive
+    region: eu-north-1
+    storage_class: STANDARD_IA
+    # no keys: SDK default credential chain
+
+  nas:
+    kind: disk
+    role: mirror
+    root: /Volumes/backup/dbox
+    workers: 1
+
+sync:
+  root: ~/dbox
+  pull_interval: 30s          # poll the primary
+  backfill_interval: 10m      # sweep mirrors for missing replicas
+  debounce: 750ms
+  part_size: 8MiB
+  delete_remote: true         # false = never delete in any store, only upload
+  delete_local: true          # false = never delete on disk from a poll
+  ignore:
+    - .git/
+    - .DS_Store
+    - "*.swp"
+    - "*.tmp"
+    - "~$*"
+    - .dbox/
+
+daemon:
+  log_level: info             # debug | info | warn | error
+  log_format: text            # text | json
+  listen: 127.0.0.1:7878      # /healthz and /metrics; empty disables
+```
+
+Validation at load: exactly one `primary`, names match `[a-z0-9_-]+`, `s3`
+stores have bucket and region, `disk` stores have an existing root. A config
+with zero stores is accepted and the daemon idles with a warning, mirroring
+immish's "no primary yet" state.
+
+Environment overrides use the `DBOX_` prefix with `__` for nesting, e.g.
+`DBOX_SYNC__ROOT`. Store secrets use `${VAR}` in the file instead.
+
+Commands:
+
+```
+dbox run      [--config] [--once] [--dry-run]   the daemon; --once reconciles and exits
+dbox status   [--config]                        daemon + service state, per-store replica counts, failed files
+dbox retry    <store>                           reset failed replicas on a store to pending
+dbox check    <store>                           write/read/delete a probe object, like immish's "Test connection"
+dbox promote  <store> [--force]                 rewrite config roles and SIGHUP the daemon if running
+dbox service  enable|disable                    run `dbox run` at login (launchd agent or systemd user unit)
+```
+
+`promote` is the only command that writes the config file. It refuses when
+the target store has unverified replicas unless `--force` is given.
+
+## Project layout
+
+```
+dbox/
+  cmd/dbox/main.go          flag parsing, config load, wiring, signal handling
+  internal/config/          yaml + env + defaults + validation
+  internal/watch/           fsnotify wrapper, recursive add, ignore filter
+  internal/debounce/        per-path timer coalescing
+  internal/index/           sqlite: files + replicas
+  internal/store/           Store interface, s3 and disk implementations, registry by name
+  internal/ignore/          ignore patterns from config, always .dbox/
+  internal/engine/          primary workers, mirror workers, backfiller, poller, reconcile, conflicts
+  internal/daemon/          pid file, health/metrics listener, open-file limit
+  internal/service/         `service enable|disable`: launchd agent / systemd user unit
+  docker-compose.yml        two MinIO instances for local dev and tests
+  Makefile
+```
+
+`internal/store` exposes a five-method interface (`Put`, `Get`, `Delete`,
+`List`, `Head`) with `s3` and `disk` implementations. Unit tests use `disk`
+stores in temp directories; MinIO is only needed for the integration suite. Mirror copy
+is `Get` from one store piped into `Put` on another, so adding a new backend
+kind (SFTP, WebDAV) is one file and never touches the sync logic.
+
+## Dependencies
+
+| Purpose | Module |
+|---|---|
+| fs events | `github.com/fsnotify/fsnotify` |
+| S3 | `github.com/aws/aws-sdk-go-v2`, `.../service/s3`, `.../feature/s3/manager` |
+| index | `modernc.org/sqlite` |
+| config | `gopkg.in/yaml.v3` |
+
+Everything else is standard library.
+
+## Running as a daemon
+
+Same as eind: the binary installs itself as a per-user login service, no
+hand-written unit files.
+
+```sh
+dbox service enable           # start now and at every login
+dbox service disable          # stop and remove it
+dbox status                   # shows whether the daemon answers and whether the service is installed
+```
+
+`internal/service` is a port of eind's package of the same name:
+
+- **macOS** writes `~/Library/LaunchAgents/dbox.plist` with `RunAtLoad` and
+  `KeepAlive`, logging to `~/Library/Logs/dbox.log`, then
+  `launchctl bootstrap gui/<uid>`. Enable first runs `bootout` and waits up
+  to 15s for the old registration to disappear, because `launchctl` returns
+  before the agent is gone and a bootstrap while it lingers fails with an I/O
+  error.
+- **Linux** writes `~/.config/systemd/user/dbox.service` (respecting
+  `$XDG_CONFIG_HOME`) with `Restart=on-failure`, then
+  `systemctl --user daemon-reload` and `enable --now`. Disable is the reverse
+  plus a final `daemon-reload`.
+- **Executable path.** The unit starts the `dbox` found on `PATH` when that
+  is the same file as the running binary, otherwise the running binary's
+  absolute path. Upgrading in place with `go install` or Homebrew then needs
+  no re-enable.
+- **Config path** is not baked into the unit. The daemon resolves
+  `~/.config/dbox/config.yaml` itself, so editing config and `SIGHUP` (or
+  `dbox promote`) is enough.
+- Other platforms get a clear error telling the user to start `dbox run`
+  from their session startup.
+
+What it writes, for reference:
+
+```xml
+<!-- ~/Library/LaunchAgents/dbox.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>dbox</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/dbox</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/gard/Library/Logs/dbox.log</string>
+  <key>StandardErrorPath</key><string>/Users/gard/Library/Logs/dbox.log</string>
+</dict></plist>
+```
+
+```ini
+# ~/.config/systemd/user/dbox.service
+[Unit]
+Description=dbox folder sync
+After=network-online.target
+
+[Service]
+ExecStart="/home/gard/go/bin/dbox" run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Linux packages (`.deb`, `.rpm`, `.apk`) can later ship
+`/usr/lib/systemd/user/dbox.service` enabled for all users plus a sysctl
+snippet for `fs.inotify.max_user_watches`, as eind's `packaging/` does. Out
+of scope for the POC; `dbox service enable` covers `go install` and Homebrew.
+
+## Local development
+
+```sh
+mise install                   # Go 1.26.5 from mise.toml
+make minio                     # two MinIOs: API :9200 and :9300, consoles :9201 and :9301
+make run                       # builds, then dbox run --config dev.config.yaml
+```
+
+`dev.config.yaml` has minio-a as primary and minio-b as mirror, both with
+`path_style: true`, and syncs `./tmp/box`. The ports avoid 9000/9001 so dbox
+can run next to another project's MinIO.
+
+## Testing
+
+- **Unit** (`make test`): debouncer coalescing, index tombstones and
+  conditional verify, ignore matching, config validation (two primaries,
+  no primary, bad names, missing env vars, unknown keys) and `Promote`
+  keeping comments. Engine scenarios run against `disk` stores in temp
+  directories, with two machines sharing stores where needed: push to
+  primary and mirror, local delete reaches every store, edits and deletes
+  travel between machines, identical file on a second machine is adopted,
+  edit on both sides keeps local and saves a conflict copy, add mirror →
+  backfill → promote → detach, mirror adopts copies made by other tools,
+  mirror falls back to the local file, and the live daemon handling a new
+  directory, an editor-style rename save, a remote change and a removed tree.
+- **Integration** (`make minio && make integration`): the S3 store against
+  both compose MinIOs, metadata round trip, not-found mapping, and a 12 MiB
+  multipart copy streamed from one MinIO's `Get` into the other's `Put`.
+- **Platform:** CI matrix on `ubuntu-latest` and `macos-latest`. The watcher
+  tests are the only ones that differ meaningfully between inotify and kqueue.
+  `internal/service` is tested with the `run` function swapped for a recorder,
+  as in eind, so no real `launchctl` or `systemctl` is invoked.
+
+## Milestones
+
+1. Config with stores, index with replicas, store interface + s3 + disk,
+   `run --once` push to primary only. Usable as a cron backup already. **Done.**
+2. Watcher + debouncer + primary workers. Live push. **Done.**
+3. Mirror workers + backfiller + `status`, `retry`, `check`, `promote`.
+   Migration works end to end against the two-MinIO compose file. **Done.**
+4. Poller + download + delete-local. Two-way. **Done.**
+5. Conflict copies, health endpoint, `service enable|disable` **done**.
+   CI matrix **not done**: the project is not in a git repository yet.
+
+Verified by hand against the compose MinIOs on macOS: live push of a small
+and a 9 MB file, `promote` refusing a store without copies, switching that
+store to mirror with `SIGHUP` and watching the backfill, `promote` rewriting
+the config and reloading the daemon, a delete after promotion reaching both
+stores, and an object written with `mc` being pulled and mirrored. The unit
+suite, live watcher test included, also passes on Linux in a `golang:1.26`
+container, so inotify is covered. Not yet run by hand: the daemon on a Linux
+host, and `dbox service enable` against a real launchd or systemd.
+
+## Open questions
+
+- Should a mirror ever be polled, so that two machines can use different
+  primaries against the same set of stores? No for the POC; it turns every
+  mirror into a potential source of conflicts.
+- Should mirror copies stream through the daemon host, as immish does, or use
+  server-side copy when source and target are the same provider? Through the
+  host for the POC; same-provider copy is an optimisation for a later pass.
+
+- Should the daemon follow symlinks? Default no; most sync tools do not either.
+- Hash choice: SHA-256 is fine on Apple Silicon and modern x86. BLAKE3 is
+  faster but adds a dependency. Decide after measuring on a 10 GB tree.
+- Large trees on macOS: measure kqueue fd usage at 5k and 20k directories to
+  decide if FSEvents is needed before the POC ships.
+- Should `.dbox/index.db` be excluded from Time Machine? Probably, via
+  `tmutil addexclusion`, done at first run.

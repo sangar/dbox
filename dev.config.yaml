@@ -1,0 +1,30 @@
+# Local development against `docker compose up -d`. Run with:
+#   make run
+stores:
+  minio-a:
+    kind: s3
+    role: primary
+    bucket: dbox
+    region: us-east-1
+    endpoint: http://localhost:9200
+    path_style: true
+    access_key: minioadmin
+    secret_key: minioadmin
+
+  minio-b:
+    kind: s3
+    role: mirror
+    bucket: dbox
+    region: us-east-1
+    endpoint: http://localhost:9300
+    path_style: true
+    access_key: minioadmin
+    secret_key: minioadmin
+
+sync:
+  root: ./tmp/box
+  pull_interval: 5s
+
+daemon:
+  log_level: debug
+  listen: 127.0.0.1:7878
