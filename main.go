@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -34,6 +36,8 @@ Usage:
   dbox check STORE                  write, read back and delete a probe object on STORE
   dbox promote STORE [--force]      make STORE the primary; the old primary becomes a mirror
   dbox service enable|disable       run dbox run at login (launchd agent or systemd user unit)
+  dbox config [--init]              show the effective config, or write a starter file
+  dbox config edit                  open the config in $VISUAL or $EDITOR, then check and reload it
   dbox version
 
 Every command takes --config FILE (default %s, env DBOX_CONFIG).
@@ -65,6 +69,8 @@ func run(args []string) error {
 		return cmdPromote(rest)
 	case "service":
 		return cmdService(rest)
+	case "config":
+		return cmdConfig(rest)
 	case "version", "--version":
 		fmt.Println("dbox", version)
 		return nil
@@ -421,5 +427,78 @@ func cmdService(args []string) error {
 		return err
 	}
 	fmt.Printf("dbox run starts now and at every login (%s)\n", path)
+	return nil
+}
+
+func cmdConfig(args []string) error {
+	fs, configPath := newFlags("config")
+	initialize := fs.Bool("init", false, "write a commented starter config if none exists")
+	positional, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(positional) == 1 && positional[0] == "edit":
+		return editConfig(*configPath)
+	case len(positional) > 0:
+		return fmt.Errorf("unknown config action %q (want edit)", positional[0])
+	case *initialize:
+		created, err := config.WriteStarter(*configPath)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Println("wrote", *configPath)
+		} else {
+			fmt.Println(*configPath, "already exists")
+		}
+		return nil
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	out, err := config.Render(cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("# %s\n%s", cfg.Path, out)
+	return nil
+}
+
+// editConfig opens the config in the user's editor, creating it first if
+// needed, then validates it and asks a running daemon to reload it.
+func editConfig(path string) error {
+	if _, err := config.WriteStarter(path); err != nil {
+		return err
+	}
+	if err := runEditor(path); err != nil {
+		return err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return fmt.Errorf("%w\nrun `dbox config edit` again to fix it", err)
+	}
+	reloaded, err := daemon.Reload(pidPath(cfg))
+	if err != nil {
+		return err
+	}
+	if reloaded {
+		fmt.Println("config is valid; the daemon is reloading it")
+	} else {
+		fmt.Println("config is valid")
+	}
+	return nil
+}
+
+// runEditor runs $VISUAL or $EDITOR through the shell, so values with
+// arguments such as "code --wait" work.
+func runEditor(path string) error {
+	editor := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"), "vi")
+	cmd := exec.Command("sh", "-c", editor+` "$1"`, "sh", path)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("editor %q: %w", editor, err)
+	}
 	return nil
 }

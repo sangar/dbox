@@ -158,3 +158,25 @@ func TestDefaultPathPrefersYmlButKeepsAnExistingYaml(t *testing.T) {
 		t.Errorf("with only config.yaml: DefaultPath() = %q", got)
 	}
 }
+
+func TestStarterConfigLoadsAndRendersWithoutSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if created, err := WriteStarter(path); !created || err != nil {
+		t.Fatalf("WriteStarter: %v, %v", created, err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Stores = map[string]Store{"a": {Kind: KindS3, Role: RolePrimary, Bucket: "b", Region: "r", SecretKey: "s3cr3t"}}
+	out, err := Render(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "s3cr3t") || !strings.Contains(string(out), "part_size: 8MiB") {
+		t.Errorf("rendered:\n%s", out)
+	}
+	if _, err := parse(path, out, nil); err != nil {
+		t.Errorf("rendered config does not load: %v", err)
+	}
+}

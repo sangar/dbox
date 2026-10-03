@@ -1,0 +1,38 @@
+# dbox configuration. Every key is listed in POC.md.
+#
+# Any value can be ${ENV_VAR}, expanded when the config loads, so secrets can
+# stay out of this file. Any key can also be overridden from the environment
+# as DBOX_SECTION__KEY, e.g. DBOX_SYNC__PULL_INTERVAL=1m.
+#
+# After editing, check a store with `dbox check NAME`. A running daemon picks
+# up changes on SIGHUP, which `dbox config edit` sends for you.
+
+stores: {}
+#  minio:                      # name: a-z, 0-9, _ and -
+#    kind: s3                  # s3 | disk
+#    role: primary             # exactly one primary; others mirror | detached
+#    bucket: dbox
+#    region: us-east-1
+#    endpoint: http://localhost:9000
+#    path_style: true
+#    access_key: ${MINIO_ACCESS_KEY}
+#    secret_key: ${MINIO_SECRET_KEY}
+#
+#  nas:
+#    kind: disk
+#    role: mirror
+#    root: /Volumes/backup/dbox
+
+sync:
+  root: ~/dbox
+  pull_interval: 30s
+  backfill_interval: 10m
+  debounce: 750ms
+  part_size: 8MiB
+  delete_remote: true
+  delete_local: true
+
+daemon:
+  log_level: info             # debug | info | warn | error
+  log_format: text            # text | json
+  listen: 127.0.0.1:7878

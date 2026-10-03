@@ -4,6 +4,7 @@ package config
 
 import (
 	"bytes"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -86,6 +87,8 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
+func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
 // Size reads byte counts with an optional KiB, MiB or GiB suffix.
@@ -100,14 +103,24 @@ func (s *Size) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
+var sizeUnits = []struct {
+	suffix string
+	factor int64
+}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}}
+
+func (s Size) MarshalYAML() (any, error) {
+	for _, u := range sizeUnits {
+		if u.factor > 1 && int64(s) >= u.factor && int64(s)%u.factor == 0 {
+			return fmt.Sprintf("%d%s", int64(s)/u.factor, u.suffix), nil
+		}
+	}
+	return int64(s), nil
+}
+
 func ParseSize(v string) (int64, error) {
-	units := []struct {
-		suffix string
-		factor int64
-	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}}
 	v = strings.TrimSpace(v)
 	factor := int64(1)
-	for _, u := range units {
+	for _, u := range sizeUnits {
 		if strings.HasSuffix(v, u.suffix) {
 			v, factor = strings.TrimSuffix(v, u.suffix), u.factor
 			break
@@ -156,6 +169,37 @@ func DefaultPath() string {
 		}
 	}
 	return ymlPath
+}
+
+//go:embed starter.yml
+var starter []byte
+
+// WriteStarter creates a commented config at path unless a file is already there.
+// It is private to the user because it may come to hold store secrets.
+func WriteStarter(path string) (created bool, err error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	return true, os.WriteFile(path, starter, 0o600)
+}
+
+// Render returns the effective config as YAML, with secrets masked.
+func Render(c *Config) ([]byte, error) {
+	masked := *c
+	masked.Stores = make(map[string]Store, len(c.Stores))
+	for name, s := range c.Stores {
+		if s.AccessKey != "" {
+			s.AccessKey = "***"
+		}
+		if s.SecretKey != "" {
+			s.SecretKey = "***"
+		}
+		masked.Stores[name] = s
+	}
+	return yaml.Marshal(masked)
 }
 
 // Load reads the file at path, expands ${VAR} references, applies DBOX_
