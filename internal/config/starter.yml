@@ -1,4 +1,4 @@
-# dbox configuration. Every key is listed in POC.md.
+# dbox configuration. Every key: https://github.com/OWNER/dbox/blob/master/docs/configuration.md
 #
 # Any value can be ${ENV_VAR}, expanded when the config loads, so secrets can
 # stay out of this file. Any key can also be overridden from the environment

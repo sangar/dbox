@@ -1,5 +1,5 @@
 // Package config loads ~/.config/dbox/config.yml: the stores, their roles and
-// the sync settings. See POC.md for the format.
+// the sync settings. See docs/configuration.md for the format.
 package config
 
 import (

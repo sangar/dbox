@@ -1,4 +1,4 @@
-# dbox — folder-to-S3 sync daemon (POC plan)
+# dbox design
 
 A small Go daemon that keeps a local folder in sync with one or more stores:
 S3-compatible buckets (AWS, MinIO, R2, Backblaze B2) or plain directories.
@@ -258,7 +258,7 @@ go back to `pending`. This is what recovers from a crash, a laptop lid close,
 or a first run on a second machine with an empty folder.
 
 **store registry** — builds one client per store from config and hands them
-out by name. Config is re-read on `SIGHUP`; a changed store is rebuilt, a
+out by name. Config is re-read on `SIGHUP` (sent by `dbox config edit` and `dbox promote`); a changed store is rebuilt, a
 removed store's workers are stopped and its replica rows left in place (they
 are harmless and come back if the store is re-added under the same name).
 
@@ -291,99 +291,6 @@ Mirror actions follow from replica rows rather than events:
 | `pending`, file is a tombstone | delete on mirror, drop row |
 | `failed`, under 5 attempts | retry with backoff |
 | `failed`, 5 attempts | leave, surface in `dbox status` |
-
-## Configuration
-
-`~/.config/dbox/config.yml` (an existing `config.yaml` also works) on both platforms (`$XDG_CONFIG_HOME` respected).
-`gopkg.in/yaml.v3` for parsing. Secrets can also come from the standard AWS
-environment variables or `~/.aws/credentials`, which the SDK picks up by
-default when `access_key`/`secret_key` are omitted on a store. Any value can
-be `${ENV_VAR}` and is expanded at load, so secrets stay out of the file.
-
-```yaml
-# ~/.config/dbox/config.yml
-
-stores:
-  minio:                      # name; stable, recorded in the index
-    kind: s3
-    role: primary             # primary | mirror | detached
-    bucket: dbox
-    prefix: gard/laptop/      # optional; keys are prefix + relative path
-    region: us-east-1
-    endpoint: http://localhost:9200
-    path_style: true
-    access_key: minioadmin
-    secret_key: ${MINIO_SECRET}
-    workers: 4
-
-  r2:
-    kind: s3
-    role: mirror
-    bucket: dbox-gard
-    region: auto
-    endpoint: https://<account>.eu.r2.cloudflarestorage.com
-    access_key: ${R2_ACCESS_KEY}
-    secret_key: ${R2_SECRET_KEY}
-    workers: 2
-
-  aws:
-    kind: s3
-    role: detached            # known to the daemon, receives nothing, objects stay readable
-    bucket: dbox-archive
-    region: eu-north-1
-    storage_class: STANDARD_IA
-    # no keys: SDK default credential chain
-
-  nas:
-    kind: disk
-    role: mirror
-    root: /Volumes/backup/dbox
-    workers: 1
-
-sync:
-  root: ~/dbox
-  pull_interval: 30s          # poll the primary
-  backfill_interval: 10m      # sweep mirrors for missing replicas
-  debounce: 750ms
-  part_size: 8MiB
-  delete_remote: true         # false = never delete in any store, only upload
-  delete_local: true          # false = never delete on disk from a poll
-  ignore:
-    - .git/
-    - .DS_Store
-    - "*.swp"
-    - "*.tmp"
-    - "~$*"
-    - .dbox/
-
-daemon:
-  log_level: info             # debug | info | warn | error
-  log_format: text            # text | json
-  listen: 127.0.0.1:7878      # /healthz and /metrics; empty disables
-```
-
-Validation at load: exactly one `primary`, names match `[a-z0-9_-]+`, `s3`
-stores have bucket and region, `disk` stores have an existing root. A config
-with zero stores is accepted and the daemon idles with a warning, mirroring
-immish's "no primary yet" state.
-
-Environment overrides use the `DBOX_` prefix with `__` for nesting, e.g.
-`DBOX_SYNC__ROOT`. Store secrets use `${VAR}` in the file instead.
-
-Commands:
-
-```
-dbox run      [--config] [--once] [--dry-run]   the daemon; --once reconciles and exits
-dbox status   [--config]                        daemon + service state, per-store replica counts, failed files
-dbox retry    <store>                           reset failed replicas on a store to pending
-dbox check    <store>                           write/read/delete a probe object, like immish's "Test connection"
-dbox promote  <store> [--force]                 rewrite config roles and SIGHUP the daemon if running
-dbox service  enable|disable                    run `dbox run` at login (launchd agent or systemd user unit)
-dbox reload   [--config]                        validate the config and SIGHUP the running daemon
-```
-
-`promote` is the only command that writes the config file. It refuses when
-the target store has unverified replicas unless `--force` is given.
 
 ## Project layout
 
@@ -482,22 +389,10 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-Linux packages (`.deb`, `.rpm`, `.apk`) can later ship
-`/usr/lib/systemd/user/dbox.service` enabled for all users plus a sysctl
-snippet for `fs.inotify.max_user_watches`, as eind's `packaging/` does. Out
-of scope for the POC; `dbox service enable` covers `go install` and Homebrew.
-
-## Local development
-
-```sh
-mise install                   # Go 1.26.5 from mise.toml
-make minio                     # two MinIOs: API :9200 and :9300, consoles :9201 and :9301
-make run                       # builds, then dbox run --config dev.config.yml
-```
-
-`dev.config.yml` has minio-a as primary and minio-b as mirror, both with
-`path_style: true`, and syncs `./tmp/box`. The ports avoid 9000/9001 so dbox
-can run next to another project's MinIO.
+The Linux packages (`.deb`, `.rpm`, `.apk`, Arch) ship
+`/usr/lib/systemd/user/dbox.service` and a sysctl snippet for
+`fs.inotify.max_user_watches` from `packaging/`. Unlike eind's, the unit is
+not enabled on install, because dbox needs a config first.
 
 ## Testing
 
@@ -515,30 +410,10 @@ can run next to another project's MinIO.
 - **Integration** (`make minio && make integration`): the S3 store against
   both compose MinIOs, metadata round trip, not-found mapping, and a 12 MiB
   multipart copy streamed from one MinIO's `Get` into the other's `Put`.
-- **Platform:** CI matrix on `ubuntu-latest` and `macos-latest`. The watcher
+- **Platform:** planned CI matrix on `ubuntu-latest` and `macos-latest`. The watcher
   tests are the only ones that differ meaningfully between inotify and kqueue.
   `internal/service` is tested with the `run` function swapped for a recorder,
   as in eind, so no real `launchctl` or `systemctl` is invoked.
-
-## Milestones
-
-1. Config with stores, index with replicas, store interface + s3 + disk,
-   `run --once` push to primary only. Usable as a cron backup already. **Done.**
-2. Watcher + debouncer + primary workers. Live push. **Done.**
-3. Mirror workers + backfiller + `status`, `retry`, `check`, `promote`.
-   Migration works end to end against the two-MinIO compose file. **Done.**
-4. Poller + download + delete-local. Two-way. **Done.**
-5. Conflict copies, health endpoint, `service enable|disable` **done**.
-   CI matrix **not done**: the project is not in a git repository yet.
-
-Verified by hand against the compose MinIOs on macOS: live push of a small
-and a 9 MB file, `promote` refusing a store without copies, switching that
-store to mirror with `SIGHUP` and watching the backfill, `promote` rewriting
-the config and reloading the daemon, a delete after promotion reaching both
-stores, and an object written with `mc` being pulled and mirrored. The unit
-suite, live watcher test included, also passes on Linux in a `golang:1.26`
-container, so inotify is covered. Not yet run by hand: the daemon on a Linux
-host, and `dbox service enable` against a real launchd or systemd.
 
 ## Open questions
 

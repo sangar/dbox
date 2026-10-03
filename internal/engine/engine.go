@@ -1,5 +1,5 @@
 // Package engine keeps a local folder, the primary store and every mirror in
-// sync. See POC.md for the decision tables it implements.
+// sync. See docs/design.md for the decision tables it implements.
 package engine
 
 import (
@@ -361,7 +361,7 @@ func (e *Engine) pushDelete(ctx context.Context, rel string) error {
 	return nil
 }
 
-// poll pulls changes from the primary. See the sync table in POC.md.
+// poll pulls changes from the primary. See the sync table in docs/design.md.
 func (e *Engine) poll(ctx context.Context) error {
 	objects, err := e.primary.List(ctx)
 	if err != nil {
