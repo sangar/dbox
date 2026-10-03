@@ -4,7 +4,7 @@ LDFLAGS  = -s -w -X main.version=$(VERSION)
 .PHONY: build test integration run minio clean
 
 build:
-	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o dbox ./cmd/dbox
+	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o dbox .
 
 test:
 	go vet ./...

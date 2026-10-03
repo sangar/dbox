@@ -388,7 +388,7 @@ the target store has unverified replicas unless `--force` is given.
 
 ```
 dbox/
-  cmd/dbox/main.go          flag parsing, config load, wiring, signal handling
+  main.go                   flag parsing, config load, wiring, signal handling
   internal/config/          yaml + env + defaults + validation
   internal/watch/           fsnotify wrapper, recursive add, ignore filter
   internal/debounce/        per-path timer coalescing
