@@ -1,0 +1,10 @@
+[Unit]
+Description=dbox folder sync daemon
+
+[Service]
+ExecStart=/usr/bin/dbox run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,7 +1,8 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS  = -s -w -X main.version=$(VERSION)
+GORELEASER = go run github.com/goreleaser/goreleaser/v2@latest
 
-.PHONY: build test integration run minio clean
+.PHONY: build test integration run minio snapshot release clean
 
 build:
 	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o dbox .
@@ -23,6 +24,12 @@ minio:
 run: build
 	mkdir -p tmp/box
 	./dbox run --config dev.config.yml
+
+snapshot:
+	$(GORELEASER) release --snapshot --clean
+
+release:
+	$(GORELEASER) release --clean
 
 clean:
 	rm -rf dbox dist tmp
