@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -175,25 +176,18 @@ func parse(path string, raw []byte, environ []string) (*Config, error) {
 		k, v, _ := strings.Cut(kv, "=")
 		env[k] = v
 	}
-	var missing []string
-	expanded := envReference.ReplaceAllFunc(raw, func(ref []byte) []byte {
-		name := string(envReference.FindSubmatch(ref)[1])
-		v, ok := env[name]
-		if !ok {
-			missing = append(missing, name)
-		}
-		return []byte(v)
-	})
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("%s: environment variables not set: %s", path, strings.Join(missing, ", "))
-	}
-
 	var tree map[string]any
-	if err := yaml.Unmarshal(expanded, &tree); err != nil {
+	if err := yaml.Unmarshal(raw, &tree); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if tree == nil {
 		tree = map[string]any{}
+	}
+	var missing []string
+	expandReferences(tree, env, &missing)
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("%s: environment variables not set: %s", path, strings.Join(slices.Compact(missing), ", "))
 	}
 	if err := applyOverrides(tree, env); err != nil {
 		return nil, err
@@ -214,6 +208,49 @@ func parse(path string, raw []byte, environ []string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// expandReferences replaces ${VAR} in every string value of the tree, so
+// references in comments are left alone. Unset names are added to missing.
+func expandReferences(node any, env map[string]string, missing *[]string) any {
+	switch n := node.(type) {
+	case map[string]any:
+		for k, v := range n {
+			n[k] = expandReferences(v, env, missing)
+		}
+	case []any:
+		for i, v := range n {
+			n[i] = expandReferences(v, env, missing)
+		}
+	case string:
+		expanded := envReference.ReplaceAllStringFunc(n, func(ref string) string {
+			name := envReference.FindStringSubmatch(ref)[1]
+			v, ok := env[name]
+			if !ok {
+				*missing = append(*missing, name)
+			}
+			return v
+		})
+		if expanded == n {
+			return n
+		}
+		return scalar(expanded)
+	}
+	return node
+}
+
+// scalar reads an expanded value as YAML would have, so "workers: ${N}" is a
+// number, while anything that is not a plain scalar stays a string.
+func scalar(v string) any {
+	var parsed any
+	if err := yaml.Unmarshal([]byte(v), &parsed); err != nil {
+		return v
+	}
+	switch parsed.(type) {
+	case int, float64, bool:
+		return parsed
+	}
+	return v
 }
 
 // applyOverrides sets DBOX_SECTION__KEY=value as tree[section][key].

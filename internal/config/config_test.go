@@ -36,6 +36,21 @@ sync: {root: /tmp/box}
 	}
 }
 
+func TestReferencesExpandInValuesButNotComments(t *testing.T) {
+	cfg, err := load(t, `
+# secret_key: ${UNSET}
+stores:
+  a: {kind: s3, role: primary, bucket: b, region: r, workers: "${N}"}
+sync: {root: /tmp/box}
+`, "N=3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stores["a"].Workers != 3 {
+		t.Errorf("workers = %d", cfg.Stores["a"].Workers)
+	}
+}
+
 func TestEnvironmentOverridesNestedKeys(t *testing.T) {
 	cfg, err := load(t, "sync: {root: /a}\n", "DBOX_SYNC__ROOT=/b", "DBOX_SYNC__DELETE_LOCAL=false")
 	if err != nil {
