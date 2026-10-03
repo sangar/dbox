@@ -294,14 +294,14 @@ Mirror actions follow from replica rows rather than events:
 
 ## Configuration
 
-`~/.config/dbox/config.yaml` on both platforms (`$XDG_CONFIG_HOME` respected).
+`~/.config/dbox/config.yml` (an existing `config.yaml` also works) on both platforms (`$XDG_CONFIG_HOME` respected).
 `gopkg.in/yaml.v3` for parsing. Secrets can also come from the standard AWS
 environment variables or `~/.aws/credentials`, which the SDK picks up by
 default when `access_key`/`secret_key` are omitted on a store. Any value can
 be `${ENV_VAR}` and is expanded at load, so secrets stay out of the file.
 
 ```yaml
-# ~/.config/dbox/config.yaml
+# ~/.config/dbox/config.yml
 
 stores:
   minio:                      # name; stable, recorded in the index
@@ -447,7 +447,7 @@ dbox status                   # shows whether the daemon answers and whether the
   absolute path. Upgrading in place with `go install` or Homebrew then needs
   no re-enable.
 - **Config path** is not baked into the unit. The daemon resolves
-  `~/.config/dbox/config.yaml` itself, so editing config and `SIGHUP` (or
+  `~/.config/dbox/config.yml` itself, so editing config and `SIGHUP` (or
   `dbox promote`) is enough.
 - Other platforms get a clear error telling the user to start `dbox run`
   from their session startup.
@@ -491,10 +491,10 @@ of scope for the POC; `dbox service enable` covers `go install` and Homebrew.
 ```sh
 mise install                   # Go 1.26.5 from mise.toml
 make minio                     # two MinIOs: API :9200 and :9300, consoles :9201 and :9301
-make run                       # builds, then dbox run --config dev.config.yaml
+make run                       # builds, then dbox run --config dev.config.yml
 ```
 
-`dev.config.yaml` has minio-a as primary and minio-b as mirror, both with
+`dev.config.yml` has minio-a as primary and minio-b as mirror, both with
 `path_style: true`, and syncs `./tmp/box`. The ports avoid 9000/9001 so dbox
 can run next to another project's MinIO.
 

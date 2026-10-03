@@ -1,4 +1,4 @@
-// Package config loads ~/.config/dbox/config.yaml: the stores, their roles and
+// Package config loads ~/.config/dbox/config.yml: the stores, their roles and
 // the sync settings. See POC.md for the format.
 package config
 
@@ -135,7 +135,9 @@ func defaults() Config {
 	}
 }
 
-// DefaultPath is $XDG_CONFIG_HOME/dbox/config.yaml, falling back to ~/.config.
+// DefaultPath is $DBOX_CONFIG, or config.yml in $XDG_CONFIG_HOME/dbox
+// (falling back to ~/.config/dbox). An existing config.yaml is used when
+// there is no config.yml.
 func DefaultPath() string {
 	if p := os.Getenv("DBOX_CONFIG"); p != "" {
 		return p
@@ -145,7 +147,14 @@ func DefaultPath() string {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".config")
 	}
-	return filepath.Join(dir, "dbox", "config.yaml")
+	ymlPath := filepath.Join(dir, "dbox", "config.yml")
+	yamlPath := filepath.Join(dir, "dbox", "config.yaml")
+	if _, err := os.Stat(ymlPath); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(yamlPath); err == nil {
+			return yamlPath
+		}
+	}
+	return ymlPath
 }
 
 // Load reads the file at path, expands ${VAR} references, applies DBOX_

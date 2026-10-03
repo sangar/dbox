@@ -22,7 +22,7 @@ minio:
 
 run: build
 	mkdir -p tmp/box
-	./dbox run --config dev.config.yaml
+	./dbox run --config dev.config.yml
 
 clean:
 	rm -rf dbox dist tmp

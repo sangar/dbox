@@ -11,7 +11,7 @@ Read [POC.md](POC.md) for the design, the sync rules and what has been verified.
 
 ```sh
 mise install && make build
-cp dev.config.yaml ~/.config/dbox/config.yaml   # then edit stores and sync.root
+cp dev.config.yml ~/.config/dbox/config.yml     # then edit stores and sync.root
 ./dbox check minio-a                            # probe each store
 ./dbox run --once                               # first sync, then exit
 ./dbox service enable                           # keep it running from login
@@ -36,5 +36,5 @@ kill -HUP "$(cat ~/dbox/.dbox/daemon.pid)"
 make minio         # two MinIOs on :9200 and :9300 with a dbox bucket each
 make test          # vet and unit tests, no network
 make integration   # S3 store tests against the MinIOs
-make run           # daemon on dev.config.yaml, syncing ./tmp/box
+make run           # daemon on dev.config.yml, syncing ./tmp/box
 ```

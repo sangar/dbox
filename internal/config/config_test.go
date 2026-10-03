@@ -128,3 +128,18 @@ func TestDefaultPathHonoursEnvironment(t *testing.T) {
 		t.Errorf("DefaultPath() = %q", got)
 	}
 }
+
+func TestDefaultPathPrefersYmlButKeepsAnExistingYaml(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	yml := filepath.Join(dir, "dbox", "config.yml")
+	if got := DefaultPath(); got != yml {
+		t.Errorf("without a file: DefaultPath() = %q", got)
+	}
+	yaml := filepath.Join(dir, "dbox", "config.yaml")
+	os.MkdirAll(filepath.Dir(yaml), 0o755)
+	os.WriteFile(yaml, nil, 0o644)
+	if got := DefaultPath(); got != yaml {
+		t.Errorf("with only config.yaml: DefaultPath() = %q", got)
+	}
+}
