@@ -38,6 +38,7 @@ Usage:
   dbox service enable|disable       run dbox run at login (launchd agent or systemd user unit)
   dbox config [--init]              show the effective config, or write a starter file
   dbox config edit                  open the config in $VISUAL or $EDITOR, then check and reload it
+  dbox reload                       check the config and ask the running daemon to re-read it
   dbox version
 
 Every command takes --config FILE (default %s, env DBOX_CONFIG).
@@ -71,6 +72,8 @@ func run(args []string) error {
 		return cmdService(rest)
 	case "config":
 		return cmdConfig(rest)
+	case "reload":
+		return cmdReload(rest)
 	case "version", "--version":
 		fmt.Println("dbox", version)
 		return nil
@@ -463,6 +466,26 @@ func cmdConfig(args []string) error {
 		return err
 	}
 	fmt.Printf("# %s\n%s", cfg.Path, out)
+	return nil
+}
+
+func cmdReload(args []string) error {
+	fs, configPath := newFlags("reload")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	reloaded, err := daemon.Reload(pidPath(cfg))
+	if err != nil {
+		return fmt.Errorf("signal daemon: %w", err)
+	}
+	if !reloaded {
+		return fmt.Errorf("no daemon is running (no live pid in %s)", pidPath(cfg))
+	}
+	fmt.Println("config is valid; the daemon is reloading it")
 	return nil
 }
 

@@ -379,6 +379,7 @@ dbox retry    <store>                           reset failed replicas on a store
 dbox check    <store>                           write/read/delete a probe object, like immish's "Test connection"
 dbox promote  <store> [--force]                 rewrite config roles and SIGHUP the daemon if running
 dbox service  enable|disable                    run `dbox run` at login (launchd agent or systemd user unit)
+dbox reload   [--config]                        validate the config and SIGHUP the running daemon
 ```
 
 `promote` is the only command that writes the config file. It refuses when

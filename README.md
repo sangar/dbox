@@ -38,7 +38,7 @@ key is described in [POC.md](POC.md#configuration).
 
 ```sh
 # 1. add the new store with role: mirror, then reload the daemon
-kill -HUP "$(cat ~/dbox/.dbox/daemon.pid)"
+dbox reload
 # 2. wait until status shows it at 100%
 dbox status
 # 3. make it the primary; the old primary becomes a mirror
