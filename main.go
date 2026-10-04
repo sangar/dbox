@@ -48,9 +48,17 @@ Every command takes --config FILE (default %s, env DBOX_CONFIG).
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "dbox:", err)
+		if errors.As(err, new(usageError)) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
+
+// usageError marks a mistake on the command line, which exits with status 2.
+type usageError struct{ error }
+
+func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format, a...)} }
 
 func run(args []string) error {
 	if len(args) == 0 {
@@ -82,8 +90,7 @@ func run(args []string) error {
 		printUsage(os.Stdout)
 		return nil
 	}
-	printUsage(os.Stderr)
-	return fmt.Errorf("unknown command %q", cmd)
+	return usagef("unknown command %q (see dbox --help)", cmd)
 }
 
 func printUsage(w io.Writer) { fmt.Fprintf(w, usageText, config.DefaultPath()) }
@@ -93,8 +100,13 @@ func printUsage(w io.Writer) { fmt.Fprintf(w, usageText, config.DefaultPath()) }
 func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
 	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
+		err := fs.Parse(args)
+		if errors.Is(err, flag.ErrHelp) {
+			printUsage(os.Stdout)
+			os.Exit(0)
+		}
+		if err != nil {
+			return nil, usagef("%w (see dbox --help)", err)
 		}
 		if fs.NArg() == 0 {
 			return positional, nil
@@ -106,6 +118,7 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 
 func newFlags(name string) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", config.DefaultPath(), "config file")
 	return fs, configPath
 }
@@ -346,7 +359,7 @@ func storeArg(name string, args []string, extra func(*flag.FlagSet)) (*config.Co
 		return nil, "", err
 	}
 	if len(positional) != 1 {
-		return nil, "", fmt.Errorf("usage: dbox %s STORE", name)
+		return nil, "", usagef("usage: dbox %s STORE", name)
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -441,7 +454,7 @@ func cmdPromote(args []string) error {
 
 func cmdService(args []string) error {
 	if len(args) != 1 || (args[0] != "enable" && args[0] != "disable") {
-		return errors.New("usage: dbox service enable|disable")
+		return usagef("usage: dbox service enable|disable")
 	}
 	if args[0] == "disable" {
 		path, err := service.Disable()
@@ -474,7 +487,7 @@ func cmdConfig(args []string) error {
 	case len(positional) == 1 && positional[0] == "edit":
 		return editConfig(*configPath)
 	case len(positional) > 0:
-		return fmt.Errorf("unknown config action %q (want edit)", positional[0])
+		return usagef("unknown config action %q (want edit)", positional[0])
 	case *initialize:
 		created, err := config.WriteStarter(*configPath)
 		if err != nil {

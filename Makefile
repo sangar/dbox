@@ -1,6 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS  = -s -w -X main.version=$(VERSION)
 GORELEASER = go run github.com/goreleaser/goreleaser/v2@latest
+STATICCHECK = go run honnef.co/go/tools/cmd/staticcheck@latest
 
 .PHONY: build test integration run minio snapshot release clean
 
@@ -9,6 +10,7 @@ build:
 
 test:
 	go vet ./...
+	$(STATICCHECK) ./...
 	go test -race ./...
 
 # Needs `make minio` first.
