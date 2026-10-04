@@ -13,7 +13,8 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	tmtypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -29,7 +30,7 @@ const (
 // time ride along as object metadata.
 type S3 struct {
 	client       *s3.Client
-	uploader     *manager.Uploader
+	uploader     *transfermanager.Client
 	bucket       string
 	prefix       string
 	storageClass types.StorageClass
@@ -54,8 +55,13 @@ func NewS3(ctx context.Context, cfg config.Store, partSize int64) (*S3, error) {
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	return &S3{
-		client:       client,
-		uploader:     manager.NewUploader(client, func(u *manager.Uploader) { u.PartSize = partSize }),
+		client: client,
+		uploader: transfermanager.New(client, func(o *transfermanager.Options) {
+			o.PartSizeBytes = partSize
+			o.MultipartUploadThreshold = partSize
+			// Overrides the client setting above unless set here too.
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}),
 		bucket:       cfg.Bucket,
 		prefix:       cfg.Prefix,
 		storageClass: types.StorageClass(cfg.StorageClass),
@@ -73,12 +79,12 @@ func (s *S3) CreateBucket(ctx context.Context) error {
 }
 
 func (s *S3) Put(ctx context.Context, key string, body io.Reader, _ int64, meta Meta) (string, error) {
-	out, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
+	out, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:       &s.bucket,
 		Key:          aws.String(s.prefix + key),
 		Body:         body,
 		Metadata:     metadata(meta),
-		StorageClass: s.storageClass,
+		StorageClass: tmtypes.StorageClass(s.storageClass),
 	})
 	if err != nil {
 		return "", err
