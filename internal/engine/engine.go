@@ -352,10 +352,14 @@ func (e *Engine) push(ctx context.Context, rel string) error {
 	if primaryCurrent && f.SHA256 == sum {
 		return e.idx.Touch(ctx, rel, info.ModTime().UnixNano())
 	}
-	return e.upload(ctx, rel, sum)
+	return e.upload(ctx, rel, sum, info)
 }
 
-func (e *Engine) upload(ctx context.Context, rel, sum string) error {
+// upload sends rel, whose content hashed to sum when it looked like info, to
+// the primary. If the file changed meanwhile, nothing is recorded and the
+// path is queued again, so the index never describes a version other than
+// the one the primary holds.
+func (e *Engine) upload(ctx context.Context, rel, sum string, info fs.FileInfo) error {
 	if e.dryRun {
 		e.log.Info("would upload", "path", rel, "store", e.primaryName)
 		return nil
@@ -365,13 +369,14 @@ func (e *Engine) upload(ctx context.Context, rel, sum string) error {
 		return err
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
 	etag, err := e.primary.Put(ctx, rel, file, info.Size(), store.Meta{SHA256: sum, ModTime: info.ModTime()})
 	if err != nil {
 		return fmt.Errorf("upload to %s: %w", e.primaryName, err)
+	}
+	if after, err := os.Lstat(e.abs(rel)); err != nil || after.Size() != info.Size() || after.ModTime() != info.ModTime() {
+		e.log.Info("changed during upload; syncing again", "path", rel)
+		e.queue.push(rel)
+		return nil
 	}
 	record := index.File{Path: rel, Size: info.Size(), MTimeNs: info.ModTime().UnixNano(), SHA256: sum}
 	if err := e.idx.RecordSynced(ctx, record, e.primaryName, etag, e.mirrorNames); err != nil {
@@ -536,11 +541,15 @@ func (e *Engine) conflict(ctx context.Context, rel string) error {
 	}
 	e.log.Warn("conflict: kept local version, saved remote beside it", "path", rel, "copy", copyName)
 	e.queue.push(copyName)
+	info, err := os.Lstat(e.abs(rel))
+	if err != nil {
+		return err
+	}
 	sum, err := hashFile(e.abs(rel))
 	if err != nil {
 		return err
 	}
-	return e.upload(ctx, rel, sum)
+	return e.upload(ctx, rel, sum, info)
 }
 
 // remoteGone handles an indexed file that is missing from a listing of the

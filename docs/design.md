@@ -211,8 +211,10 @@ plain queries.
    `PutObject` below `part_size` and multipart above it. Set metadata `x-amz-meta-sha256` and
    `x-amz-meta-mtime` so the remote side carries enough to compare without
    downloading.
-5. Update `files`, set the primary replica row `verified`, and insert a
-   `pending` row for every mirror.
+5. Stat again. If size or mtime moved during the upload, record nothing and
+   queue the path again, so the index never describes a version other than
+   the one the primary holds. Otherwise update `files`, set the primary
+   replica row `verified`, and insert a `pending` row for every mirror.
 
 A path already in flight is marked so a second event for it re-queues once
 the current operation finishes rather than racing.

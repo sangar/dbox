@@ -454,6 +454,43 @@ func TestFailedUploadIsRecordedAndForgottenOnceItSucceeds(t *testing.T) {
 	}
 }
 
+// editsDuringPut rewrites the local file while its first upload is running,
+// like an application still saving when the debounce fired.
+type editsDuringPut struct {
+	store.Store
+	local string
+	done  bool
+}
+
+func (s *editsDuringPut) Put(ctx context.Context, key string, body io.Reader, size int64, meta store.Meta) (string, error) {
+	if !s.done {
+		s.done = true
+		if err := os.WriteFile(s.local, []byte("second, longer version"), 0o644); err != nil {
+			return "", err
+		}
+	}
+	return s.Store.Put(ctx, key, body, size, meta)
+}
+
+func TestFileChangedDuringUploadIsNotRecordedUntilResent(t *testing.T) {
+	ctx := context.Background()
+	dirs := newStores(t, "home")
+	m := newMachine(t, dirs, map[string]config.Role{"home": config.RolePrimary})
+	m.stores["home"] = &editsDuringPut{Store: m.stores["home"], local: filepath.Join(m.root, "saving.txt")}
+	m.write("saving.txt", "first")
+
+	m.once()
+	if f, _ := m.idx.File(ctx, "saving.txt"); f != nil {
+		t.Fatalf("index after an upload the file changed under = %+v, want nothing recorded", f)
+	}
+
+	m.once()
+	expect(t, "primary copy", readFile(t, filepath.Join(dirs["home"], "saving.txt")), "second, longer version")
+	if f, _ := m.idx.File(ctx, "saving.txt"); f == nil || f.Size != int64(len("second, longer version")) {
+		t.Errorf("index after resend = %+v, want the second version", f)
+	}
+}
+
 func eventually(t *testing.T, ok func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
