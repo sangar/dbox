@@ -138,6 +138,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	start(func() { watcher.Run(ctx) })
 	start(func() { e.every(ctx, e.cfg.Sync.PullInterval.D(), "poll", e.poll) })
+	start(func() { e.every(ctx, e.cfg.Sync.PullInterval.D(), "retry", e.retryDueUploads) })
 	start(func() { e.every(ctx, e.cfg.Sync.BackfillInterval.D(), "backfill", e.backfill) })
 
 	e.log.Info("watching", "root", e.root, "primary", e.primaryName, "mirrors", e.mirrorNames)
@@ -268,7 +269,8 @@ func (e *Engine) primaryWorker(ctx context.Context) {
 	}
 }
 
-// process syncs one path under its lock, and retries failures later.
+// process syncs one path under its lock, and records a failure so that
+// retryDueUploads brings the path back after a backoff.
 func (e *Engine) process(ctx context.Context, rel string) {
 	if !e.locks.acquire(rel) {
 		return
@@ -278,9 +280,37 @@ func (e *Engine) process(ctx context.Context, rel string) {
 		e.queue.push(rel)
 	}
 	if err != nil && ctx.Err() == nil {
-		e.log.Error("sync", "path", rel, "err", err)
-		time.AfterFunc(30*time.Second, func() { e.queue.push(rel) })
+		e.recordUploadFailure(ctx, rel, err)
 	}
+}
+
+func (e *Engine) recordUploadFailure(ctx context.Context, rel string, cause error) {
+	attempts := 1
+	if prev, err := e.idx.UploadFailure(ctx, rel); err == nil && prev != nil {
+		attempts = prev.Attempts + 1
+	}
+	if attempts >= index.MaxAttempts {
+		e.log.Error("sync failed; giving up until `dbox retry` or the file changes", "path", rel, "attempts", attempts, "err", cause)
+	} else {
+		e.log.Error("sync failed; will retry", "path", rel, "attempt", attempts, "in", retryDelay(attempts), "err", cause)
+	}
+	if err := e.idx.MarkUploadFailed(ctx, rel, cause, attempts, e.now().Add(retryDelay(attempts))); err != nil {
+		e.log.Error("record failure", "path", rel, "err", err)
+	}
+}
+
+// retryDueUploads queues every failed upload whose backoff has passed.
+func (e *Engine) retryDueUploads(ctx context.Context) error {
+	due, err := e.idx.DueUploads(ctx, e.now())
+	for _, rel := range due {
+		e.queue.push(rel)
+	}
+	return err
+}
+
+// retryDelay doubles from 20 seconds: 20s, 40s, 80s, 160s, 320s.
+func retryDelay(attempts int) time.Duration {
+	return time.Duration(1<<attempts) * 10 * time.Second
 }
 
 // push makes the primary match the local file at rel.
@@ -355,6 +385,9 @@ func (e *Engine) pushDelete(ctx context.Context, rel string) error {
 		return err
 	}
 	if f == nil {
+		if err := e.idx.ClearUploadFailure(ctx, rel); err != nil {
+			return err
+		}
 		inside, err := e.idx.FilesUnder(ctx, rel)
 		for _, child := range inside {
 			e.queue.push(child.Path)

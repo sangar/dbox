@@ -217,6 +217,13 @@ plain queries.
 A path already in flight is marked so a second event for it re-queues once
 the current operation finishes rather than racing.
 
+A failed upload is recorded in `upload_failures` with its error and retried
+with the same backoff as mirror copies: 20s, 40s, 80s, 160s, then 320s. Every
+`pull_interval` the daemon queues the failures whose backoff has passed.
+After five attempts the path waits for `dbox retry <primary>` or a change to
+the file; `dbox status` lists it under the primary. The row is removed when
+the file is synced or deleted.
+
 **mirror workers** — one small pool per mirror, fed by that store's `pending`
 replica rows. Each job copies the object from the primary store to the mirror
 (not from disk, see migration above), `Head`s it on the mirror to confirm size

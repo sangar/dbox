@@ -80,7 +80,7 @@ func (e *Engine) recordFailure(ctx context.Context, r index.Replica, cause error
 	if errors.Is(cause, errSourceMissing) {
 		attempts = index.MaxAttempts
 	}
-	retryAt := e.now().Add(time.Duration(1<<attempts) * 10 * time.Second)
+	retryAt := e.now().Add(retryDelay(attempts))
 	e.log.Warn("mirror copy failed", "store", r.Store, "path", r.Path, "attempt", attempts, "err", cause)
 	if err := e.idx.MarkFailed(ctx, r.Path, r.Store, cause, attempts, retryAt); err != nil {
 		e.log.Error("record failure", "err", err)

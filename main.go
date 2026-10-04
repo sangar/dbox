@@ -265,23 +265,35 @@ func cmdStatus(args []string) error {
 	defer idx.Close()
 	fmt.Println()
 	fmt.Printf("%-12s %-9s %8s %8s %8s %8s %10s\n", "STORE", "ROLE", "FILES", "VERIFIED", "PENDING", "FAILED", "COPIED")
-	var failed []index.Replica
+	uploads, err := idx.FailedUploads(ctx)
+	if err != nil {
+		return err
+	}
+	var failed []string
 	for _, name := range storeNames(cfg) {
 		s, err := idx.Stats(ctx, name)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%-12s %-9s %8d %8d %8d %8d %9.0f%%\n", name, cfg.Stores[name].Role, s.Files, s.Verified, s.Pending, s.Failed, percent(s))
-		f, err := idx.Failed(ctx, name, 10)
+		copies, err := idx.Failed(ctx, name, 10)
 		if err != nil {
 			return err
 		}
-		failed = append(failed, f...)
+		for _, r := range copies {
+			failed = append(failed, fmt.Sprintf("%s  %s  %s", r.Store, r.Path, r.LastError))
+		}
+		if name == cfg.Primary() {
+			s.Failed = int64(len(uploads))
+			for _, u := range uploads[:min(10, len(uploads))] {
+				failed = append(failed, fmt.Sprintf("%s  %s  %s", name, u.Path, u.LastError))
+			}
+		}
+		fmt.Printf("%-12s %-9s %8d %8d %8d %8d %9.0f%%\n", name, cfg.Stores[name].Role, s.Files, s.Verified, s.Pending, s.Failed, percent(s))
 	}
 	if len(failed) > 0 {
 		fmt.Println("\nfailed copies (`dbox retry STORE` to try again):")
-		for _, r := range failed {
-			fmt.Printf("  %s  %s  %s\n", r.Store, r.Path, r.LastError)
+		for _, line := range failed {
+			fmt.Println(" ", line)
 		}
 	}
 	return nil
@@ -346,6 +358,14 @@ func cmdRetry(args []string) error {
 		return err
 	}
 	defer idx.Close()
+	if name == cfg.Primary() {
+		n, err := idx.RetryFailedUploads(context.Background())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%d failed uploads to %s are due again; the daemon retries them within %s\n", n, name, cfg.Sync.PullInterval.D())
+		return nil
+	}
 	n, err := idx.RetryFailed(context.Background(), name)
 	if err != nil {
 		return err

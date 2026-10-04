@@ -2,8 +2,11 @@ package index
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 )
 
 func open(t *testing.T) *Index {
@@ -70,5 +73,36 @@ func TestBackfillAndStats(t *testing.T) {
 	}
 	if s.Unverified() != 1 {
 		t.Errorf("unverified = %d", s.Unverified())
+	}
+}
+
+func TestUploadFailuresAreDueAfterBackoffUntilGivenUp(t *testing.T) {
+	ctx := context.Background()
+	idx := open(t)
+	now := time.Now()
+	if err := idx.MarkUploadFailed(ctx, "a", errors.New("504"), 1, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.MarkUploadFailed(ctx, "b", errors.New("403"), MaxAttempts, now); err != nil {
+		t.Fatal(err)
+	}
+	if due, _ := idx.DueUploads(ctx, now); len(due) != 0 {
+		t.Errorf("due before backoff = %v, want none", due)
+	}
+	if due, _ := idx.DueUploads(ctx, now.Add(time.Minute)); !slices.Equal(due, []string{"a"}) {
+		t.Errorf("due after backoff = %v, want [a]; b has used its attempts", due)
+	}
+	if n, _ := idx.RetryFailedUploads(ctx); n != 2 {
+		t.Errorf("retried %d, want 2", n)
+	}
+	if due, _ := idx.DueUploads(ctx, now); !slices.Equal(due, []string{"a", "b"}) {
+		t.Errorf("due after retry = %v, want [a b]", due)
+	}
+	if err := idx.RecordSynced(ctx, File{Path: "a", Size: 1, SHA256: "x"}, "p", "e1", nil); err != nil {
+		t.Fatal(err)
+	}
+	failed, _ := idx.FailedUploads(ctx)
+	if len(failed) != 1 || failed[0].Path != "b" || failed[0].LastError != "403" {
+		t.Errorf("failed after a synced = %+v, want only b", failed)
 	}
 }

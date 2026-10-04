@@ -419,6 +419,41 @@ func TestPollDownloadsInParallel(t *testing.T) {
 	expect(t, "two", m.read("two.txt"), "2")
 }
 
+// rejectingPuts fails every Put while rejecting is set.
+type rejectingPuts struct {
+	store.Store
+	rejecting bool
+}
+
+func (s *rejectingPuts) Put(ctx context.Context, key string, body io.Reader, size int64, meta store.Meta) (string, error) {
+	if s.rejecting {
+		return "", errors.New("503 slow down")
+	}
+	return s.Store.Put(ctx, key, body, size, meta)
+}
+
+func TestFailedUploadIsRecordedAndForgottenOnceItSucceeds(t *testing.T) {
+	ctx := context.Background()
+	dirs := newStores(t, "home")
+	m := newMachine(t, dirs, map[string]config.Role{"home": config.RolePrimary})
+	primary := &rejectingPuts{Store: m.stores["home"], rejecting: true}
+	m.stores["home"] = primary
+	m.write("flaky.txt", "content")
+
+	m.once()
+	failed, _ := m.idx.FailedUploads(ctx)
+	if len(failed) != 1 || failed[0].Path != "flaky.txt" || failed[0].Attempts != 1 || !strings.Contains(failed[0].LastError, "503") {
+		t.Fatalf("failed uploads = %+v, want flaky.txt after one attempt", failed)
+	}
+
+	primary.rejecting = false
+	m.once()
+	expect(t, "primary copy", readFile(t, filepath.Join(dirs["home"], "flaky.txt")), "content")
+	if failed, _ := m.idx.FailedUploads(ctx); len(failed) != 0 {
+		t.Errorf("failed uploads after success = %+v, want none", failed)
+	}
+}
+
 func eventually(t *testing.T, ok func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {

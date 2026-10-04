@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS replicas (
   PRIMARY KEY (path, store)
 );
 CREATE INDEX IF NOT EXISTS replicas_by_store_state ON replicas (store, state);
+CREATE TABLE IF NOT EXISTS upload_failures (
+  path            TEXT PRIMARY KEY,
+  attempts        INTEGER NOT NULL,
+  next_attempt_at INTEGER NOT NULL,
+  last_error      TEXT    NOT NULL
+);
 `
 
 // File is a path the daemon has synced. Deleted marks a tombstone: the file is
@@ -138,6 +144,9 @@ func (x *Index) RecordSynced(ctx context.Context, f File, primary, etag string, 
 			f.Path, f.Size, f.MTimeNs, f.SHA256, now); err != nil {
 			return err
 		}
+		if err := clearUploadFailure(tx, f.Path); err != nil {
+			return err
+		}
 		if err := setVerified(tx, f.Path, primary, etag, now); err != nil {
 			return err
 		}
@@ -162,6 +171,9 @@ func (x *Index) Touch(ctx context.Context, path string, mtimeNs int64) error {
 func (x *Index) Tombstone(ctx context.Context, path, primary string, keepPrimary bool) error {
 	return x.tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`UPDATE files SET deleted = 1, synced_at = ? WHERE path = ?`, time.Now().UnixNano(), path); err != nil {
+			return err
+		}
+		if err := clearUploadFailure(tx, path); err != nil {
 			return err
 		}
 		if !keepPrimary {
@@ -282,6 +294,89 @@ func (x *Index) RetryFailed(ctx context.Context, store string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// UploadFailure is a local file the primary has refused so far.
+type UploadFailure struct {
+	Path      string
+	Attempts  int
+	LastError string
+}
+
+// MarkUploadFailed records that uploading path to the primary failed and
+// when it is worth trying again.
+func (x *Index) MarkUploadFailed(ctx context.Context, path string, cause error, attempts int, retryAt time.Time) error {
+	_, err := x.db.ExecContext(ctx, `INSERT INTO upload_failures (path, attempts, next_attempt_at, last_error) VALUES (?, ?, ?, ?)
+		ON CONFLICT (path) DO UPDATE SET attempts = excluded.attempts, next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error`,
+		path, attempts, retryAt.UnixNano(), cause.Error())
+	return err
+}
+
+// UploadFailure returns the recorded failure for path, or nil.
+func (x *Index) UploadFailure(ctx context.Context, path string) (*UploadFailure, error) {
+	var f UploadFailure
+	err := x.db.QueryRowContext(ctx, `SELECT path, attempts, last_error FROM upload_failures WHERE path = ?`, path).
+		Scan(&f.Path, &f.Attempts, &f.LastError)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &f, err
+}
+
+// ClearUploadFailure forgets path's failure, for a file that is gone.
+func (x *Index) ClearUploadFailure(ctx context.Context, path string) error {
+	return x.tx(ctx, func(tx *sql.Tx) error { return clearUploadFailure(tx, path) })
+}
+
+// DueUploads returns the paths whose upload is worth retrying at now.
+func (x *Index) DueUploads(ctx context.Context, now time.Time) ([]string, error) {
+	rows, err := x.db.QueryContext(ctx, `SELECT path FROM upload_failures WHERE attempts < ? AND next_attempt_at <= ? ORDER BY path`,
+		MaxAttempts, now.UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// FailedUploads returns every recorded upload failure.
+func (x *Index) FailedUploads(ctx context.Context) ([]UploadFailure, error) {
+	rows, err := x.db.QueryContext(ctx, `SELECT path, attempts, last_error FROM upload_failures ORDER BY path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UploadFailure
+	for rows.Next() {
+		var f UploadFailure
+		if err := rows.Scan(&f.Path, &f.Attempts, &f.LastError); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// RetryFailedUploads makes every recorded upload failure due again.
+func (x *Index) RetryFailedUploads(ctx context.Context) (int64, error) {
+	res, err := x.db.ExecContext(ctx, `UPDATE upload_failures SET attempts = 0, next_attempt_at = 0`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func clearUploadFailure(tx *sql.Tx, path string) error {
+	_, err := tx.Exec(`DELETE FROM upload_failures WHERE path = ?`, path)
+	return err
 }
 
 // Stats summarises one store's copies of live files.
