@@ -154,7 +154,7 @@ func cmdRun(args []string) error {
 			slog.Info("reloading config", "path", cfg.Path)
 			cancel()
 			if err := <-done; err != nil {
-				return err
+				slog.Warn("stopped for reload", "err", err)
 			}
 		}
 	}

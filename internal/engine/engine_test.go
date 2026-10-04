@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -335,6 +336,47 @@ func TestDaemonPushesEditsAsTheyHappen(t *testing.T) {
 	eventually(t, func() bool {
 		return readFile(t, filepath.Join(dirs["home"], "new/dir/a.txt")) == "<missing>" &&
 			readFile(t, filepath.Join(dirs["nas"], "new/dir/a.txt")) == "<missing>"
+	})
+}
+
+// offlineListing fails List until online is closed, like a daemon that
+// starts before the network is up.
+type offlineListing struct {
+	store.Store
+	online chan struct{}
+}
+
+func (s offlineListing) List(ctx context.Context) ([]store.Object, error) {
+	select {
+	case <-s.online:
+		return s.Store.List(ctx)
+	default:
+		return nil, errors.New("network is unreachable")
+	}
+}
+
+func TestDaemonRetriesReconcileInsteadOfExiting(t *testing.T) {
+	dirs := newStores(t, "home")
+	m := newMachine(t, dirs, map[string]config.Role{"home": config.RolePrimary})
+	online := make(chan struct{})
+	m.stores["home"] = offlineListing{Store: m.stores["home"], online: online}
+	m.write("written-while-offline.txt", "queued")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- m.engine().Run(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	expect(t, "before the network is up", readFile(t, filepath.Join(dirs["home"], "written-while-offline.txt")), "<missing>")
+	close(online)
+	eventually(t, func() bool {
+		return readFile(t, filepath.Join(dirs["home"], "written-while-offline.txt")) == "queued"
 	})
 }
 

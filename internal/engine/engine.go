@@ -108,8 +108,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err := os.MkdirAll(e.root, 0o755); err != nil {
 		return err
 	}
-	if err := e.Reconcile(ctx); err != nil {
-		return err
+	e.reconcileUntilDone(ctx)
+	if ctx.Err() != nil {
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -143,6 +144,25 @@ func (e *Engine) Run(ctx context.Context) error {
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+// reconcileUntilDone keeps retrying the startup reconcile, one pull interval
+// apart, until it succeeds or ctx is done. The daemon is usually started by
+// launchd or systemd before the network is up, and giving up would only
+// make the supervisor restart it into the same situation.
+func (e *Engine) reconcileUntilDone(ctx context.Context) {
+	for {
+		err := e.Reconcile(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		e.log.Error("reconcile; retrying", "err", err, "in", e.cfg.Sync.PullInterval.D())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(e.cfg.Sync.PullInterval.D()):
+		}
+	}
 }
 
 func (e *Engine) every(ctx context.Context, interval time.Duration, name string, fn func(context.Context) error) {
