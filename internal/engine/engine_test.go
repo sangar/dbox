@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,6 +379,44 @@ func TestDaemonRetriesReconcileInsteadOfExiting(t *testing.T) {
 	eventually(t, func() bool {
 		return readFile(t, filepath.Join(dirs["home"], "written-while-offline.txt")) == "queued"
 	})
+}
+
+// concurrentGets lets a Get proceed only once `want` of them are in flight
+// together, so it fails when downloads run one after another.
+type concurrentGets struct {
+	store.Store
+	want     int
+	mu       sync.Mutex
+	inFlight int
+	ready    chan struct{}
+}
+
+func (s *concurrentGets) Get(ctx context.Context, key string) (io.ReadCloser, store.Object, error) {
+	s.mu.Lock()
+	s.inFlight++
+	if s.inFlight == s.want {
+		close(s.ready)
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.ready:
+		return s.Store.Get(ctx, key)
+	case <-time.After(2 * time.Second):
+		return nil, store.Object{}, errors.New("downloads did not overlap")
+	}
+}
+
+func TestPollDownloadsInParallel(t *testing.T) {
+	dirs := newStores(t, "home")
+	m := newMachine(t, dirs, map[string]config.Role{"home": config.RolePrimary})
+	m.stores["home"] = &concurrentGets{Store: m.stores["home"], want: 2, ready: make(chan struct{})}
+	writeFile(t, filepath.Join(dirs["home"], "one.txt"), "1")
+	writeFile(t, filepath.Join(dirs["home"], "two.txt"), "2")
+
+	m.once()
+
+	expect(t, "one", m.read("one.txt"), "1")
+	expect(t, "two", m.read("two.txt"), "2")
 }
 
 func eventually(t *testing.T, ok func() bool) {

@@ -388,13 +388,24 @@ func (e *Engine) poll(ctx context.Context) error {
 		return err
 	}
 	remote := map[string]bool{}
+	work := make(chan store.Object)
+	var wg sync.WaitGroup
+	for range e.cfg.Stores[e.primaryName].Workers {
+		wg.Go(func() {
+			for obj := range work {
+				e.withLock(obj.Key, func() error { return e.pull(ctx, obj) })
+			}
+		})
+	}
 	for _, obj := range objects {
 		if e.ignore.Match(obj.Key, false) {
 			continue
 		}
 		remote[obj.Key] = true
-		e.withLock(obj.Key, func() error { return e.pull(ctx, obj) })
+		work <- obj
 	}
+	close(work)
+	wg.Wait()
 	files, err := e.idx.Files(ctx)
 	if err != nil {
 		return err
