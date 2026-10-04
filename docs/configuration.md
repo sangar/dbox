@@ -72,7 +72,7 @@ sync:
 daemon:
   log_level: info             # debug | info | warn | error
   log_format: text            # text | json
-  listen: 127.0.0.1:7878      # /healthz and /metrics; empty disables
+  listen: 127.0.0.1:7878      # /healthz, /metrics and /status; empty disables
 ```
 
 ## Validation

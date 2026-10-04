@@ -34,6 +34,13 @@ func (d *Debouncer) Trigger(key string) {
 	})
 }
 
+// Pending is how many keys are in their quiet period.
+func (d *Debouncer) Pending() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.timers)
+}
+
 // Stop cancels every pending call.
 func (d *Debouncer) Stop() {
 	d.mu.Lock()

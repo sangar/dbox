@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -179,7 +180,8 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	}
 	return withEngine(ctx, cfg, false, func(e *engine.Engine, idx *index.Index) error {
 		go func() {
-			if err := daemon.Serve(ctx, cfg.Daemon.Listen, func(ctx context.Context) (string, error) { return metrics(ctx, cfg, idx) }); err != nil {
+			status := func() daemon.Status { return daemon.Status{Backlog: e.Backlog()} }
+			if err := daemon.Serve(ctx, cfg.Daemon.Listen, func(ctx context.Context) (string, error) { return metrics(ctx, cfg, idx, e) }, status); err != nil {
 				slog.Error("health listener", "addr", cfg.Daemon.Listen, "err", err)
 			}
 		}()
@@ -215,8 +217,9 @@ func newLogger(d config.Daemon) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
 
-func metrics(ctx context.Context, cfg *config.Config, idx *index.Index) (string, error) {
+func metrics(ctx context.Context, cfg *config.Config, idx *index.Index, e *engine.Engine) (string, error) {
 	var b strings.Builder
+	fmt.Fprintf(&b, "dbox_upload_backlog %d\n", e.Backlog())
 	for _, name := range storeNames(cfg) {
 		s, err := idx.Stats(ctx, name)
 		if err != nil {
@@ -269,6 +272,10 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	backlog := "-"
+	if s, ok := daemon.Ask(cfg.Daemon.Listen); ok {
+		backlog = strconv.Itoa(s.Backlog)
+	}
 	var failed []string
 	for _, name := range storeNames(cfg) {
 		s, err := idx.Stats(ctx, name)
@@ -283,10 +290,13 @@ func cmdStatus(args []string) error {
 			failed = append(failed, fmt.Sprintf("%s  %s  %s", r.Store, r.Path, r.LastError))
 		}
 		if name == cfg.Primary() {
-			s.Failed = int64(len(uploads))
 			for _, u := range uploads[:min(10, len(uploads))] {
 				failed = append(failed, fmt.Sprintf("%s  %s  %s", name, u.Path, u.LastError))
 			}
+			// Every indexed file is on the primary by definition, so its row
+			// shows what is still on the way there instead.
+			fmt.Printf("%-12s %-9s %8d %8d %8s %8d %10s\n", name, cfg.Stores[name].Role, s.Files, s.Verified, backlog, len(uploads), "-")
+			continue
 		}
 		fmt.Printf("%-12s %-9s %8d %8d %8d %8d %9.0f%%\n", name, cfg.Stores[name].Role, s.Files, s.Verified, s.Pending, s.Failed, percent(s))
 	}

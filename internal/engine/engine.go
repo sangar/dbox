@@ -41,6 +41,7 @@ type Engine struct {
 	mirrors     map[string]store.Store
 	mirrorNames []string
 	queue       *queue
+	debouncer   *debounce.Debouncer
 	locks       *pathLocks
 	wake        map[string]chan struct{}
 	now         func() time.Time
@@ -77,6 +78,7 @@ func New(cfg *config.Config, idx *index.Index, stores map[string]store.Store, op
 		wake:        map[string]chan struct{}{},
 		now:         time.Now,
 	}
+	e.debouncer = debounce.New(cfg.Sync.Debounce.D(), e.queue.push)
 	for _, name := range e.mirrorNames {
 		e.mirrors[name] = stores[name]
 		e.wake[name] = make(chan struct{}, 1)
@@ -128,9 +130,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		start(func() { e.mirrorLoop(ctx, name) })
 	}
 
-	debouncer := debounce.New(e.cfg.Sync.Debounce.D(), e.queue.push)
-	defer debouncer.Stop()
-	watcher, err := watch.New(e.root, e.ignore.Match, debouncer.Trigger, e.log)
+	defer e.debouncer.Stop()
+	watcher, err := watch.New(e.root, e.ignore.Match, e.debouncer.Trigger, e.log)
 	if err != nil {
 		cancel()
 		wg.Wait()
@@ -165,6 +166,10 @@ func (e *Engine) reconcileUntilDone(ctx context.Context) {
 		}
 	}
 }
+
+// Backlog is how many changed paths have not reached the primary yet: still
+// settling in the debouncer, queued, or in the middle of a sync.
+func (e *Engine) Backlog() int { return e.debouncer.Pending() + e.queue.len() + e.locks.inFlight() }
 
 func (e *Engine) every(ctx context.Context, interval time.Duration, name string, fn func(context.Context) error) {
 	t := time.NewTicker(interval)

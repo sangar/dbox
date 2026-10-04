@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -54,14 +55,23 @@ func Reload(path string) (bool, error) {
 	return true, syscall.Kill(pid, syscall.SIGHUP)
 }
 
-// Serve answers /healthz and /metrics on addr until ctx is done. An empty
-// addr disables the listener.
-func Serve(ctx context.Context, addr string, metrics func(context.Context) (string, error)) error {
+// Status is what the daemon reports about itself to `dbox status`.
+type Status struct {
+	Backlog int `json:"backlog"`
+}
+
+// Serve answers /healthz, /metrics and /status on addr until ctx is done. An
+// empty addr disables the listener.
+func Serve(ctx context.Context, addr string, metrics func(context.Context) (string, error), status func() Status) error {
 	if addr == "" {
 		return nil
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status())
+	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		body, err := metrics(r.Context())
 		if err != nil {
@@ -84,6 +94,22 @@ func Serve(ctx context.Context, addr string, metrics func(context.Context) (stri
 		return err
 	}
 	return nil
+}
+
+// Ask fetches the running daemon's Status from addr. It reports false when
+// no daemon answers there.
+func Ask(addr string) (Status, bool) {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/status")
+	if err != nil {
+		return Status{}, false
+	}
+	defer resp.Body.Close()
+	var s Status
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&s) != nil {
+		return Status{}, false
+	}
+	return s, true
 }
 
 // RaiseFileLimit lifts the soft open-file limit to the hard limit. kqueue on

@@ -270,7 +270,8 @@ removed store's workers are stopped and its replica rows left in place (they
 are harmless and come back if the store is re-added under the same name).
 
 **daemon** — `signal.NotifyContext` for SIGINT/SIGTERM, structured logs via
-`log/slog`, a `/healthz` and `/metrics` HTTP listener on localhost (optional).
+`log/slog`, a `/healthz`, `/metrics` and `/status` HTTP listener on localhost
+(optional). `dbox status` reads the upload backlog from `/status`.
 Supervised by launchd on macOS and systemd on Linux; no self-daemonising.
 
 ## Sync algorithm summary

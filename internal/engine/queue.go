@@ -28,6 +28,12 @@ func (q *queue) push(p string) {
 	}
 }
 
+func (q *queue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
 // pop returns the next path, or false when done is closed first.
 func (q *queue) pop(done <-chan struct{}) (string, bool) {
 	for {
@@ -65,6 +71,12 @@ type pathLocks struct {
 
 func newPathLocks() *pathLocks {
 	return &pathLocks{busy: map[string]bool{}, dirty: map[string]bool{}}
+}
+
+func (l *pathLocks) inFlight() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.busy)
 }
 
 func (l *pathLocks) acquire(p string) bool {

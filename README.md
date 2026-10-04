@@ -63,7 +63,7 @@ dbox status
 
 ```
 dbox run [--once] [--dry-run]     the daemon; --once reconciles, copies to mirrors and exits
-dbox status                       daemon and service state, per-store copies, failed files
+dbox status                       daemon and service state, upload backlog, per-store copies, failed files
 dbox retry STORE                  make failed copies on STORE pending again
 dbox check STORE                  write, read back and delete a probe object on STORE
 dbox promote STORE [--force]      make STORE the primary; the old primary becomes a mirror
@@ -136,7 +136,8 @@ on Linux a systemd user unit (`journalctl --user -u dbox`). It starts the
 `dbox` on your `PATH`, so upgrading the binary is enough.
 
 - **Reload:** `dbox config edit` and `dbox promote` tell the daemon to reload. After editing the file another way, run `dbox reload`.
-- **Health:** the daemon serves `/healthz` and `/metrics` on `127.0.0.1:7878`. Set `daemon.listen` to an empty string to turn this off.
+- **Health:** the daemon serves `/healthz`, `/metrics` and `/status` on `127.0.0.1:7878`. `dbox status` asks `/status` for the upload backlog, so with `daemon.listen` set to an empty string that column shows `-`.
+- **Reading the table:** every indexed file is on the primary by definition, so the primary row shows the backlog still to upload under PENDING and failed uploads under FAILED. Mirror rows show copies pending, failed and the share of bytes verified.
 - **Failed copies:** `dbox status` lists them. Fix the cause, then run `dbox retry STORE`.
 
 ## More
