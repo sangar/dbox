@@ -275,7 +275,7 @@ Supervised by launchd on macOS and systemd on Linux; no self-daemonising.
 | poll, key new | absent | present | download |
 | poll, etag changed | unchanged | changed | download |
 | poll, etag changed | changed | changed | conflict copy, upload local |
-| poll, key gone | present, synced | absent | delete local |
+| poll, key gone, Head confirms | present, synced | absent | delete local |
 | reconcile, local newer than index | changed | ? | upload |
 | reconcile, in index, missing locally | gone | present | delete remote |
 

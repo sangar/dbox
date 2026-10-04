@@ -474,8 +474,15 @@ func (e *Engine) conflict(ctx context.Context, rel string) error {
 	return e.upload(ctx, rel, sum)
 }
 
-// remoteGone handles an indexed file that is no longer on the primary.
+// remoteGone handles an indexed file that is missing from a listing of the
+// primary. The listing may predate an upload that finished while the poll
+// was still pulling, so the miss is confirmed before anything is deleted.
 func (e *Engine) remoteGone(ctx context.Context, f index.File) error {
+	if _, err := e.primary.Head(ctx, f.Path); err == nil {
+		return nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
 	r, err := e.idx.Replica(ctx, f.Path, e.primaryName)
 	if err != nil {
 		return err

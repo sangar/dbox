@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -170,6 +171,37 @@ func TestChangesMadeOnOneMachineArriveOnAnother(t *testing.T) {
 	a.once()
 	b.once()
 	expect(t, "b after delete", b.read("shared.txt"), "<missing>")
+}
+
+// staleListing hides one key from List, as a listing taken before that
+// file's upload finished would.
+type staleListing struct {
+	store.Store
+	hidden string
+}
+
+func (s staleListing) List(ctx context.Context) ([]store.Object, error) {
+	objects, err := s.Store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(objects, func(o store.Object) bool { return o.Key == s.hidden }), nil
+}
+
+func TestFileMissingFromStaleListingIsNotDeletedLocally(t *testing.T) {
+	dirs := newStores(t, "home")
+	m := newMachine(t, dirs, map[string]config.Role{"home": config.RolePrimary})
+	m.write("fresh.txt", "just uploaded")
+	m.once()
+
+	m.stores["home"] = staleListing{Store: m.stores["home"], hidden: "fresh.txt"}
+	m.once()
+
+	expect(t, "local file", m.read("fresh.txt"), "just uploaded")
+	f, err := m.idx.File(context.Background(), "fresh.txt")
+	if err != nil || f == nil || f.Deleted {
+		t.Errorf("index row = %+v, %v; want a live row", f, err)
+	}
 }
 
 func TestIdenticalFileOnSecondMachineIsAdoptedNotConflicted(t *testing.T) {
