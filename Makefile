@@ -1,7 +1,8 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-override CFLAGS += -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Wshadow -Wno-unused-parameter \
+override CFLAGS += -std=c23 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE \
+           -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter \
            -pthread -DDBOX_VERSION='"$(VERSION)"'
 PKG_CONFIG ?= pkg-config
 DEPS     = yaml-0.1 libcurl sqlite3

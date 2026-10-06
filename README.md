@@ -31,6 +31,19 @@ kernel extensions.
 
 State lives in `<folder>/.dbox/`, which is never synced.
 
+## Profile
+
+```text
+Language:   C23
+Compilers:  clang >= 18 (primary), gcc >= 14
+Targets:    linux-x86_64, linux-aarch64, macos-aarch64
+Extensions: __attribute__((format(printf, ...))) on variadic formatters
+```
+
+Windows is not a target: dbox is POSIX throughout and its login service is a
+launchd agent or a systemd user unit. Warnings are errors, and the test suite
+also runs under AddressSanitizer and UndefinedBehaviorSanitizer.
+
 ## Build
 
 Requires a C11 compiler, `make`, `pkg-config` and three libraries:
