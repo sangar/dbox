@@ -91,7 +91,7 @@ static void *work_main(void *arg) {
 void run_workers(Engine *e, int workers, void **items, size_t count, void (*fn)(Engine *, void *)) {
     Work w = {.e = e, .items = items, .count = count, .fn = fn};
     atomic_init(&w.next, 0);
-    size_t n = MIN((size_t)MAX(workers, 1), count);
+    size_t n = min_size((size_t)(workers > 1 ? workers : 1), count);
     pthread_t *threads = xcalloc(n + 1, sizeof *threads);
     for (size_t i = 0; i < n; i++) pthread_create(&threads[i], NULL, work_main, &w);
     for (size_t i = 0; i < n; i++) pthread_join(threads[i], NULL);
@@ -143,7 +143,7 @@ static bool upload(Engine *e, const char *rel, const char *sum, const struct sta
  */
 static bool upload(Engine *e, const char *rel, const char *sum, const struct stat *info, Err *err) {
     if (e->dry_run) {
-        log_info(e->log, "would upload", LS("path", rel), LS("store", e->primary_name));
+        log_info(e->log, "would upload", log_str("path", rel), log_str("store", e->primary_name), log_end());
         return true;
     }
     char *abs = engine_abs(e, rel);
@@ -168,13 +168,13 @@ static bool upload(Engine *e, const char *rel, const char *sum, const struct sta
     bool unchanged = lstat(abs, &after) == 0 && after.st_size == info->st_size && stat_mtime_ns(&after) == stat_mtime_ns(info);
     free(abs);
     if (!unchanged) {
-        log_info(e->log, "changed during upload; syncing again", LS("path", rel));
+        log_info(e->log, "changed during upload; syncing again", log_str("path", rel), log_end());
         queue_push(&e->queue, e->ctx, rel);
         return true;
     }
     IndexFile record = {.path = rel, .size = info->st_size, .mtime_ns = stat_mtime_ns(info), .sha256 = sum};
     if (!index_record_synced(e->idx, &record, e->primary_name, etag, e->mirror_names, e->mirror_count, err)) return false;
-    log_info(e->log, "uploaded", LS("path", rel), LS("store", e->primary_name), LI("bytes", info->st_size));
+    log_info(e->log, "uploaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", info->st_size), log_end());
     engine_wake_mirrors(e);
     return true;
 }
@@ -197,7 +197,7 @@ static bool push_delete(Engine *e, const char *rel, Err *err) {
     }
     if (f.deleted) goto out;
     if (e->dry_run) {
-        log_info(e->log, "would delete", LS("path", rel), LS("store", e->primary_name));
+        log_info(e->log, "would delete", log_str("path", rel), log_str("store", e->primary_name), log_end());
         goto out;
     }
     if (e->cfg->sync.delete_remote) {
@@ -207,7 +207,7 @@ static bool push_delete(Engine *e, const char *rel, Err *err) {
             ok = false;
             goto out;
         }
-        log_info(e->log, "deleted", LS("path", rel), LS("store", e->primary_name));
+        log_info(e->log, "deleted", log_str("path", rel), log_str("store", e->primary_name), log_end());
     }
     ok = index_tombstone(e->idx, rel, e->primary_name, !e->cfg->sync.delete_remote, err);
     if (ok) engine_wake_mirrors(e);
@@ -261,12 +261,12 @@ static void record_upload_failure(Engine *e, const char *rel, const Err *cause) 
     Err err;
     if (index_upload_failure(e->idx, &a, rel, &prev, &found, &err) && found) attempts = prev.attempts + 1;
     if (attempts >= MAX_ATTEMPTS) {
-        log_error(e->log, "sync failed; giving up until `dbox retry` or the file changes", LS("path", rel), LI("attempts", attempts), LERR(cause));
+        log_error(e->log, "sync failed; giving up until `dbox retry` or the file changes", log_str("path", rel), log_int("attempts", attempts), log_err(cause), log_end());
     } else {
-        log_error(e->log, "sync failed; will retry", LS("path", rel), LI("attempt", attempts), LD("in", retry_delay_ns(attempts)), LERR(cause));
+        log_error(e->log, "sync failed; will retry", log_str("path", rel), log_int("attempt", attempts), log_dur("in", retry_delay_ns(attempts)), log_err(cause), log_end());
     }
     if (!index_mark_upload_failed(e->idx, rel, cause->msg, attempts, wall_ns() + retry_delay_ns(attempts), &err))
-        log_error(e->log, "record failure", LS("path", rel), LERR(&err));
+        log_error(e->log, "record failure", log_str("path", rel), log_err(&err), log_end());
     arena_free(&a);
 }
 
@@ -371,7 +371,7 @@ static bool download_to(Engine *e, const char *key, const char *rel, bool record
 
 static bool download(Engine *e, const char *key, const char *rel, Err *err) {
     if (e->dry_run) {
-        log_info(e->log, "would download", LS("path", rel), LS("store", e->primary_name));
+        log_info(e->log, "would download", log_str("path", rel), log_str("store", e->primary_name), log_end());
         return true;
     }
     return download_to(e, key, rel, true, err);
@@ -428,7 +428,7 @@ static bool download_to(Engine *e, const char *key, const char *rel, bool record
         err_sys(err, "rename %s", abs);
         goto done;
     }
-    log_info(e->log, "downloaded", LS("path", rel), LS("store", e->primary_name), LI("bytes", st.st_size));
+    log_info(e->log, "downloaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", st.st_size), log_end());
     ok = true;
 done:
     if (out >= 0) close(out);
@@ -455,12 +455,12 @@ static bool conflict(Engine *e, const char *rel, Err *err) {
     const char *copy_name = sb_cstr(&copy);
     bool ok = true;
     if (e->dry_run) {
-        log_info(e->log, "would save conflict copy", LS("path", rel), LS("copy", copy_name));
+        log_info(e->log, "would save conflict copy", log_str("path", rel), log_str("copy", copy_name), log_end());
         goto out;
     }
     ok = download_to(e, rel, copy_name, false, err);
     if (!ok) goto out;
-    log_warn(e->log, "conflict: kept local version, saved remote beside it", LS("path", rel), LS("copy", copy_name));
+    log_warn(e->log, "conflict: kept local version, saved remote beside it", log_str("path", rel), log_str("copy", copy_name), log_end());
     queue_push(&e->queue, e->ctx, copy_name);
     char *abs = engine_abs(e, rel);
     struct stat st;
@@ -492,7 +492,7 @@ static bool adopt_or_conflict(Engine *e, const Object *obj, const LocalFile *loc
     if (!ok) return false;
     if (strcmp(head.sha256, sum) != 0) return conflict(e, obj->key, err);
     if (e->dry_run) {
-        log_info(e->log, "would adopt", LS("path", obj->key));
+        log_info(e->log, "would adopt", log_str("path", obj->key), log_end());
         return true;
     }
     IndexFile record = {.path = obj->key, .size = local->size, .mtime_ns = local->mtime_ns, .sha256 = sum};
@@ -566,7 +566,7 @@ static bool remote_gone(Engine *e, const IndexFile *f, Err *err) {
         goto out;
     }
     if (e->dry_run) {
-        log_info(e->log, "would delete local", LS("path", f->path));
+        log_info(e->log, "would delete local", log_str("path", f->path), log_end());
         goto out;
     }
     char *abs = engine_abs(e, f->path);
@@ -576,7 +576,7 @@ static bool remote_gone(Engine *e, const IndexFile *f, Err *err) {
     }
     free(abs);
     if (!ok) goto out;
-    log_info(e->log, "deleted locally, gone from primary", LS("path", f->path));
+    log_info(e->log, "deleted locally, gone from primary", log_str("path", f->path), log_end());
     ok = index_tombstone(e->idx, f->path, e->primary_name, false, err);
     if (ok) engine_wake_mirrors(e);
 out:
@@ -596,7 +596,7 @@ static void with_lock(Engine *e, void *item) {
     Err err;
     bool ok = l->fn(e, l->arg, &err);
     if (locks_release(&e->locks, l->rel)) queue_push(&e->queue, e->ctx, l->rel);
-    if (!ok) log_error(e->log, "pull", LS("path", l->rel), LERR(&err));
+    if (!ok) log_error(e->log, "pull", log_str("path", l->rel), log_err(&err), log_end());
 }
 
 static bool pull_object(Engine *e, const void *arg, Err *err) { return pull(e, arg, err); }
@@ -645,7 +645,7 @@ static bool backfill(Engine *e, Err *err) {
     for (size_t i = 0; i < e->mirror_count; i++) {
         int64_t n;
         if (!index_backfill(e->idx, e->mirror_names[i], &n, err)) return false;
-        if (n > 0) log_info(e->log, "backfill", LS("store", e->mirror_names[i]), LI("files", n));
+        if (n > 0) log_info(e->log, "backfill", log_str("store", e->mirror_names[i]), log_int("files", n), log_end());
     }
     engine_wake_mirrors(e);
     return true;
@@ -663,7 +663,7 @@ bool engine_reconcile(Engine *e, Ctx *ctx, Err *err) {
     }
     if (!push_all(e, err)) return false;
     for (size_t i = 0; i < e->mirror_count; i++)
-        if (!mirror_reconcile(e, i, &inner)) log_error(e->log, "reconcile mirror", LS("store", e->mirror_names[i]), LERR(&inner));
+        if (!mirror_reconcile(e, i, &inner)) log_error(e->log, "reconcile mirror", log_str("store", e->mirror_names[i]), log_err(&inner), log_end());
     return backfill(e, err);
 }
 
@@ -702,7 +702,7 @@ static void reconcile_until_done(Engine *e) {
     for (;;) {
         Err err;
         if (engine_reconcile(e, e->ctx, &err) || ctx_done(e->ctx)) return;
-        log_error(e->log, "reconcile; retrying", LERR(&err), LD("in", e->cfg->sync.pull_interval_ns));
+        log_error(e->log, "reconcile; retrying", log_err(&err), log_dur("in", e->cfg->sync.pull_interval_ns), log_end());
         if (!ctx_sleep(e->ctx, e->cfg->sync.pull_interval_ns / NS_PER_MS)) return;
     }
 }
@@ -718,7 +718,7 @@ static void *every(void *arg) {
     Periodic *p = arg;
     while (ctx_sleep(p->e->ctx, p->interval_ns / NS_PER_MS) && !engine_done(p->e)) {
         Err err;
-        if (!p->fn(p->e, &err) && !engine_done(p->e)) log_error(p->e->log, p->name, LERR(&err));
+        if (!p->fn(p->e, &err) && !engine_done(p->e)) log_error(p->e->log, p->name, log_err(&err), log_end());
     }
     return NULL;
 }
@@ -801,7 +801,7 @@ bool engine_run(Engine *e, Ctx *ctx, Err *err) {
     sb_putc(&mirrors, '[');
     for (size_t i = 0; i < e->mirror_count; i++) sb_printf(&mirrors, "%s%s", i ? " " : "", e->mirror_names[i]);
     sb_putc(&mirrors, ']');
-    log_info(e->log, "watching", LS("root", e->root), LS("primary", e->primary_name), LS("mirrors", sb_cstr(&mirrors)));
+    log_info(e->log, "watching", log_str("root", e->root), log_str("primary", e->primary_name), log_str("mirrors", sb_cstr(&mirrors)), log_end());
     sb_free(&mirrors);
 
     ctx_lock(ctx);

@@ -78,13 +78,11 @@ static const char *attr_string(const LogAttr *a, char buf[48]) {
     }
 }
 
-void log_at(Logger *l, LogLevel level, const char *msg, ...) {
+static void log_vat(Logger *l, LogLevel level, const char *msg, va_list ap) {
     if (level < l->level || !l->out) return;
     char stamp[48], scratch[48];
     format_time(wall_ns(), stamp);
     StrBuf sb = {0};
-    va_list ap;
-    va_start(ap, msg);
     if (l->json) {
         sb_printf(&sb, "{\"time\":\"%s\",\"level\":\"%s\",\"msg\":", stamp, level_name(level));
         write_quoted(&sb, msg);
@@ -112,10 +110,37 @@ void log_at(Logger *l, LogLevel level, const char *msg, ...) {
         }
         sb_putc(&sb, '\n');
     }
-    va_end(ap);
     pthread_mutex_lock(&l->mu);
     fputs(sb_cstr(&sb), l->out);
     fflush(l->out);
     pthread_mutex_unlock(&l->mu);
     sb_free(&sb);
+}
+
+void log_debug(Logger *l, const char *msg, ...) {
+    va_list ap;
+    va_start(ap, msg);
+    log_vat(l, LOG_DEBUG, msg, ap);
+    va_end(ap);
+}
+
+void log_info(Logger *l, const char *msg, ...) {
+    va_list ap;
+    va_start(ap, msg);
+    log_vat(l, LOG_INFO, msg, ap);
+    va_end(ap);
+}
+
+void log_warn(Logger *l, const char *msg, ...) {
+    va_list ap;
+    va_start(ap, msg);
+    log_vat(l, LOG_WARN, msg, ap);
+    va_end(ap);
+}
+
+void log_error(Logger *l, const char *msg, ...) {
+    va_list ap;
+    va_start(ap, msg);
+    log_vat(l, LOG_ERROR, msg, ap);
+    va_end(ap);
 }

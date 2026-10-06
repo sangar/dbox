@@ -252,7 +252,7 @@ static void *serve_http(void *arg) {
     ServeArg *s = arg;
     Err err;
     if (!daemon_serve(s->ctx, s->cfg->daemon.listen, metrics, backlog, &s->running, &err))
-        log_error(&logger, "health listener", LS("addr", s->cfg->daemon.listen), LERR(&err));
+        log_error(&logger, "health listener", log_str("addr", s->cfg->daemon.listen), log_err(&err), log_end());
     return NULL;
 }
 
@@ -277,7 +277,7 @@ static bool serve(Ctx *ctx, const Config *cfg, Err *err) {
     ok = daemon_write_pid(pid, err);
     if (ok) {
         if (!config_primary(cfg)) {
-            log_warn(&logger, "no stores configured; add one to the config and send SIGHUP", LS("config", cfg->path));
+            log_warn(&logger, "no stores configured; add one to the config and send SIGHUP", log_str("config", cfg->path), log_end());
             ctx_lock(ctx);
             while (ctx_wait(ctx, 0)) {
             }
@@ -324,7 +324,7 @@ static int cmd_run(int argc, char **argv) {
     }
 
     logger_init(&logger, "info", "text", stderr);
-    if (!daemon_raise_file_limit(&err)) log_warn(&logger, "raise open file limit", LERR(&err));
+    if (!daemon_raise_file_limit(&err)) log_warn(&logger, "raise open file limit", log_err(&err), log_end());
     for (;;) {
         if (!config_load(f.config, &cfg, &err)) {
             flags_free(&f);
@@ -337,8 +337,8 @@ static int cmd_run(int argc, char **argv) {
         int sig = end_run();
         ctx_destroy(&ctx);
         if (sig == SIGHUP) {
-            log_info(&logger, "reloading config", LS("path", cfg.path));
-            if (!ok) log_warn(&logger, "stopped for reload", LERR(&err));
+            log_info(&logger, "reloading config", log_str("path", cfg.path), log_end());
+            if (!ok) log_warn(&logger, "stopped for reload", log_err(&err), log_end());
             config_free(&cfg);
             continue;
         }
@@ -418,7 +418,7 @@ static int cmd_status(int argc, char **argv) {
         }
         const char *role = role_name(config_store(&cfg, names[i])->role);
         if (strcmp(names[i], primary) == 0) {
-            for (size_t j = 0; j < MIN(upload_count, 10); j++) strlist_push(&failed, arena_printf(&a, "%s  %s  %s", names[i], uploads[j].path, uploads[j].last_error));
+            for (size_t j = 0; j < min_size(upload_count, 10); j++) strlist_push(&failed, arena_printf(&a, "%s  %s  %s", names[i], uploads[j].path, uploads[j].last_error));
             /* Every indexed file is on the primary by definition, so its row shows what is still on the way there instead. */
             printf("%-12s %-9s %8lld %8lld %8s %8zu %10s\n", names[i], role, (long long)s.files, (long long)s.verified, backlog_text, upload_count, "-");
             continue;

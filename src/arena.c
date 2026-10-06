@@ -26,7 +26,7 @@ void *arena_alloc(Arena *a, size_t size) {
     size = (size + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
     ArenaBlock *b = a->head;
     if (!b || b->offset + size > b->capacity) {
-        b = new_block(MAX(a->block_size, size));
+        b = new_block(max_size(a->block_size, size));
         b->next = a->head;
         a->head = b;
     }

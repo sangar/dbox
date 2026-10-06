@@ -96,7 +96,7 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
     if (!rel) {
         if (rescan_subdirs) {
             Err err;
-            if (!add_tree(w, w->root, true, &err)) log_error(w->log, "rescan", LERR(&err));
+            if (!add_tree(w, w->root, true, &err)) log_error(w->log, "rescan", log_err(&err), log_end());
         }
         return;
     }
@@ -114,7 +114,7 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
         /* Files can land in a new directory before its watch is added, so everything already inside is reported too. */
         if (!known || rescan_subdirs) {
             Err err;
-            if (!add_tree(w, abs_path, true, &err)) log_error(w->log, "watch new directory", LS("path", rel), LERR(&err));
+            if (!add_tree(w, abs_path, true, &err)) log_error(w->log, "watch new directory", log_str("path", rel), log_err(&err), log_end());
         }
         free(rel);
         return;

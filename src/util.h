@@ -8,13 +8,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
-#ifndef MAX
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#endif
+#define countof(a) (sizeof(a) / sizeof((a)[0]))
+
+static inline size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
+static inline size_t max_size(size_t a, size_t b) { return a > b ? a : b; }
+static inline int64_t min_i64(int64_t a, int64_t b) { return a < b ? a : b; }
 
 #define NS_PER_MS 1000000LL
 #define NS_PER_SEC 1000000000LL

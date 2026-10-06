@@ -63,7 +63,7 @@ void config_init(Config *c) {
     c->sync.delete_remote = true;
     c->sync.delete_local = true;
     c->sync.ignore = default_ignore;
-    c->sync.ignore_count = ARRAY_LEN(default_ignore);
+    c->sync.ignore_count = countof(default_ignore);
     c->daemon.log_level = "info";
     c->daemon.log_format = "text";
     c->daemon.listen = "127.0.0.1:7878";
@@ -116,7 +116,7 @@ const char **config_store_names(const Config *c, Arena *a, size_t *count) {
     const char **names = arena_alloc(a, (c->store_count + 1) * sizeof *names);
     size_t n = 0;
     StoreRole order[] = {ROLE_PRIMARY, ROLE_MIRROR, ROLE_DETACHED};
-    for (size_t r = 0; r < ARRAY_LEN(order); r++) {
+    for (size_t r = 0; r < countof(order); r++) {
         size_t m;
         const char **group = names_with_role(c, a, order[r], &m);
         for (size_t i = 0; i < m; i++) names[n++] = group[i];
@@ -157,7 +157,7 @@ bool parse_size(const char *s, int64_t *out, Err *err) {
     size_t n = strlen(s);
     while (n > 0 && s[n - 1] == ' ') n--;
     int64_t factor = 1;
-    for (size_t i = 0; i < ARRAY_LEN(size_units); i++) {
+    for (size_t i = 0; i < countof(size_units); i++) {
         size_t m = strlen(size_units[i].suffix);
         if (n >= m && memcmp(s + n - m, size_units[i].suffix, m) == 0) {
             factor = size_units[i].factor;
@@ -178,7 +178,7 @@ bool parse_size(const char *s, int64_t *out, Err *err) {
 }
 
 const char *format_size(int64_t n, char buf[32]) {
-    for (size_t i = 0; i < ARRAY_LEN(size_units); i++) {
+    for (size_t i = 0; i < countof(size_units); i++) {
         int64_t f = size_units[i].factor;
         if (f > 1 && n >= f && n % f == 0) {
             snprintf(buf, 32, "%lld%s", (long long)(n / f), size_units[i].suffix);
@@ -608,7 +608,7 @@ static bool looks_special(const char *s) {
     if (s[0] == ' ' || s[strlen(s) - 1] == ' ') return true;
     if (strstr(s, ": ") || strstr(s, " #") || has_suffix(s, ":")) return true;
     static const char *words[] = {"true", "false", "null", "~", "yes", "no", "on", "off"};
-    for (size_t i = 0; i < ARRAY_LEN(words); i++)
+    for (size_t i = 0; i < countof(words); i++)
         if (strcmp(s, words[i]) == 0) return true;
     char *end;
     strtod(s, &end);

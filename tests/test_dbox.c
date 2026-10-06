@@ -24,7 +24,8 @@
 
 static int failures, checks;
 
-#define CHECK(cond)                                                                                \
+/* The check macros stay macros for __FILE__, __LINE__ and the expression text. */
+#define CHECK(cond)                                                                                /* modern-c: allow function-macro */ \
     do {                                                                                           \
         checks++;                                                                                  \
         if (!(cond)) {                                                                             \
@@ -33,7 +34,7 @@ static int failures, checks;
         }                                                                                          \
     } while (0)
 
-#define CHECK_STR(got, want)                                                                                                 \
+#define CHECK_STR(got, want)                                                                                                 /* modern-c: allow function-macro */ \
     do {                                                                                                                     \
         checks++;                                                                                                            \
         const char *g_ = (got), *w_ = (want);                                                                                \
@@ -43,7 +44,7 @@ static int failures, checks;
         }                                                                                                                    \
     } while (0)
 
-#define CHECK_OK(call)                                                                                   \
+#define CHECK_OK(call)                                                                                   /* modern-c: allow function-macro */ \
     do {                                                                                                 \
         Err e_;                                                                                          \
         e_.msg[0] = '\0';                                                                                \
@@ -195,7 +196,7 @@ static void test_config_rejects_invalid_configs(void) {
         {"bad duration", "sync: {pull_interval: soon}"},
         {"invalid yaml", "sync: [unclosed"},
     };
-    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+    for (size_t i = 0; i < countof(cases); i++) {
         Config cfg;
         Err err;
         bool ok = load(cases[i].yaml, NULL, &cfg, &err);
@@ -349,7 +350,7 @@ static void test_durations_and_sizes(void) {
 static void test_ignore_match(void) {
     const char *patterns[] = {".git/", ".DS_Store", "*.swp", "~$*", "build/out/*"};
     Ignore m;
-    ignore_init(&m, patterns, ARRAY_LEN(patterns));
+    ignore_init(&m, patterns, countof(patterns));
     static const struct {
         const char *path;
         bool is_dir, want;
@@ -358,7 +359,7 @@ static void test_ignore_match(void) {
         {".git", false, false},        {"docs/.DS_Store", false, true},  {"notes/.todo.md.swp", false, true},
         {"~$report.docx", false, true}, {"build/out/app", false, true},  {"other/build/out/app", false, false}, {"notes/todo.md", false, false},
     };
-    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+    for (size_t i = 0; i < countof(cases); i++) {
         bool got = ignore_match(&m, cases[i].path, cases[i].is_dir);
         checks++;
         if (got != cases[i].want) {

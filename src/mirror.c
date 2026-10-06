@@ -21,9 +21,9 @@ static void record_failure(Engine *e, const Replica *r, bool source_missing, con
     /* When neither the primary nor the local folder has the content, retrying cannot help. */
     if (source_missing) attempts = MAX_ATTEMPTS;
     int64_t retry_at = wall_ns() + retry_delay_ns(attempts);
-    log_warn(e->log, "mirror copy failed", LS("store", r->store), LS("path", r->path), LI("attempt", attempts), LERR(cause));
+    log_warn(e->log, "mirror copy failed", log_str("store", r->store), log_str("path", r->path), log_int("attempt", attempts), log_err(cause), log_end());
     Err err;
-    if (!index_mark_failed(e->idx, r->path, r->store, cause->msg, attempts, retry_at, &err)) log_error(e->log, "record failure", LERR(&err));
+    if (!index_mark_failed(e->idx, r->path, r->store, cause->msg, attempts, retry_at, &err)) log_error(e->log, "record failure", log_err(&err), log_end());
 }
 
 static void replicate_job(Engine *e, void *item) {
@@ -59,7 +59,7 @@ void mirror_loop(Engine *e, size_t mirror) {
     while (!engine_done(e)) {
         Err err;
         long n = mirror_batch(e, mirror, &err);
-        if (n < 0 && !engine_done(e)) log_error(e->log, "mirror", LS("store", e->mirror_names[mirror]), LERR(&err));
+        if (n < 0 && !engine_done(e)) log_error(e->log, "mirror", log_str("store", e->mirror_names[mirror]), log_err(&err), log_end());
         if (n > 0) continue;
         ctx_lock(e->ctx);
         int64_t deadline = monotonic_ns() + IDLE_NS;
@@ -123,7 +123,7 @@ static bool replicate(Engine *e, size_t mirror, const Replica *r, bool *source_m
     }
     if (f.deleted) {
         if (e->dry_run) {
-            log_info(e->log, "would delete", LS("path", r->path), LS("store", name));
+            log_info(e->log, "would delete", log_str("path", r->path), log_str("store", name), log_end());
             goto out;
         }
         if (e->cfg->sync.delete_remote) {
@@ -133,7 +133,7 @@ static bool replicate(Engine *e, size_t mirror, const Replica *r, bool *source_m
                 ok = false;
                 goto out;
             }
-            log_info(e->log, "deleted", LS("path", r->path), LS("store", name));
+            log_info(e->log, "deleted", log_str("path", r->path), log_str("store", name), log_end());
         }
         ok = index_drop_replica(e->idx, r->path, name, err);
         goto out;
@@ -147,7 +147,7 @@ static bool replicate(Engine *e, size_t mirror, const Replica *r, bool *source_m
         goto out;
     }
     if (e->dry_run) {
-        log_info(e->log, "would copy", LS("path", r->path), LS("from", e->primary_name), LS("to", name));
+        log_info(e->log, "would copy", log_str("path", r->path), log_str("from", e->primary_name), log_str("to", name), log_end());
         goto out;
     }
 
@@ -176,7 +176,7 @@ static bool replicate(Engine *e, size_t mirror, const Replica *r, bool *source_m
     }
     bool verified;
     ok = index_mark_verified(e->idx, r->path, name, head.etag, meta.sha256, &verified, err);
-    if (ok && verified) log_info(e->log, "copied", LS("path", r->path), LS("from", e->primary_name), LS("to", name), LI("bytes", head.size));
+    if (ok && verified) log_info(e->log, "copied", log_str("path", r->path), log_str("from", e->primary_name), log_str("to", name), log_int("bytes", head.size), log_end());
 out:
     arena_free(&a);
     return ok;
@@ -224,7 +224,7 @@ bool mirror_reconcile(Engine *e, size_t mirror, Err *err) {
         ok = index_mark_verified(e->idx, rows[i].path, name, head.etag, f.sha256, &verified, err);
         if (ok && verified) adopted++;
     }
-    if (adopted > 0) log_info(e->log, "adopted existing copies", LS("store", name), LI("files", adopted));
+    if (adopted > 0) log_info(e->log, "adopted existing copies", log_str("store", name), log_int("files", adopted), log_end());
     strmap_free(&present);
 out:
     arena_free(&a);

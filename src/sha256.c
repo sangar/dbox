@@ -13,24 +13,24 @@ static const uint32_t K[64] = {
     0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
     0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
 
-#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+static inline uint32_t rotr(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
 
 static void transform(Sha256 *h, const uint8_t block[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++)
         w[i] = (uint32_t)block[i * 4] << 24 | (uint32_t)block[i * 4 + 1] << 16 | (uint32_t)block[i * 4 + 2] << 8 | block[i * 4 + 3];
     for (int i = 16; i < 64; i++) {
-        uint32_t s0 = ROTR(w[i - 15], 7) ^ ROTR(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        uint32_t s1 = ROTR(w[i - 2], 17) ^ ROTR(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
     uint32_t a = h->state[0], b = h->state[1], c = h->state[2], d = h->state[3];
     uint32_t e = h->state[4], f = h->state[5], g = h->state[6], hh = h->state[7];
     for (int i = 0; i < 64; i++) {
-        uint32_t s1 = ROTR(e, 6) ^ ROTR(e, 11) ^ ROTR(e, 25);
+        uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         uint32_t ch = (e & f) ^ (~e & g);
         uint32_t t1 = hh + s1 + ch + K[i] + w[i];
-        uint32_t s0 = ROTR(a, 2) ^ ROTR(a, 13) ^ ROTR(a, 22);
+        uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
         uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
         uint32_t t2 = s0 + maj;
         hh = g;
@@ -63,7 +63,7 @@ void sha256_update(Sha256 *h, const void *data, size_t len) {
     const uint8_t *p = data;
     h->length += len;
     if (h->buffered) {
-        size_t take = MIN(64 - h->buffered, len);
+        size_t take = min_size(64 - h->buffered, len);
         memcpy(h->buffer + h->buffered, p, take);
         h->buffered += take;
         p += take;

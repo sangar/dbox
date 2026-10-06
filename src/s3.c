@@ -214,14 +214,14 @@ static size_t read_body(char *buf, size_t size, size_t nitems, void *userdata) {
     BodySource *src = userdata;
     size_t want = size * nitems;
     if (src->mem) {
-        size_t n = MIN(want, src->mem_len - (size_t)src->pos);
+        size_t n = min_size(want, src->mem_len - (size_t)src->pos);
         memcpy(buf, src->mem + src->pos, n);
         src->pos += (int64_t)n;
         return n;
     }
     int64_t remaining = src->len - src->pos;
     if (remaining <= 0) return 0;
-    ssize_t n = pread(src->fd, buf, MIN(want, (size_t)remaining), src->off + src->pos);
+    ssize_t n = pread(src->fd, buf, min_size(want, (size_t)remaining), src->off + src->pos);
     if (n < 0) return CURL_READFUNC_ABORT;
     src->pos += n;
     return (size_t)n;
@@ -274,7 +274,7 @@ static size_t read_header(char *line, size_t size, size_t nitems, void *userdata
     while (v < end && (*v == ' ' || *v == '\t')) v++;
     while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) end--;
     char value[1024];
-    size_t vlen = MIN((size_t)(end - v), sizeof value - 1);
+    size_t vlen = min_size((size_t)(end - v), sizeof value - 1);
     memcpy(value, v, vlen);
     value[vlen] = '\0';
     if (name_len == 4 && strncasecmp(line, "etag", 4) == 0) {
@@ -351,7 +351,7 @@ static struct curl_slist *sign(const S3 *s, const Request *req, const char *uri,
     headers[n++] = (KV){"x-amz-content-sha256", payload_hash};
     headers[n++] = (KV){"x-amz-date", amz_date};
     if (*s->session_token) headers[n++] = (KV){"x-amz-security-token", s->session_token};
-    for (size_t i = 0; i < req->header_count && n < ARRAY_LEN(headers); i++) headers[n++] = req->headers[i];
+    for (size_t i = 0; i < req->header_count && n < countof(headers); i++) headers[n++] = req->headers[i];
     qsort(headers, n, sizeof *headers, compare_kv);
 
     StrBuf canonical = {0}, signed_names = {0};
@@ -571,7 +571,7 @@ static StoreStatus put_multipart(S3 *s, Ctx *ctx, const char *key, int fd, int64
         char num[24];
         snprintf(num, sizeof num, "%lld", (long long)number);
         KV query[] = {{"partNumber", num}, {"uploadId", upload_id}};
-        Request part = {.method = "PUT", .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_off = off, .body_len = MIN(s->part_size, size - off), .sink_fd = -1};
+        Request part = {.method = "PUT", .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_off = off, .body_len = min_i64(s->part_size, size - off), .sink_fd = -1};
         ok = request(s, ctx, &part, &resp, err);
         if (ok && !ok_status(resp.status)) {
             fail_status(&part, &resp, err);

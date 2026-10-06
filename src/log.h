@@ -29,11 +29,12 @@ typedef struct {
     long long num;
 } LogAttr;
 
-#define LS(k, v) ((LogAttr){(k), ATTR_STR, (v), 0})
-#define LI(k, v) ((LogAttr){(k), ATTR_INT, NULL, (long long)(v)})
-#define LD(k, ns) ((LogAttr){(k), ATTR_DURATION, NULL, (long long)(ns)})
-#define LERR(e) LS("err", (e)->msg)
-#define LEND ((LogAttr){NULL, ATTR_END, NULL, 0})
+static inline LogAttr log_str(const char *key, const char *value) { return (LogAttr){key, ATTR_STR, value, 0}; }
+static inline LogAttr log_int(const char *key, long long value) { return (LogAttr){key, ATTR_INT, NULL, value}; }
+static inline LogAttr log_dur(const char *key, int64_t ns) { return (LogAttr){key, ATTR_DURATION, NULL, ns}; }
+static inline LogAttr log_err(const Err *err) { return log_str("err", err->msg); }
+/* log_end closes the attribute list of every log call. */
+static inline LogAttr log_end(void) { return (LogAttr){NULL, ATTR_END, NULL, 0}; }
 
 /* logger_init takes the config's level ("debug", "info", "warn", "error") and format ("text", "json"). */
 void logger_init(Logger *l, const char *level, const char *format, FILE *out);
@@ -41,10 +42,10 @@ void logger_destroy(Logger *l);
 /* logger_discard drops everything, for tests. */
 Logger *logger_discard(void);
 
-void log_at(Logger *l, LogLevel level, const char *msg, ...);
-#define log_debug(l, ...) log_at((l), LOG_DEBUG, __VA_ARGS__, LEND)
-#define log_info(l, ...) log_at((l), LOG_INFO, __VA_ARGS__, LEND)
-#define log_warn(l, ...) log_at((l), LOG_WARN, __VA_ARGS__, LEND)
-#define log_error(l, ...) log_at((l), LOG_ERROR, __VA_ARGS__, LEND)
+/* Each takes LogAttr values and ends with log_end(). */
+void log_debug(Logger *l, const char *msg, ...);
+void log_info(Logger *l, const char *msg, ...);
+void log_warn(Logger *l, const char *msg, ...);
+void log_error(Logger *l, const char *msg, ...);
 
 #endif

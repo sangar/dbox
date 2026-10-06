@@ -229,7 +229,7 @@ bool parse_duration(const char *s, int64_t *ns) {
             double ns;
         } units[] = {{"ns", 1}, {"us", 1e3}, {"\xc2\xb5s", 1e3}, {"\xce\xbcs", 1e3}, {"ms", 1e6}, {"s", 1e9}, {"m", 60e9}, {"h", 3600e9}};
         size_t i;
-        for (i = 0; i < ARRAY_LEN(units); i++) {
+        for (i = 0; i < countof(units); i++) {
             size_t n = strlen(units[i].unit);
             if (strncmp(p, units[i].unit, n) == 0) {
                 total += v * units[i].ns;
@@ -237,7 +237,7 @@ bool parse_duration(const char *s, int64_t *ns) {
                 break;
             }
         }
-        if (i == ARRAY_LEN(units)) return false;
+        if (i == countof(units)) return false;
     }
     *ns = (int64_t)(negative ? -total : total);
     return true;

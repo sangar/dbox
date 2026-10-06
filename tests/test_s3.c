@@ -11,7 +11,8 @@
 
 static int failures, checks;
 
-#define CHECK(cond)                                                                                      \
+/* The check macros stay macros for __FILE__, __LINE__ and the expression text. */
+#define CHECK(cond)                                                                                      /* modern-c: allow function-macro */ \
     do {                                                                                                 \
         checks++;                                                                                        \
         if (!(cond)) {                                                                                   \
@@ -20,7 +21,7 @@ static int failures, checks;
         }                                                                                                \
     } while (0)
 
-#define CHECK_STR(got, want)                                                                                       \
+#define CHECK_STR(got, want)                                                                                       /* modern-c: allow function-macro */ \
     do {                                                                                                           \
         checks++;                                                                                                  \
         const char *g_ = (got), *w_ = (want);                                                                      \
