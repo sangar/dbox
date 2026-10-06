@@ -26,11 +26,11 @@ void hmac_sha256(const void *key, size_t key_len, const void *data, size_t len, 
 void hex_encode(const uint8_t *in, size_t n, char *out);
 
 /* sha256_file hashes the file at path. */
-bool sha256_file(const char *path, char out[SHA256_HEX_LEN], Err *err);
+[[nodiscard]] Error sha256_file(const char *path, char out[SHA256_HEX_LEN], Err *err);
 /*
- * copy_fd copies in from its current position to out, feeding h when given.
- * It returns the number of bytes copied, or -1.
+ * copy_fd copies in from its current position to out, feeding h when given,
+ * and stores the number of bytes copied in *copied. out may be -1 to only hash.
  */
-int64_t copy_fd(int in, int out, Sha256 *h, Err *err);
+[[nodiscard]] Error copy_fd(int in, int out, Sha256 *h, int64_t *copied, Err *err);
 
 #endif

@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include "alloc.h"
+#include "error.h"
 
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -19,15 +20,6 @@ static inline int64_t min_i64(int64_t a, int64_t b) { return a < b ? a : b; }
 #define NS_PER_MS 1000000LL
 #define NS_PER_SEC 1000000000LL
 
-
-/* Err carries a human readable message up to whoever can report it. */
-typedef struct {
-    char msg[512];
-} Err;
-
-void err_set(Err *err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-/* err_sys formats the message and appends ": strerror(errno)". */
-void err_sys(Err *err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 typedef struct {
     char *data;
@@ -73,7 +65,7 @@ bool parse_int64(const char *s, int64_t *out);
 int compare_strings(const void *a, const void *b);
 
 const char *home_dir(void);
-bool mkdir_p(const char *path, mode_t mode, Err *err);
+[[nodiscard]] Error mkdir_p(const char *path, mode_t mode, Err *err);
 char *path_join(const char *dir, const char *name);
 char *path_dir(const char *path);
 const char *path_base(const char *path);
@@ -83,9 +75,9 @@ char *expand_home(const char *path);
 /* rel_path returns path relative to root, or NULL when it is the root or outside it. */
 char *rel_path(const char *root, const char *path);
 bool is_dir(const char *path);
-bool read_file(const char *path, StrBuf *out, Err *err);
-bool write_file(const char *path, const void *data, size_t len, mode_t mode, Err *err);
-bool write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err);
+[[nodiscard]] Error read_file(const char *path, StrBuf *out, Err *err);
+[[nodiscard]] Error write_file(const char *path, const void *data, size_t len, mode_t mode, Err *err);
+[[nodiscard]] Error write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err);
 bool write_all(int fd, const void *data, size_t len);
 const char *short_hostname(char buf[256]);
 

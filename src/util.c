@@ -10,24 +10,6 @@
 #include <time.h>
 #include <unistd.h>
 
-void err_set(Err *err, const char *fmt, ...) {
-    if (!err) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err->msg, sizeof err->msg, fmt, ap);
-    va_end(ap);
-}
-
-void err_sys(Err *err, const char *fmt, ...) {
-    if (!err) return;
-    int saved = errno;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(err->msg, sizeof err->msg, fmt, ap);
-    va_end(ap);
-    if (n >= 0 && (size_t)n < sizeof err->msg) snprintf(err->msg + n, sizeof err->msg - (size_t)n, ": %s", strerror(saved));
-}
-
 void sb_grow(StrBuf *sb, size_t extra) {
     if (sb->len + extra + 1 <= sb->cap) return;
     size_t cap = sb->cap ? sb->cap : 64;
@@ -254,22 +236,18 @@ const char *home_dir(void) {
     return pw && pw->pw_dir ? pw->pw_dir : ".";
 }
 
-bool mkdir_p(const char *path, mode_t mode, Err *err) {
+Error mkdir_p(const char *path, mode_t mode, Err *err) {
     char *p = xstrdup(path);
-    for (char *s = p + 1; *s; s++) {
+    Error e = ERR_OK;
+    for (char *s = p + 1; e == ERR_OK && *s; s++) {
         if (*s != '/') continue;
         *s = '\0';
-        if (mkdir(p, mode) != 0 && errno != EEXIST) {
-            err_sys(err, "mkdir %s", p);
-            xfree(p);
-            return false;
-        }
+        if (mkdir(p, mode) != 0 && errno != EEXIST) e = err_sys(err, "mkdir %s", p);
         *s = '/';
     }
-    bool ok = mkdir(p, mode) == 0 || errno == EEXIST;
-    if (!ok) err_sys(err, "mkdir %s", p);
+    if (e == ERR_OK && mkdir(p, mode) != 0 && errno != EEXIST) e = err_sys(err, "mkdir %s", p);
     xfree(p);
-    return ok;
+    return e;
 }
 
 char *path_join(const char *dir, const char *name) {
@@ -322,20 +300,16 @@ bool is_dir(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-bool read_file(const char *path, StrBuf *out, Err *err) {
+Error read_file(const char *path, StrBuf *out, Err *err) {
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        err_sys(err, "%s", path);
-        return false;
-    }
+    if (!f) return err_sys(err, "%s", path);
     char buf[65536];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) sb_append(out, buf, n);
-    bool ok = !ferror(f);
-    if (!ok) err_set(err, "%s: read error", path);
+    Error e = ferror(f) ? err_set(err, ERR_IO, "%s: read error", path) : ERR_OK;
     fclose(f);
     sb_cstr(out);
-    return ok;
+    return e;
 }
 
 bool write_all(int fd, const void *data, size_t len) {
@@ -352,36 +326,29 @@ bool write_all(int fd, const void *data, size_t len) {
     return true;
 }
 
-bool write_file(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
+Error write_file(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
-    if (fd < 0) {
-        err_sys(err, "%s", path);
-        return false;
-    }
-    bool ok = write_all(fd, data, len);
-    if (!ok) err_sys(err, "%s", path);
+    if (fd < 0) return err_sys(err, "%s", path);
+    Error e = write_all(fd, data, len) ? ERR_OK : err_sys(err, "%s", path);
     close(fd);
-    return ok;
+    return e;
 }
 
-bool write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
+Error write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
     char *dir = path_dir(path);
-    bool ok = mkdir_p(dir, 0755, err);
+    Error e = mkdir_p(dir, 0755, err);
     xfree(dir);
-    if (!ok) return false;
+    if (e != ERR_OK) return e;
     char *tmp = path_join(path, "");
     tmp[strlen(tmp) - 1] = '\0';
     size_t n = strlen(tmp);
     tmp = xrealloc(tmp, n + 5);
     memcpy(tmp + n, ".tmp", 5);
-    ok = write_file(tmp, data, len, mode, err);
-    if (ok && rename(tmp, path) != 0) {
-        err_sys(err, "rename %s", path);
-        ok = false;
-    }
-    if (!ok) unlink(tmp);
+    e = write_file(tmp, data, len, mode, err);
+    if (e == ERR_OK && rename(tmp, path) != 0) e = err_sys(err, "rename %s", path);
+    if (e != ERR_OK) unlink(tmp);
     xfree(tmp);
-    return ok;
+    return e;
 }
 
 const char *short_hostname(char buf[256]) {

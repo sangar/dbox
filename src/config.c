@@ -151,7 +151,7 @@ static const struct {
     int64_t factor;
 } size_units[] = {{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}};
 
-bool parse_size(const char *s, int64_t *out, Err *err) {
+Error parse_size(const char *s, int64_t *out, Err *err) {
     const char *original = s;
     while (*s == ' ') s++;
     size_t n = strlen(s);
@@ -169,12 +169,9 @@ bool parse_size(const char *s, int64_t *out, Err *err) {
     int64_t v;
     bool ok = parse_int64(digits, &v);
     xfree(digits);
-    if (!ok) {
-        err_set(err, "size %s: want a number with an optional KiB, MiB or GiB suffix", original);
-        return false;
-    }
+    if (!ok) return err_set(err, ERR_INVALID_ARGUMENT, "size %s: want a number with an optional KiB, MiB or GiB suffix", original);
     *out = v * factor;
-    return true;
+    return ERR_OK;
 }
 
 const char *format_size(int64_t n, char buf[32]) {
@@ -208,18 +205,19 @@ char *config_default_path(void) {
     return yml;
 }
 
-bool config_write_starter(const char *path, bool *created, Err *err) {
+Error config_write_starter(const char *path, bool *created, Err *err) {
     struct stat st;
     *created = false;
-    if (stat(path, &st) == 0) return true;
+    if (stat(path, &st) == 0) return ERR_OK;
     char *dir = path_dir(path);
-    bool ok = mkdir_p(dir, 0755, err);
+    Error e = mkdir_p(dir, 0755, err);
     xfree(dir);
-    if (!ok) return false;
+    if (e != ERR_OK) return e;
     /* Private to the user because it may come to hold store secrets. */
-    if (!write_file(path, starter_yml, sizeof starter_yml - 1, 0600, err)) return false;
+    e = write_file(path, starter_yml, sizeof starter_yml - 1, 0600, err);
+    if (e != ERR_OK) return e;
     *created = true;
-    return true;
+    return ERR_OK;
 }
 
 typedef struct {
@@ -342,8 +340,8 @@ static void decode_fail(Decoder *d, int line, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
-    if (line > 0) err_set(d->err, "line %d: %s", line, msg);
-    else err_set(d->err, "%s", msg);
+    if (line > 0) (void)err_set(d->err, ERR_INVALID_ARGUMENT, "line %d: %s", line, msg);
+    else (void)err_set(d->err, ERR_INVALID_ARGUMENT, "%s", msg);
 }
 
 static const char *scalar(Decoder *d, const YmlNode *n, const char *key) {
@@ -384,7 +382,7 @@ static int64_t duration_field(Decoder *d, const YmlNode *n, const char *key, int
 static int64_t size_field(Decoder *d, const YmlNode *n, const char *key, int64_t current) {
     Err err;
     int64_t out;
-    if (parse_size(scalar(d, n, key), &out, &err)) return out;
+    if (parse_size(scalar(d, n, key), &out, &err) == ERR_OK) return out;
     decode_fail(d, n->line, "%s: %s", key, err.msg);
     return current;
 }
@@ -502,55 +500,34 @@ static const char *expand_home_into(Arena *a, const char *p) {
     return out;
 }
 
-static bool finish(Config *c, Err *err) {
+[[nodiscard]] static Error finish(Config *c, Err *err) {
     c->sync.root = expand_home_into(&c->arena, c->sync.root);
-    if (!*c->sync.root) {
-        err_set(err, "sync.root is required");
-        return false;
-    }
+    if (!*c->sync.root) return err_set(err, ERR_INVALID_ARGUMENT, "sync.root is required");
     int primaries = 0;
     for (size_t i = 0; i < c->store_count; i++) {
         StoreConfig *s = &c->stores[i];
-        if (!valid_store_name(s->name)) {
-            err_set(err, "store \"%s\": names may only contain a-z, 0-9, _ and -", s->name);
-            return false;
-        }
+        if (!valid_store_name(s->name)) return err_set(err, ERR_INVALID_ARGUMENT, "store \"%s\": names may only contain a-z, 0-9, _ and -", s->name);
         if (s->role == ROLE_PRIMARY) primaries++;
-        if (s->role == ROLE_NONE) {
-            err_set(err, "store \"%s\": role is required (primary, mirror or detached)", s->name);
-            return false;
-        }
+        if (s->role == ROLE_NONE) return err_set(err, ERR_INVALID_ARGUMENT, "store \"%s\": role is required (primary, mirror or detached)", s->name);
         switch (s->kind) {
         case KIND_S3:
-            if (!*s->bucket || !*s->region) {
-                err_set(err, "store \"%s\": s3 stores need bucket and region", s->name);
-                return false;
-            }
+            if (!*s->bucket || !*s->region) return err_set(err, ERR_INVALID_ARGUMENT, "store \"%s\": s3 stores need bucket and region", s->name);
             break;
         case KIND_DISK:
             s->root = expand_home_into(&c->arena, s->root);
-            if (!is_dir(s->root)) {
-                err_set(err, "store \"%s\": root \"%s\" is not an existing directory", s->name, s->root);
-                return false;
-            }
+            if (!is_dir(s->root)) return err_set(err, ERR_INVALID_ARGUMENT, "store \"%s\": root \"%s\" is not an existing directory", s->name, s->root);
             break;
-        default: err_set(err, "store \"%s\": kind must be s3 or disk", s->name); return false;
+        default: return err_set(err, ERR_INVALID_ARGUMENT, "store \"%s\": kind must be s3 or disk", s->name);
         }
         if (*s->prefix && !has_suffix(s->prefix, "/")) s->prefix = arena_printf(&c->arena, "%s/", s->prefix);
         if (s->workers <= 0) s->workers = s->role == ROLE_PRIMARY ? 4 : 2;
     }
-    if (c->store_count > 0 && primaries != 1) {
-        err_set(err, "exactly one store must be primary, found %d", primaries);
-        return false;
-    }
-    if (c->sync.part_size < 5 << 20) {
-        err_set(err, "sync.part_size must be at least 5MiB, the S3 minimum");
-        return false;
-    }
-    return true;
+    if (c->store_count > 0 && primaries != 1) return err_set(err, ERR_INVALID_ARGUMENT, "exactly one store must be primary, found %d", primaries);
+    if (c->sync.part_size < 5 << 20) return err_set(err, ERR_INVALID_ARGUMENT, "sync.part_size must be at least 5MiB, the S3 minimum");
+    return ERR_OK;
 }
 
-bool config_parse(const char *path, const char *text, size_t len, char *const *environ, Config *c, Err *err) {
+Error config_parse(const char *path, const char *text, size_t len, char *const *environ, Config *c, Err *err) {
     static char *const no_env[] = {NULL};
     if (!environ) environ = no_env;
     config_init(c);
@@ -558,10 +535,10 @@ bool config_parse(const char *path, const char *text, size_t len, char *const *e
     Arena tree;
     arena_init(&tree, 16 * 1024);
     Err inner;
-    bool ok = false;
-    YmlNode *root = yml_load(&tree, text, len, &inner);
-    if (!root) {
-        err_set(err, "%s: %s", path, inner.msg);
+    YmlNode *root;
+    Error e = yml_load(&tree, text, len, &root, &inner);
+    if (e != ERR_OK) {
+        e = err_set(err, e, "%s: %s", path, inner.msg);
         goto out;
     }
     if (root->kind == YML_NULL) root = yml_new_map(&tree);
@@ -571,7 +548,7 @@ bool config_parse(const char *path, const char *text, size_t len, char *const *e
         strlist_sort(&x.missing);
         StrBuf names = {0};
         for (size_t i = 0; i < x.missing.len; i++) sb_printf(&names, "%s%s", i ? ", " : "", x.missing.items[i]);
-        err_set(err, "%s: environment variables not set: %s", path, sb_cstr(&names));
+        e = err_set(err, ERR_INVALID_ARGUMENT, "%s: environment variables not set: %s", path, sb_cstr(&names));
         sb_free(&names);
         strlist_free(&x.missing);
         goto out;
@@ -579,25 +556,22 @@ bool config_parse(const char *path, const char *text, size_t len, char *const *e
     apply_overrides(&tree, root, environ);
     Decoder d = {.cfg = c, .err = &inner};
     decode(&d, root);
-    if (d.failed || !finish(c, &inner)) {
-        err_set(err, "%s: %s", path, inner.msg);
-        goto out;
-    }
-    ok = true;
+    e = d.failed ? ERR_INVALID_ARGUMENT : finish(c, &inner);
+    if (e != ERR_OK) e = err_set(err, e, "%s: %s", path, inner.msg);
 out:
     arena_free(&tree);
-    if (!ok) config_free(c);
-    return ok;
+    if (e != ERR_OK) config_free(c);
+    return e;
 }
 
 extern char **environ;
 
-bool config_load(const char *path, Config *c, Err *err) {
+Error config_load(const char *path, Config *c, Err *err) {
     StrBuf raw = {0};
-    if (!read_file(path, &raw, err)) return false;
-    bool ok = config_parse(path, raw.data ? raw.data : "", raw.len, environ, c, err);
+    Error e = read_file(path, &raw, err);
+    if (e == ERR_OK) e = config_parse(path, raw.data ? raw.data : "", raw.len, environ, c, err);
     sb_free(&raw);
-    return ok;
+    return e;
 }
 
 /* ---- rendering ---- */
@@ -690,21 +664,22 @@ typedef struct {
     YmlNode *role;
 } StoreRoleNode;
 
-bool config_promote(const char *path, const char *store, Err *err) {
+Error config_promote(const char *path, const char *store, Err *err) {
     StrBuf raw = {0};
-    if (!read_file(path, &raw, err)) return false;
+    Error e = read_file(path, &raw, err);
+    if (e != ERR_OK) return e;
     Arena a;
     arena_init(&a, 16 * 1024);
-    bool ok = false;
     Err inner;
-    YmlNode *root = yml_load(&a, raw.data ? raw.data : "", raw.len, &inner);
-    if (!root) {
-        err_set(err, "%s: %s", path, inner.msg);
+    YmlNode *root;
+    e = yml_load(&a, raw.data ? raw.data : "", raw.len, &root, &inner);
+    if (e != ERR_OK) {
+        e = err_set(err, e, "%s: %s", path, inner.msg);
         goto out;
     }
     YmlNode *stores = yml_get(root, "stores");
     if (!stores || !yml_get(stores, store)) {
-        err_set(err, "%s: no store named \"%s\"", path, store);
+        e = err_set(err, ERR_NOT_FOUND, "%s: no store named \"%s\"", path, store);
         goto out;
     }
     /* Edits are applied from the end of the file so earlier offsets stay valid. */
@@ -725,15 +700,11 @@ bool config_promote(const char *path, const char *store, Err *err) {
         out = edited;
     }
     struct stat st;
-    if (stat(path, &st) != 0) {
-        err_sys(err, "%s", path);
-        sb_free(&out);
-        goto out;
-    }
-    ok = write_file_atomic(path, out.data, out.len, st.st_mode & 0777, err);
+    if (stat(path, &st) != 0) e = err_sys(err, "%s", path);
+    else e = write_file_atomic(path, out.data, out.len, st.st_mode & 0777, err);
     sb_free(&out);
 out:
     arena_free(&a);
     sb_free(&raw);
-    return ok;
+    return e;
 }

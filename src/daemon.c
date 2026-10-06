@@ -14,12 +14,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-bool daemon_write_pid(const char *path, Err *err) {
+Error daemon_write_pid(const char *path, Err *err) {
     pid_t pid;
-    if (daemon_running(path, &pid)) {
-        err_set(err, "dbox is already running as pid %d", (int)pid);
-        return false;
-    }
+    if (daemon_running(path, &pid)) return err_set(err, ERR_PLATFORM, "dbox is already running as pid %d", (int)pid);
     char line[32];
     snprintf(line, sizeof line, "%d\n", (int)getpid());
     return write_file(path, line, strlen(line), 0644, err);
@@ -30,7 +27,7 @@ void daemon_remove_pid(const char *path) { unlink(path); }
 bool daemon_running(const char *path, pid_t *pid) {
     StrBuf raw = {0};
     Err ignored;
-    if (!read_file(path, &raw, &ignored)) return false;
+    if (read_file(path, &raw, &ignored) != ERR_OK) return false;
     char *end;
     long long n = strtoll(raw.data, &end, 10);
     bool ok = end != raw.data && n > 0;
@@ -41,35 +38,28 @@ bool daemon_running(const char *path, pid_t *pid) {
     return true;
 }
 
-bool daemon_reload(const char *path, bool *reloaded, Err *err) {
+Error daemon_reload(const char *path, bool *reloaded, Err *err) {
     pid_t pid;
     *reloaded = daemon_running(path, &pid);
-    if (!*reloaded) return true;
-    if (kill(pid, SIGHUP) != 0) {
-        err_sys(err, "signal pid %d", (int)pid);
-        return false;
-    }
-    return true;
+    if (!*reloaded) return ERR_OK;
+    if (kill(pid, SIGHUP) != 0) return err_set(err, ERR_PLATFORM, "signal pid %d: %s", (int)pid, strerror(errno));
+    return ERR_OK;
 }
 
 /* ---- the listener ---- */
 
-static int listen_on(const char *addr, Err *err) {
+[[nodiscard]] static Error listen_on(const char *addr, int *out, Err *err) {
+    *out = -1;
     const char *colon = strrchr(addr, ':');
-    if (!colon) {
-        err_set(err, "listen %s: want host:port", addr);
-        return -1;
-    }
+    if (!colon) return err_set(err, ERR_INVALID_ARGUMENT, "listen %s: want host:port", addr);
     char *host = xstrndup(addr, (size_t)(colon - addr));
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE | AI_NUMERICSERV};
     struct addrinfo *res;
     int rc = getaddrinfo(*host ? host : NULL, colon + 1, &hints, &res);
     xfree(host);
-    if (rc != 0) {
-        err_set(err, "listen %s: %s", addr, gai_strerror(rc));
-        return -1;
-    }
+    if (rc != 0) return err_set(err, ERR_PLATFORM, "listen %s: %s", addr, gai_strerror(rc));
     int fd = -1;
+    Error e = ERR_OK;
     for (struct addrinfo *ai = res; ai && fd < 0; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
@@ -77,14 +67,15 @@ static int listen_on(const char *addr, Err *err) {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
         if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0 || listen(fd, 16) != 0) {
-            err_sys(err, "listen %s", addr);
+            e = err_set(err, ERR_PLATFORM, "listen %s: %s", addr, strerror(errno));
             close(fd);
             fd = -1;
         }
     }
     freeaddrinfo(res);
-    if (fd < 0 && !err->msg[0]) err_set(err, "listen %s: no usable address", addr);
-    return fd;
+    if (fd < 0) return e != ERR_OK ? e : err_set(err, ERR_PLATFORM, "listen %s: no usable address", addr);
+    *out = fd;
+    return ERR_OK;
 }
 
 static void respond(int client, int status, const char *reason, const char *content_type, const char *body, size_t len) {
@@ -124,7 +115,7 @@ static void handle(int client, MetricsFn metrics, BacklogFn backlog, void *arg) 
     } else if (strcmp(path, "/metrics") == 0) {
         StrBuf body = {0};
         Err err;
-        if (metrics(arg, &body, &err)) {
+        if (metrics(arg, &body, &err) == ERR_OK) {
             respond(client, 200, "OK", "text/plain; version=0.0.4", sb_cstr(&body), body.len);
         } else {
             sb_clear(&body);
@@ -138,11 +129,11 @@ static void handle(int client, MetricsFn metrics, BacklogFn backlog, void *arg) 
     close(client);
 }
 
-bool daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backlog, void *arg, Err *err) {
-    if (!*addr) return true;
-    err->msg[0] = '\0';
-    int fd = listen_on(addr, err);
-    if (fd < 0) return false;
+Error daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backlog, void *arg, Err *err) {
+    if (!*addr) return ERR_OK;
+    int fd;
+    Error e = listen_on(addr, &fd, err);
+    if (e != ERR_OK) return e;
     while (!ctx_done(ctx)) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         if (poll(&pfd, 1, 200) <= 0) continue;
@@ -150,7 +141,7 @@ bool daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backl
         if (client >= 0) handle(client, metrics, backlog, arg);
     }
     close(fd);
-    return true;
+    return ERR_OK;
 }
 
 static size_t collect(char *data, size_t size, size_t nmemb, void *userdata) {
@@ -183,18 +174,14 @@ bool daemon_ask(const char *addr, long *backlog) {
     return ok;
 }
 
-bool daemon_raise_file_limit(Err *err) {
+Error daemon_raise_file_limit(Err *err) {
     struct rlimit limit;
-    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
-        err_sys(err, "getrlimit");
-        return false;
-    }
-    if (limit.rlim_cur >= limit.rlim_max) return true;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return err_set(err, ERR_PLATFORM, "getrlimit: %s", strerror(errno));
+    if (limit.rlim_cur >= limit.rlim_max) return ERR_OK;
     limit.rlim_cur = limit.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return true;
+    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return ERR_OK;
     /* macOS rejects RLIM_INFINITY for the soft limit; OPEN_MAX-sized values work. */
     limit.rlim_cur = 1 << 20;
-    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return true;
-    err_sys(err, "setrlimit");
-    return false;
+    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return ERR_OK;
+    return err_set(err, ERR_PLATFORM, "setrlimit: %s", strerror(errno));
 }

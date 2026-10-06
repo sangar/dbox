@@ -25,7 +25,8 @@ typedef struct YmlNode {
     struct YmlNode **items;
 } YmlNode;
 
-YmlNode *yml_load(Arena *a, const char *text, size_t len, Err *err);
+/* yml_load parses text into *root, allocated in a. */
+[[nodiscard]] Error yml_load(Arena *a, const char *text, size_t len, YmlNode **root, Err *err);
 YmlNode *yml_get(const YmlNode *map, const char *key);
 YmlNode *yml_new_map(Arena *a);
 YmlNode *yml_new_scalar(Arena *a, const char *value, bool quoted);

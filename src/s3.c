@@ -394,8 +394,8 @@ static bool retryable(CURLcode code, long status) {
     return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 }
 
-/* perform sends req once and fills resp; it reports transport failures as false. */
-static bool perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, CURLcode *code, Err *err) {
+/* perform sends req once and fills resp; transport failures are the error, HTTP statuses are left in resp. */
+[[nodiscard]] static Error perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, CURLcode *code, Err *err) {
     StrBuf uri = {0}, query = {0}, url = {0};
     canonical_uri(s, req, &uri);
     canonical_query(req, &query);
@@ -444,17 +444,17 @@ static bool perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, CURLcod
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
     }
     *code = curl_easy_perform(curl);
-    bool ok = *code == CURLE_OK && !sink.failed;
-    if (ok) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
-    else if (sink.failed) err_sys(err, "write download");
-    else if (*code == CURLE_ABORTED_BY_CALLBACK) err_set(err, "cancelled");
-    else err_set(err, "%s %s: %s", req->method, sb_cstr(&url), curl_easy_strerror(*code));
+    Error e = ERR_OK;
+    if (*code == CURLE_OK && !sink.failed) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
+    else if (sink.failed) e = err_sys(err, "write download");
+    else if (*code == CURLE_ABORTED_BY_CALLBACK) e = err_set(err, ERR_CANCELLED, "cancelled");
+    else e = err_set(err, ERR_REMOTE, "%s %s: %s", req->method, sb_cstr(&url), curl_easy_strerror(*code));
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
     sb_free(&uri);
     sb_free(&query);
     sb_free(&url);
-    return ok;
+    return e;
 }
 
 static void response_init(Response *r) {
@@ -465,37 +465,34 @@ static void response_init(Response *r) {
 static void response_free(Response *r) { sb_free(&r->body); }
 
 /* request sends req, retrying transient failures, and leaves the status in resp. */
-static bool request(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
+[[nodiscard]] static Error request(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
     static const int64_t backoff_ms[MAX_TRIES] = {0, 200, 1000};
     for (int attempt = 0;; attempt++) {
         if (attempt > 0) {
-            if (!ctx_sleep(ctx, backoff_ms[attempt])) {
-                err_set(err, "cancelled");
-                return false;
-            }
+            if (!ctx_sleep(ctx, backoff_ms[attempt])) return err_set(err, ERR_CANCELLED, "cancelled");
             if (req->sink_fd >= 0) {
                 lseek(req->sink_fd, 0, SEEK_SET);
-                if (ftruncate(req->sink_fd, 0) != 0) return false;
+                if (ftruncate(req->sink_fd, 0) != 0) return err_sys(err, "truncate download");
             }
         }
         CURLcode code;
-        bool ok = perform(s, ctx, req, resp, &code, err);
-        if (!retryable(code, ok ? resp->status : 0) || attempt + 1 == MAX_TRIES) return ok;
+        Error e = perform(s, ctx, req, resp, &code, err);
+        if (!retryable(code, e == ERR_OK ? resp->status : 0) || attempt + 1 == MAX_TRIES) return e;
     }
 }
 
 /* fail_status describes a non-2xx response. */
-static StoreStatus fail_status(const Request *req, Response *resp, Err *err) {
-    if (resp->status == 404) return STORE_NOT_FOUND;
+[[nodiscard]] static Error fail_status(const Request *req, Response *resp, Err *err) {
+    if (resp->status == 404) return ERR_NOT_FOUND;
     Arena a;
     arena_init(&a, 4096);
     const char *end = resp->body.data ? resp->body.data + resp->body.len : NULL;
     const char *code = end ? xml_text(&a, resp->body.data, end, "Code") : "";
     const char *message = end ? xml_text(&a, resp->body.data, end, "Message") : "";
-    err_set(err, "%s %s: HTTP %ld%s%s%s%s", req->method, req->key ? req->key : "/", resp->status, *code ? " " : "", code, *message ? ": " : "",
-            message);
+    Error e = err_set(err, ERR_REMOTE, "%s %s: HTTP %ld%s%s%s%s", req->method, req->key ? req->key : "/", resp->status, *code ? " " : "", code,
+                      *message ? ": " : "", message);
     arena_free(&a);
-    return STORE_ERROR;
+    return e;
 }
 
 static bool ok_status(long status) { return status >= 200 && status < 300; }
@@ -513,23 +510,19 @@ static size_t meta_headers(const S3 *s, const Meta *meta, KV out[4], char mtime[
     return n;
 }
 
-static StoreStatus put_single(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
+[[nodiscard]] static Error put_single(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
     KV headers[4];
     char mtime[32];
     Request req = {.method = "PUT", .key = key, .headers = headers, .header_count = meta_headers(s, meta, headers, mtime), .body_fd = fd, .body_len = size, .sink_fd = -1};
     Response resp;
     response_init(&resp);
-    StoreStatus status = STORE_ERROR;
-    if (request(s, ctx, &req, &resp, err)) {
-        if (ok_status(resp.status)) {
-            snprintf(etag, ETAG_MAX, "%s", resp.etag);
-            status = STORE_OK;
-        } else {
-            status = fail_status(&req, &resp, err);
-        }
+    Error e = request(s, ctx, &req, &resp, err);
+    if (e == ERR_OK) {
+        if (ok_status(resp.status)) snprintf(etag, ETAG_MAX, "%s", resp.etag);
+        else e = fail_status(&req, &resp, err);
     }
     response_free(&resp);
-    return status;
+    return e;
 }
 
 static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id) {
@@ -538,77 +531,68 @@ static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id
     Response resp;
     response_init(&resp);
     Err ignored;
-    request(s, ctx, &req, &resp, &ignored);
+    (void)request(s, ctx, &req, &resp, &ignored);
     response_free(&resp);
 }
 
-static StoreStatus put_multipart(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
+[[nodiscard]] static Error put_multipart(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
     Arena a;
     arena_init(&a, 16 * 1024);
-    StoreStatus status = STORE_ERROR;
     Response resp;
     response_init(&resp);
     KV headers[4];
     char mtime[32];
     KV start_query[] = {{"uploads", ""}};
     Request start = {.method = "POST", .key = key, .query = start_query, .query_count = 1, .headers = headers, .header_count = meta_headers(s, meta, headers, mtime), .body_fd = -1, .sink_fd = -1};
-    if (!request(s, ctx, &start, &resp, err)) goto out;
+    Error e = request(s, ctx, &start, &resp, err);
+    if (e != ERR_OK) goto out;
     if (!ok_status(resp.status)) {
-        status = fail_status(&start, &resp, err);
+        e = fail_status(&start, &resp, err);
         goto out;
     }
     char *upload_id = xml_text(&a, resp.body.data, resp.body.data + resp.body.len, "UploadId");
     if (!*upload_id) {
-        err_set(err, "POST %s: no UploadId in response", key);
+        e = err_set(err, ERR_REMOTE, "POST %s: no UploadId in response", key);
         goto out;
     }
     StrBuf parts = {0};
     sb_puts(&parts, "<CompleteMultipartUpload>");
-    bool ok = true;
-    for (int64_t off = 0, number = 1; ok && off < size; off += s->part_size, number++) {
+    for (int64_t off = 0, number = 1; e == ERR_OK && off < size; off += s->part_size, number++) {
         char num[24];
         snprintf(num, sizeof num, "%lld", (long long)number);
         KV query[] = {{"partNumber", num}, {"uploadId", upload_id}};
         Request part = {.method = "PUT", .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_off = off, .body_len = min_i64(s->part_size, size - off), .sink_fd = -1};
-        ok = request(s, ctx, &part, &resp, err);
-        if (ok && !ok_status(resp.status)) {
-            fail_status(&part, &resp, err);
-            ok = false;
-        }
-        if (ok) sb_printf(&parts, "<Part><PartNumber>%s</PartNumber><ETag>\"%s\"</ETag></Part>", num, resp.etag);
+        e = request(s, ctx, &part, &resp, err);
+        if (e == ERR_OK && !ok_status(resp.status)) e = fail_status(&part, &resp, err);
+        if (e == ERR_OK) sb_printf(&parts, "<Part><PartNumber>%s</PartNumber><ETag>\"%s\"</ETag></Part>", num, resp.etag);
     }
     sb_puts(&parts, "</CompleteMultipartUpload>");
-    if (ok) {
+    if (e == ERR_OK) {
         KV query[] = {{"uploadId", upload_id}};
         Request complete = {.method = "POST", .key = key, .query = query, .query_count = 1, .body_fd = -1, .body = parts.data, .body_size = parts.len, .sink_fd = -1};
-        ok = request(s, ctx, &complete, &resp, err);
-        if (ok && !ok_status(resp.status)) {
-            fail_status(&complete, &resp, err);
-            ok = false;
-        }
-        if (ok) {
+        e = request(s, ctx, &complete, &resp, err);
+        if (e == ERR_OK && !ok_status(resp.status)) e = fail_status(&complete, &resp, err);
+        if (e == ERR_OK) {
             const char *end = resp.body.data + resp.body.len;
             char *code = xml_text(&a, resp.body.data, end, "Code");
             if (*code) {
-                err_set(err, "POST %s: %s: %s", key, code, xml_text(&a, resp.body.data, end, "Message"));
-                ok = false;
+                e = err_set(err, ERR_REMOTE, "POST %s: %s: %s", key, code, xml_text(&a, resp.body.data, end, "Message"));
             } else {
                 char *tag = xml_text(&a, resp.body.data, end, "ETag");
                 strip_quotes(tag);
                 snprintf(etag, ETAG_MAX, "%s", *tag ? tag : resp.etag);
-                status = STORE_OK;
             }
         }
     }
     sb_free(&parts);
-    if (!ok) abort_upload(s, ctx, key, upload_id);
+    if (e != ERR_OK) abort_upload(s, ctx, key, upload_id);
 out:
     response_free(&resp);
     arena_free(&a);
-    return status;
+    return e;
 }
 
-static StoreStatus s3_put(Store *base, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
+[[nodiscard]] static Error s3_put(Store *base, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
     S3 *s = (S3 *)base;
     if (size < s->part_size) return put_single(s, ctx, key, fd, size, meta, etag, err);
     return put_multipart(s, ctx, key, fd, size, meta, etag, err);
@@ -623,69 +607,62 @@ static void describe(Object *obj, const char *key, const Response *resp) {
     obj->mtime_ns = resp->meta_mtime_ns ? resp->meta_mtime_ns : resp->last_modified_ns;
 }
 
-static StoreStatus s3_get(Store *base, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
+[[nodiscard]] static Error s3_get(Store *base, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
     S3 *s = (S3 *)base;
-    int tmp = temp_file(s->tmp_dir, err);
-    if (tmp < 0) return STORE_ERROR;
+    int tmp;
+    Error e = temp_file(s->tmp_dir, &tmp, err);
+    if (e != ERR_OK) return e;
     Request req = {.method = "GET", .key = key, .body_fd = -1, .sink_fd = tmp};
     Response resp;
     response_init(&resp);
-    StoreStatus status = STORE_ERROR;
-    if (request(s, ctx, &req, &resp, err)) {
+    e = request(s, ctx, &req, &resp, err);
+    if (e == ERR_OK) {
         if (ok_status(resp.status)) {
             describe(obj, key, &resp);
             if (resp.content_length < 0) obj->size = lseek(tmp, 0, SEEK_CUR);
             lseek(tmp, 0, SEEK_SET);
             *fd = tmp;
-            status = STORE_OK;
         } else {
-            status = fail_status(&req, &resp, err);
+            e = fail_status(&req, &resp, err);
         }
     }
-    if (status != STORE_OK) close(tmp);
+    if (e != ERR_OK) close(tmp);
     response_free(&resp);
-    return status;
+    return e;
 }
 
-static StoreStatus s3_head(Store *base, Ctx *ctx, const char *key, Object *obj, Err *err) {
+[[nodiscard]] static Error s3_head(Store *base, Ctx *ctx, const char *key, Object *obj, Err *err) {
     S3 *s = (S3 *)base;
     Request req = {.method = "HEAD", .key = key, .body_fd = -1, .sink_fd = -1};
     Response resp;
     response_init(&resp);
-    StoreStatus status = STORE_ERROR;
-    if (request(s, ctx, &req, &resp, err)) {
-        if (ok_status(resp.status)) {
-            describe(obj, key, &resp);
-            status = STORE_OK;
-        } else if (resp.status == 404) {
-            status = STORE_NOT_FOUND;
-        } else {
-            err_set(err, "HEAD %s: HTTP %ld", key, resp.status);
-        }
+    Error e = request(s, ctx, &req, &resp, err);
+    if (e == ERR_OK) {
+        if (ok_status(resp.status)) describe(obj, key, &resp);
+        else if (resp.status == 404) e = ERR_NOT_FOUND;
+        else e = err_set(err, ERR_REMOTE, "HEAD %s: HTTP %ld", key, resp.status);
     }
     response_free(&resp);
-    return status;
+    return e;
 }
 
-static StoreStatus s3_delete(Store *base, Ctx *ctx, const char *key, Err *err) {
+[[nodiscard]] static Error s3_delete(Store *base, Ctx *ctx, const char *key, Err *err) {
     S3 *s = (S3 *)base;
     Request req = {.method = "DELETE", .key = key, .body_fd = -1, .sink_fd = -1};
     Response resp;
     response_init(&resp);
-    StoreStatus status = STORE_ERROR;
-    if (request(s, ctx, &req, &resp, err)) {
-        status = ok_status(resp.status) || resp.status == 404 ? STORE_OK : fail_status(&req, &resp, err);
-    }
+    Error e = request(s, ctx, &req, &resp, err);
+    if (e == ERR_OK && !ok_status(resp.status) && resp.status != 404) e = fail_status(&req, &resp, err);
     response_free(&resp);
-    return status;
+    return e;
 }
 
-static StoreStatus s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
+[[nodiscard]] static Error s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
     S3 *s = (S3 *)base;
     size_t n = 0, cap = 256;
     Object *out = xmalloc(cap * sizeof *out);
     char *token = NULL;
-    StoreStatus status = STORE_ERROR;
+    Error e = ERR_OK;
     Response resp;
     response_init(&resp);
     Arena scratch;
@@ -695,9 +672,9 @@ static StoreStatus s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, si
         size_t qn = 2;
         if (token) query[qn++] = (KV){"continuation-token", token};
         Request req = {.method = "GET", .query = query, .query_count = qn, .body_fd = -1, .sink_fd = -1};
-        if (!request(s, ctx, &req, &resp, err)) goto out;
+        if ((e = request(s, ctx, &req, &resp, err)) != ERR_OK) goto out;
         if (!ok_status(resp.status)) {
-            status = fail_status(&req, &resp, err);
+            e = fail_status(&req, &resp, err);
             goto out;
         }
         const char *p = resp.body.data, *end = p + resp.body.len;
@@ -724,7 +701,6 @@ static StoreStatus s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, si
         token = truncated ? xml_text(&scratch, resp.body.data, end, "NextContinuationToken") : NULL;
         if (!token || !*token) break;
     }
-    status = STORE_OK;
 out:
     *objects = arena_alloc(a, (n + 1) * sizeof **objects);
     memcpy(*objects, out, n * sizeof **objects);
@@ -732,25 +708,24 @@ out:
     *count = n;
     response_free(&resp);
     arena_free(&scratch);
-    return status;
+    return e;
 }
 
-bool s3_create_bucket(Store *base, Ctx *ctx, Err *err) {
+Error s3_create_bucket(Store *base, Ctx *ctx, Err *err) {
     S3 *s = (S3 *)base;
     Request req = {.method = "PUT", .body_fd = -1, .sink_fd = -1};
     Response resp;
     response_init(&resp);
-    bool ok = request(s, ctx, &req, &resp, err);
-    if (ok && !ok_status(resp.status)) {
+    Error e = request(s, ctx, &req, &resp, err);
+    if (e == ERR_OK && !ok_status(resp.status)) {
         Arena a;
         arena_init(&a, 4096);
         const char *code = xml_text(&a, resp.body.data, resp.body.data + resp.body.len, "Code");
-        ok = strcmp(code, "BucketAlreadyOwnedByYou") == 0;
-        if (!ok) fail_status(&req, &resp, err);
+        if (strcmp(code, "BucketAlreadyOwnedByYou") != 0) e = fail_status(&req, &resp, err);
         arena_free(&a);
     }
     response_free(&resp);
-    return ok;
+    return e;
 }
 
 static void s3_close(Store *base) {
@@ -778,9 +753,9 @@ static bool credentials_file(const char *profile, char **access, char **secret, 
     char *path = custom && *custom ? xstrdup(custom) : path_join(home_dir(), ".aws/credentials");
     StrBuf raw = {0};
     Err ignored;
-    bool ok = read_file(path, &raw, &ignored);
+    Error e = read_file(path, &raw, &ignored);
     xfree(path);
-    if (!ok) return false;
+    if (e != ERR_OK) return false;
     bool in_profile = false;
     char *save = NULL;
     for (char *line = strtok_r(raw.data, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -809,12 +784,12 @@ static bool credentials_file(const char *profile, char **access, char **secret, 
     return *access && *secret;
 }
 
-static bool resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
+[[nodiscard]] static Error resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
     s->session_token = xstrdup("");
     if (*cfg->access_key) {
         s->access_key = xstrdup(cfg->access_key);
         s->secret_key = xstrdup(cfg->secret_key);
-        return true;
+        return ERR_OK;
     }
     const char *access = getenv("AWS_ACCESS_KEY_ID"), *secret = getenv("AWS_SECRET_ACCESS_KEY"), *token = getenv("AWS_SESSION_TOKEN");
     if (access && *access && secret && *secret) {
@@ -824,7 +799,7 @@ static bool resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
             xfree(s->session_token);
             s->session_token = xstrdup(token);
         }
-        return true;
+        return ERR_OK;
     }
     const char *profile = getenv("AWS_PROFILE");
     char *a = NULL, *k = NULL, *t = NULL;
@@ -835,22 +810,18 @@ static bool resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
             xfree(s->session_token);
             s->session_token = t;
         }
-        return true;
+        return ERR_OK;
     }
     xfree(a);
     xfree(k);
     xfree(t);
-    err_set(err, "no credentials: set access_key and secret_key, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or ~/.aws/credentials");
-    return false;
+    return err_set(err, ERR_INVALID_ARGUMENT, "no credentials: set access_key and secret_key, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or ~/.aws/credentials");
 }
 
 /* parse_endpoint splits scheme://host[:port][/...] into scheme and host, as curl sends it in the Host header. */
-static bool parse_endpoint(const char *endpoint, char **scheme, char **host, Err *err) {
+[[nodiscard]] static Error parse_endpoint(const char *endpoint, char **scheme, char **host, Err *err) {
     const char *sep = strstr(endpoint, "://");
-    if (!sep) {
-        err_set(err, "endpoint %s: want scheme://host[:port]", endpoint);
-        return false;
-    }
+    if (!sep) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %s: want scheme://host[:port]", endpoint);
     *scheme = xstrndup(endpoint, (size_t)(sep - endpoint));
     const char *h = sep + 3;
     const char *end = strchr(h, '/');
@@ -859,14 +830,12 @@ static bool parse_endpoint(const char *endpoint, char **scheme, char **host, Err
     char *colon = strrchr(hp, ':');
     if (colon && ((https && strcmp(colon, ":443") == 0) || (!https && strcmp(colon, ":80") == 0))) *colon = '\0';
     *host = hp;
-    if (!*hp || (strcmp(*scheme, "http") != 0 && !https)) {
-        err_set(err, "endpoint %s: want http://host or https://host", endpoint);
-        return false;
-    }
-    return true;
+    if (!*hp || (strcmp(*scheme, "http") != 0 && !https)) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %s: want http://host or https://host", endpoint);
+    return ERR_OK;
 }
 
-Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Err *err) {
+Error s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Store **out, Err *err) {
+    *out = NULL;
     S3 *s = xcalloc(1, sizeof *s);
     s->base.ops = &s3_ops;
     s->bucket = xstrdup(cfg->bucket);
@@ -882,11 +851,12 @@ Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *
         sb_printf(&sb, "https://s3.%s.amazonaws.com", cfg->region);
         endpoint = sb.data;
     }
-    bool ok = parse_endpoint(endpoint, &s->scheme, &s->host, err) && resolve_credentials(cfg, s, err);
+    Error e = parse_endpoint(endpoint, &s->scheme, &s->host, err);
+    if (e == ERR_OK) e = resolve_credentials(cfg, s, err);
     xfree(endpoint);
-    if (!ok) {
+    if (e != ERR_OK) {
         s3_close(&s->base);
-        return NULL;
+        return e;
     }
     if (!s->path_style) {
         char *virtual_host = s->host;
@@ -894,5 +864,6 @@ Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *
         s->host[strlen(s->bucket)] = '.';
         xfree(virtual_host);
     }
-    return &s->base;
+    *out = &s->base;
+    return ERR_OK;
 }

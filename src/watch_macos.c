@@ -24,7 +24,8 @@ static void on_events(ConstFSEventStreamRef stream, void *info, size_t count, vo
     }
 }
 
-WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
+Error backend_open(Watcher *w, const char *root, WatchBackend **out, Err *err) {
+    *out = NULL;
     WatchBackend *b = xcalloc(1, sizeof *b);
     b->watcher = w;
     CFStringRef s = CFStringCreateWithCString(NULL, root, kCFStringEncodingUTF8);
@@ -35,24 +36,23 @@ WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
                                     kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer);
     CFRelease(paths);
     if (!b->stream) {
-        err_set(err, "FSEvents: cannot create event stream for %s", root);
         xfree(b);
-        return NULL;
+        return err_set(err, ERR_PLATFORM, "FSEvents: cannot create event stream for %s", root);
     }
     b->dispatch = dispatch_queue_create("dbox.fsevents", DISPATCH_QUEUE_SERIAL);
     FSEventStreamSetDispatchQueue(b->stream, b->dispatch);
     if (!FSEventStreamStart(b->stream)) {
-        err_set(err, "FSEvents: cannot start event stream for %s", root);
         FSEventStreamInvalidate(b->stream);
         FSEventStreamRelease(b->stream);
         dispatch_release(b->dispatch);
         xfree(b);
-        return NULL;
+        return err_set(err, ERR_PLATFORM, "FSEvents: cannot start event stream for %s", root);
     }
-    return b;
+    *out = b;
+    return ERR_OK;
 }
 
-bool backend_add_dir(WatchBackend *b, const char *path, Err *err) { return true; }
+Error backend_add_dir(WatchBackend *b, const char *path, Err *err) { return ERR_OK; }
 
 void backend_run(WatchBackend *b, Ctx *ctx) {
     ctx_lock(ctx);

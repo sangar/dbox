@@ -20,16 +20,15 @@ struct WatchBackend {
     size_t dir_cap;
 };
 
-WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
+Error backend_open(Watcher *w, const char *root, WatchBackend **out, Err *err) {
+    *out = NULL;
     int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd < 0) {
-        err_sys(err, "inotify");
-        return NULL;
-    }
+    if (fd < 0) return err_sys(err, "inotify");
     WatchBackend *b = xcalloc(1, sizeof *b);
     b->watcher = w;
     b->fd = fd;
-    return b;
+    *out = b;
+    return ERR_OK;
 }
 
 void backend_close(WatchBackend *b) {
@@ -39,9 +38,9 @@ void backend_close(WatchBackend *b) {
     xfree(b);
 }
 
-bool backend_add_dir(WatchBackend *b, const char *path, Err *err) {
+Error backend_add_dir(WatchBackend *b, const char *path, Err *err) {
     int wd = inotify_add_watch(b->fd, path, WATCH_MASK);
-    if (wd < 0) return errno == ENOENT;
+    if (wd < 0) return errno == ENOENT ? ERR_OK : ERR_PLATFORM;
     if ((size_t)wd >= b->dir_cap) {
         size_t cap = b->dir_cap ? b->dir_cap : 1024;
         while (cap <= (size_t)wd) cap *= 2;
@@ -51,7 +50,7 @@ bool backend_add_dir(WatchBackend *b, const char *path, Err *err) {
     }
     xfree(b->dirs[wd]);
     b->dirs[wd] = xstrdup(path);
-    return true;
+    return ERR_OK;
 }
 
 static void read_events(WatchBackend *b) {

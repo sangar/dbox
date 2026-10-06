@@ -10,7 +10,7 @@
 typedef enum { OS_DARWIN, OS_LINUX, OS_OTHER } ServiceOs;
 
 /* ServiceRunner executes a service manager command such as launchctl or systemctl; tests record them instead. */
-typedef bool (*ServiceRunner)(void *user, char *const argv[], Err *err);
+typedef Error (*ServiceRunner)(void *user, char *const argv[], Err *err);
 
 typedef struct {
     ServiceOs os;
@@ -23,18 +23,18 @@ typedef struct {
 } ServiceManager;
 
 /* service_run_command is the ServiceRunner that spawns the command and captures its output. */
-bool service_run_command(void *user, char *const argv[], Err *err);
+[[nodiscard]] Error service_run_command(void *user, char *const argv[], Err *err);
 
 /* service_manager describes this user's session; it fails where no service manager is known. */
-bool service_manager(ServiceManager *m, Err *err);
+[[nodiscard]] Error service_manager(ServiceManager *m, Err *err);
 char *service_unit_path(const ServiceManager *m);
-bool service_manager_enable(const ServiceManager *m, const char *executable, Err *err);
-bool service_manager_disable(const ServiceManager *m, Err *err);
+[[nodiscard]] Error service_manager_enable(const ServiceManager *m, const char *executable, Err *err);
+[[nodiscard]] Error service_manager_disable(const ServiceManager *m, Err *err);
 char *service_launchd_plist(const char *executable, const char *log_path);
 
 /* service_enable writes the definition for executable and starts it now and at every login; *unit receives the definition's path. */
-bool service_enable(const char *executable, char **unit, Err *err);
-bool service_disable(char **unit, Err *err);
+[[nodiscard]] Error service_enable(const char *executable, char **unit, Err *err);
+[[nodiscard]] Error service_disable(char **unit, Err *err);
 /* service_installed reports whether a definition written by service_enable exists, and where. */
 bool service_installed(char **unit);
 /*
@@ -42,6 +42,6 @@ bool service_installed(char **unit);
  * binary, because that survives upgrades that move the real file, otherwise
  * the running executable.
  */
-char *service_executable_path(Err *err);
+[[nodiscard]] Error service_executable_path(char **out, Err *err);
 
 #endif

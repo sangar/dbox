@@ -80,16 +80,16 @@ static void remove_tree(const char *path) { nftw(path, remove_entry, 16, FTW_DEP
 static void write_text(T *t, const char *path, const char *content) {
     char *dir = path_dir(path);
     Err err;
-    CHECK(mkdir_p(dir, 0755, &err));
+    CHECK(mkdir_p(dir, 0755, &err) == ERR_OK);
     xfree(dir);
-    CHECK(write_file(path, content, strlen(content), 0644, &err));
+    CHECK(write_file(path, content, strlen(content), 0644, &err) == ERR_OK);
 }
 
 /* read_text returns the file's content, or "<missing>". The result is malloc'd. */
 static char *read_text(const char *path) {
     StrBuf sb = {0};
     Err err;
-    if (!read_file(path, &sb, &err)) {
+    if (read_file(path, &sb, &err) != ERR_OK) {
         sb_free(&sb);
         return xstrdup("<missing>");
     }
@@ -118,7 +118,7 @@ static bool eventually(bool (*ok)(void *), void *arg) {
 
 /* ---- config ---- */
 
-static bool load(const char *yaml, char *const *env, Config *cfg, Err *err) { return config_parse("config.yaml", yaml, strlen(yaml), env, cfg, err); }
+[[nodiscard]] static Error load(const char *yaml, char *const *env, Config *cfg, Err *err) { return config_parse("config.yaml", yaml, strlen(yaml), env, cfg, err); }
 
 static void test_config_loads_stores_with_defaults_and_expanded_secrets(T *t) {
     char *nas = temp_dir(t);
@@ -132,9 +132,9 @@ static void test_config_loads_stores_with_defaults_and_expanded_secrets(T *t) {
     char *env[] = {"SECRET=s3cr3t", NULL};
     Config cfg;
     Err err;
-    bool ok = load(yaml.data, env, &cfg, &err);
-    CHECK(ok);
-    if (!ok) {
+    Error e = load(yaml.data, env, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e != ERR_OK) {
         fprintf(stderr, "load: %s\n", err.msg);
         goto out;
     }
@@ -163,9 +163,9 @@ static void test_config_references_expand_in_values_but_not_comments(T *t) {
     char *env[] = {"N=3", NULL};
     Config cfg;
     Err err;
-    bool ok = load("# secret_key: ${UNSET}\nstores:\n  a: {kind: s3, role: primary, bucket: b, region: r, workers: \"${N}\"}\nsync: {root: /tmp/box}\n", env, &cfg, &err);
-    CHECK(ok);
-    if (ok) {
+    Error e = load("# secret_key: ${UNSET}\nstores:\n  a: {kind: s3, role: primary, bucket: b, region: r, workers: \"${N}\"}\nsync: {root: /tmp/box}\n", env, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e == ERR_OK) {
         CHECK(config_store(&cfg, "a")->workers == 3);
         config_free(&cfg);
     } else {
@@ -177,9 +177,9 @@ static void test_config_environment_overrides_nested_keys(T *t) {
     char *env[] = {"DBOX_SYNC__ROOT=/b", "DBOX_SYNC__DELETE_LOCAL=false", NULL};
     Config cfg;
     Err err;
-    bool ok = load("sync: {root: /a}\n", env, &cfg, &err);
-    CHECK(ok);
-    if (ok) {
+    Error e = load("sync: {root: /a}\n", env, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e == ERR_OK) {
         CHECK_STR(cfg.sync.root, "/b");
         CHECK(!cfg.sync.delete_local);
         config_free(&cfg);
@@ -204,9 +204,9 @@ static void test_config_rejects_invalid_configs(T *t) {
     for (size_t i = 0; i < countof(cases); i++) {
         Config cfg;
         Err err;
-        bool ok = load(cases[i].yaml, NULL, &cfg, &err);
+        Error e = load(cases[i].yaml, NULL, &cfg, &err);
         t->checks++;
-        if (ok) {
+        if (e == ERR_OK) {
             t->failures++;
             fprintf(stderr, "%s: loaded without error\n", cases[i].name);
             config_free(&cfg);
@@ -217,9 +217,9 @@ static void test_config_rejects_invalid_configs(T *t) {
 static void test_config_no_stores_is_accepted(T *t) {
     Config cfg;
     Err err;
-    bool ok = load("", NULL, &cfg, &err);
-    CHECK(ok);
-    if (ok) {
+    Error e = load("", NULL, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e == ERR_OK) {
         CHECK(config_primary(&cfg) == NULL);
         CHECK_STR(cfg.daemon.listen, "127.0.0.1:7878");
         config_free(&cfg);
@@ -248,11 +248,11 @@ static void test_config_promote_swaps_roles_and_keeps_comments(T *t) {
                "    bucket: dbox\n"
                "    region: auto\n");
     Err err;
-    CHECK(config_promote(path, "r2", &err));
+    CHECK(config_promote(path, "r2", &err) == ERR_OK);
     Config cfg;
-    bool ok = config_load(path, &cfg, &err);
-    CHECK(ok);
-    if (ok) {
+    Error e = config_load(path, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e == ERR_OK) {
         CHECK(config_store(&cfg, "r2")->role == ROLE_PRIMARY);
         CHECK(config_store(&cfg, "minio")->role == ROLE_MIRROR);
         CHECK(config_store(&cfg, "old")->role == ROLE_DETACHED);
@@ -261,7 +261,7 @@ static void test_config_promote_swaps_roles_and_keeps_comments(T *t) {
     char *raw = read_text(path);
     CHECK(strstr(raw, "# my stores") && strstr(raw, "# home server"));
     xfree(raw);
-    CHECK(!config_promote(path, "nope", &err));
+    CHECK(config_promote(path, "nope", &err) != ERR_OK);
     xfree(path);
     xfree(dir);
 }
@@ -294,11 +294,11 @@ static void test_config_starter_loads_and_renders_without_secrets(T *t) {
     char *path = join(dir, "config.yml");
     bool created;
     Err err;
-    CHECK(config_write_starter(path, &created, &err) && created);
+    CHECK(config_write_starter(path, &created, &err) == ERR_OK && created);
     Config cfg;
-    bool ok = config_load(path, &cfg, &err);
-    CHECK(ok);
-    if (!ok) {
+    Error e = config_load(path, &cfg, &err);
+    CHECK(e == ERR_OK);
+    if (e != ERR_OK) {
         fprintf(stderr, "starter: %s\n", err.msg);
         goto out;
     }
@@ -315,9 +315,9 @@ static void test_config_starter_loads_and_renders_without_secrets(T *t) {
     CHECK(strstr(out.data, "part_size: 8MiB") != NULL);
     CHECK(strstr(out.data, "secret_key: '***'") != NULL);
     Config again;
-    ok = config_parse(path, out.data, out.len, NULL, &again, &err);
-    CHECK(ok);
-    if (ok) {
+    e = config_parse(path, out.data, out.len, NULL, &again, &err);
+    CHECK(e == ERR_OK);
+    if (e == ERR_OK) {
         CHECK_STR(config_store(&again, "a")->secret_key, "***");
         CHECK(again.sync.ignore_count == 5);
         config_free(&again);
@@ -343,9 +343,9 @@ static void test_durations_and_sizes(T *t) {
     CHECK(!parse_duration("5", &ns));
     Err err;
     int64_t size;
-    CHECK(parse_size("8MiB", &size, &err) && size == 8 << 20);
-    CHECK(parse_size(" 12 ", &size, &err) && size == 12);
-    CHECK(!parse_size("8MB", &size, &err));
+    CHECK(parse_size("8MiB", &size, &err) == ERR_OK && size == 8 << 20);
+    CHECK(parse_size(" 12 ", &size, &err) == ERR_OK && size == 12);
+    CHECK(parse_size("8MB", &size, &err) != ERR_OK);
     CHECK_STR(format_size(8 << 20, buf), "8MiB");
     CHECK_STR(format_size(1500, buf), "1500");
 }
@@ -413,8 +413,8 @@ static Index *open_index(T *t) {
     char *dir = temp_dir(t);
     char *path = join(dir, "index.db");
     Err err;
-    Index *idx = index_open(path, &err);
-    if (!idx) fprintf(stderr, "index_open: %s\n", err.msg);
+    Index *idx;
+    if (index_open(path, &idx, &err) != ERR_OK) fprintf(stderr, "index_open: %s\n", err.msg);
     xfree(path);
     xfree(dir);
     return idx;
@@ -427,13 +427,13 @@ static void test_index_tombstone_is_removed_once_no_store_holds_a_copy(T *t) {
     Err err;
     IndexFile f = {.path = "a", .size = 1, .sha256 = "x"};
     const char *mirrors[] = {"m"};
-    CHECK(index_record_synced(idx, &f, "p", "e1", mirrors, 1, &err));
-    CHECK(index_tombstone(idx, "a", "p", false, &err));
+    CHECK(index_record_synced(idx, &f, "p", "e1", mirrors, 1, &err) == ERR_OK);
+    CHECK(index_tombstone(idx, "a", "p", false, &err) == ERR_OK);
     IndexFile got;
     bool found;
-    CHECK(index_file(idx, &a, "a", &got, &found, &err) && found && got.deleted);
-    CHECK(index_drop_replica(idx, "a", "m", &err));
-    CHECK(index_file(idx, &a, "a", &got, &found, &err) && !found);
+    CHECK(index_file(idx, &a, "a", &got, &found, &err) == ERR_OK && found && got.deleted);
+    CHECK(index_drop_replica(idx, "a", "m", &err) == ERR_OK);
+    CHECK(index_file(idx, &a, "a", &got, &found, &err) == ERR_OK && !found);
     arena_free(&a);
     index_close(idx);
 }
@@ -443,10 +443,10 @@ static void test_index_mark_verified_ignores_stale_content(T *t) {
     Err err;
     IndexFile f = {.path = "a", .sha256 = "new"};
     const char *mirrors[] = {"m"};
-    CHECK(index_record_synced(idx, &f, "p", "e", mirrors, 1, &err));
+    CHECK(index_record_synced(idx, &f, "p", "e", mirrors, 1, &err) == ERR_OK);
     bool verified;
-    CHECK(index_mark_verified(idx, "a", "m", "e", "old", &verified, &err) && !verified);
-    CHECK(index_mark_verified(idx, "a", "m", "e", "new", &verified, &err) && verified);
+    CHECK(index_mark_verified(idx, "a", "m", "e", "old", &verified, &err) == ERR_OK && !verified);
+    CHECK(index_mark_verified(idx, "a", "m", "e", "new", &verified, &err) == ERR_OK && verified);
     index_close(idx);
 }
 
@@ -454,15 +454,15 @@ static void test_index_backfill_and_stats(T *t) {
     Index *idx = open_index(t);
     Err err;
     IndexFile a = {.path = "a", .size = 10, .sha256 = "x"}, b = {.path = "b", .size = 20, .sha256 = "y"};
-    CHECK(index_record_synced(idx, &a, "p", "e", NULL, 0, &err));
-    CHECK(index_record_synced(idx, &b, "p", "e", NULL, 0, &err));
+    CHECK(index_record_synced(idx, &a, "p", "e", NULL, 0, &err) == ERR_OK);
+    CHECK(index_record_synced(idx, &b, "p", "e", NULL, 0, &err) == ERR_OK);
     int64_t n;
-    CHECK(index_backfill(idx, "new", &n, &err) && n == 2);
-    CHECK(index_backfill(idx, "new", &n, &err) && n == 0);
+    CHECK(index_backfill(idx, "new", &n, &err) == ERR_OK && n == 2);
+    CHECK(index_backfill(idx, "new", &n, &err) == ERR_OK && n == 0);
     bool verified;
-    CHECK(index_mark_verified(idx, "a", "new", "e", "x", &verified, &err));
+    CHECK(index_mark_verified(idx, "a", "new", "e", "x", &verified, &err) == ERR_OK);
     Stats s;
-    CHECK(index_stats(idx, "new", &s, &err));
+    CHECK(index_stats(idx, "new", &s, &err) == ERR_OK);
     CHECK(s.files == 2 && s.bytes == 30 && s.verified == 1 && s.verified_bytes == 10 && s.pending == 1 && s.failed == 0);
     CHECK(stats_unverified(&s) == 1);
     index_close(idx);
@@ -474,19 +474,19 @@ static void test_index_upload_failures_are_due_after_backoff_until_given_up(T *t
     arena_init(&a, 4096);
     Err err;
     int64_t now = wall_ns();
-    CHECK(index_mark_upload_failed(idx, "a", "504", 1, now + 60 * NS_PER_SEC, &err));
-    CHECK(index_mark_upload_failed(idx, "b", "403", MAX_ATTEMPTS, now, &err));
+    CHECK(index_mark_upload_failed(idx, "a", "504", 1, now + 60 * NS_PER_SEC, &err) == ERR_OK);
+    CHECK(index_mark_upload_failed(idx, "b", "403", MAX_ATTEMPTS, now, &err) == ERR_OK);
     const char **due;
     size_t n;
-    CHECK(index_due_uploads(idx, &a, now, &due, &n, &err) && n == 0);
-    CHECK(index_due_uploads(idx, &a, now + 60 * NS_PER_SEC, &due, &n, &err) && n == 1 && strcmp(due[0], "a") == 0);
+    CHECK(index_due_uploads(idx, &a, now, &due, &n, &err) == ERR_OK && n == 0);
+    CHECK(index_due_uploads(idx, &a, now + 60 * NS_PER_SEC, &due, &n, &err) == ERR_OK && n == 1 && strcmp(due[0], "a") == 0);
     int64_t retried;
-    CHECK(index_retry_failed_uploads(idx, &retried, &err) && retried == 2);
-    CHECK(index_due_uploads(idx, &a, now, &due, &n, &err) && n == 2 && strcmp(due[0], "a") == 0 && strcmp(due[1], "b") == 0);
+    CHECK(index_retry_failed_uploads(idx, &retried, &err) == ERR_OK && retried == 2);
+    CHECK(index_due_uploads(idx, &a, now, &due, &n, &err) == ERR_OK && n == 2 && strcmp(due[0], "a") == 0 && strcmp(due[1], "b") == 0);
     IndexFile f = {.path = "a", .size = 1, .sha256 = "x"};
-    CHECK(index_record_synced(idx, &f, "p", "e1", NULL, 0, &err));
+    CHECK(index_record_synced(idx, &f, "p", "e1", NULL, 0, &err) == ERR_OK);
     UploadFailure *failed;
-    CHECK(index_failed_uploads(idx, &a, &failed, &n, &err) && n == 1 && strcmp(failed[0].path, "b") == 0 && strcmp(failed[0].last_error, "403") == 0);
+    CHECK(index_failed_uploads(idx, &a, &failed, &n, &err) == ERR_OK && n == 1 && strcmp(failed[0].path, "b") == 0 && strcmp(failed[0].last_error, "403") == 0);
     arena_free(&a);
     index_close(idx);
 }
@@ -555,8 +555,7 @@ static Machine *new_machine(T *t, StoreDir *dirs, size_t ndirs, const RoleSpec *
     char *state = config_state_dir(&m->cfg);
     char *path = join(state, "index.db");
     Err err;
-    m->idx = index_open(path, &err);
-    if (!m->idx) fprintf(stderr, "index: %s\n", err.msg);
+    if (index_open(path, &m->idx, &err) != ERR_OK) fprintf(stderr, "index: %s\n", err.msg);
     xfree(path);
     xfree(state);
     return m;
@@ -576,15 +575,15 @@ static Engine *machine_engine(T *t, Machine *m) {
 }
 
 static void once(T *t, Machine *m) {
-    Engine *e = machine_engine(t, m);
+    Engine *engine = machine_engine(t, m);
     Err err;
-    bool ok = engine_once(e, &t->background, &err);
+    Error e = engine_once(engine, &t->background, &err);
     t->checks++;
-    if (!ok) {
+    if (e != ERR_OK) {
         t->failures++;
         fprintf(stderr, "once: %s\n", err.msg);
     }
-    engine_free(e);
+    engine_free(engine);
 }
 
 static void mwrite(T *t, Machine *m, const char *rel, const char *content) {
@@ -638,7 +637,7 @@ static void test_engine_new_files_reach_primary_and_mirror(T *t) {
     }
     Stats s;
     Err err;
-    CHECK(index_stats(m->idx, "nas", &s, &err) && stats_unverified(&s) == 0);
+    CHECK(index_stats(m->idx, "nas", &s, &err) == ERR_OK && stats_unverified(&s) == 0);
     free_machine(m);
 }
 
@@ -656,7 +655,7 @@ static void test_engine_local_delete_reaches_every_store(T *t) {
     IndexFile f;
     bool found;
     Err err;
-    CHECK(index_file(m->idx, &a, "a.txt", &f, &found, &err) && !found);
+    CHECK(index_file(m->idx, &a, "a.txt", &f, &found, &err) == ERR_OK && !found);
     arena_free(&a);
     free_machine(m);
 }
@@ -703,11 +702,10 @@ typedef struct {
     T *t;
 } Wrapped;
 
-static StoreStatus w_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
+[[nodiscard]] static Error w_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
     Wrapped *w = (Wrapped *)s;
     if (w->rejecting && *w->rejecting) {
-        err_set(err, "503 slow down");
-        return STORE_ERROR;
+        return err_set(err, ERR_REMOTE, "503 slow down");
     }
     if (w->edit_local && !w->edited) {
         w->edited = true;
@@ -716,7 +714,7 @@ static StoreStatus w_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t si
     return store_put(w->inner, ctx, key, fd, size, meta, etag, err);
 }
 
-static StoreStatus w_get(Store *s, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
+[[nodiscard]] static Error w_get(Store *s, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
     Wrapped *w = (Wrapped *)s;
     if (w->want_gets > 0) {
         pthread_mutex_lock(&w->mu);
@@ -734,24 +732,22 @@ static StoreStatus w_get(Store *s, Ctx *ctx, const char *key, Object *obj, int *
         bool released = w->released;
         pthread_mutex_unlock(&w->mu);
         if (!released) {
-            err_set(err, "downloads did not overlap");
-            return STORE_ERROR;
+            return err_set(err, ERR_REMOTE, "downloads did not overlap");
         }
     }
     return store_get(w->inner, ctx, key, obj, fd, err);
 }
 
-static StoreStatus w_head(Store *s, Ctx *ctx, const char *key, Object *obj, Err *err) { return store_head(((Wrapped *)s)->inner, ctx, key, obj, err); }
-static StoreStatus w_del(Store *s, Ctx *ctx, const char *key, Err *err) { return store_delete(((Wrapped *)s)->inner, ctx, key, err); }
+[[nodiscard]] static Error w_head(Store *s, Ctx *ctx, const char *key, Object *obj, Err *err) { return store_head(((Wrapped *)s)->inner, ctx, key, obj, err); }
+[[nodiscard]] static Error w_del(Store *s, Ctx *ctx, const char *key, Err *err) { return store_delete(((Wrapped *)s)->inner, ctx, key, err); }
 
-static StoreStatus w_list(Store *s, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
+[[nodiscard]] static Error w_list(Store *s, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
     Wrapped *w = (Wrapped *)s;
     if (w->online && !atomic_load(w->online)) {
-        err_set(err, "network is unreachable");
-        return STORE_ERROR;
+        return err_set(err, ERR_REMOTE, "network is unreachable");
     }
-    StoreStatus status = store_list(w->inner, ctx, a, objects, count, err);
-    if (status == STORE_OK && w->hidden) {
+    Error status = store_list(w->inner, ctx, a, objects, count, err);
+    if (status == ERR_OK && w->hidden) {
         size_t n = 0;
         for (size_t i = 0; i < *count; i++)
             if (strcmp((*objects)[i].key, w->hidden) != 0) (*objects)[n++] = (*objects)[i];
@@ -795,7 +791,7 @@ static void test_engine_file_missing_from_stale_listing_is_not_deleted_locally(T
     IndexFile f;
     bool found;
     Err err;
-    CHECK(index_file(m->idx, &a, "fresh.txt", &f, &found, &err) && found && !f.deleted);
+    CHECK(index_file(m->idx, &a, "fresh.txt", &f, &found, &err) == ERR_OK && found && !f.deleted);
     arena_free(&a);
     free_machine(m);
 }
@@ -816,7 +812,7 @@ static void test_engine_identical_file_on_second_machine_is_adopted_not_conflict
     xfree(pattern);
     Stats s;
     Err err;
-    CHECK(index_stats(b->idx, "home", &s, &err) && s.files == 1 && s.verified == 1);
+    CHECK(index_stats(b->idx, "home", &s, &err) == ERR_OK && s.files == 1 && s.verified == 1);
     free_machine(a);
     free_machine(b);
 }
@@ -861,7 +857,7 @@ static void test_engine_migration_by_promoting_a_mirror(T *t) {
     expect_in(t, dirs[1].dir, "old.txt", "before r2 existed");
     Stats s;
     Err err;
-    CHECK(index_stats(m->idx, "r2", &s, &err) && stats_unverified(&s) == 0);
+    CHECK(index_stats(m->idx, "r2", &s, &err) == ERR_OK && stats_unverified(&s) == 0);
 
     RoleSpec promoted[] = {{"r2", ROLE_PRIMARY}, {"minio", ROLE_MIRROR}};
     set_roles(m, dirs, 2, promoted, 2);
@@ -892,10 +888,10 @@ static void test_engine_mirror_reconcile_adopts_copies_made_by_other_tools(T *t)
     set_roles(m, dirs, 2, primary_and_mirror, 2);
     Engine *e = machine_engine(t, m);
     Err err;
-    CHECK(engine_reconcile(e, &t->background, &err));
+    CHECK(engine_reconcile(e, &t->background, &err) == ERR_OK);
     engine_free(e);
     Stats s;
-    CHECK(index_stats(m->idx, "nas", &s, &err) && s.verified == 1);
+    CHECK(index_stats(m->idx, "nas", &s, &err) == ERR_OK && s.verified == 1);
     stat(copy, &after);
     CHECK(stat_mtime_ns(&before) == stat_mtime_ns(&after));
     xfree(copy);
@@ -912,9 +908,9 @@ static void test_engine_mirror_falls_back_to_local_file_when_primary_lacks_it(T 
     set_roles(m, dirs, 2, primary_and_mirror, 2);
     int64_t n;
     Err err;
-    CHECK(index_backfill(m->idx, "nas", &n, &err));
+    CHECK(index_backfill(m->idx, "nas", &n, &err) == ERR_OK);
     Engine *e = machine_engine(t, m);
-    CHECK(engine_drain_mirror(e, &t->background, "nas", &err));
+    CHECK(engine_drain_mirror(e, &t->background, "nas", &err) == ERR_OK);
     engine_free(e);
     expect_in(t, dirs[1].dir, "a.txt", "only local and in index");
     free_machine(m);
@@ -923,13 +919,13 @@ static void test_engine_mirror_falls_back_to_local_file_when_primary_lacks_it(T 
 typedef struct {
     Engine *e;
     Ctx ctx;
-    bool ok;
+    Error result;
     Err err;
 } DaemonRun;
 
 static void *daemon_main(void *arg) {
     DaemonRun *d = arg;
-    d->ok = engine_run(d->e, &d->ctx, &d->err);
+    d->result = engine_run(d->e, &d->ctx, &d->err);
     return NULL;
 }
 
@@ -980,7 +976,7 @@ static void test_engine_daemon_pushes_edits_as_they_happen(T *t) {
 
     ctx_cancel(&run.ctx);
     pthread_join(thread, NULL);
-    CHECK(run.ok);
+    CHECK(run.result == ERR_OK);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
     xfree(tmp);
@@ -1014,7 +1010,7 @@ static void test_engine_daemon_retries_reconcile_instead_of_exiting(T *t) {
     CHECK(eventually(file_is, uploaded));
     ctx_cancel(&run.ctx);
     pthread_join(thread, NULL);
-    CHECK(run.ok);
+    CHECK(run.result == ERR_OK);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
     xfree(copy);
@@ -1052,12 +1048,12 @@ static void test_engine_failed_upload_is_recorded_and_forgotten_once_it_succeeds
     UploadFailure *failed;
     size_t n;
     Err err;
-    CHECK(index_failed_uploads(m->idx, &a, &failed, &n, &err));
+    CHECK(index_failed_uploads(m->idx, &a, &failed, &n, &err) == ERR_OK);
     CHECK(n == 1 && strcmp(failed[0].path, "flaky.txt") == 0 && failed[0].attempts == 1 && strstr(failed[0].last_error, "503"));
     rejecting = false;
     once(t, m);
     expect_in(t, dirs[0].dir, "flaky.txt", "content");
-    CHECK(index_failed_uploads(m->idx, &a, &failed, &n, &err) && n == 0);
+    CHECK(index_failed_uploads(m->idx, &a, &failed, &n, &err) == ERR_OK && n == 0);
     arena_free(&a);
     free_machine(m);
 }
@@ -1077,10 +1073,10 @@ static void test_engine_file_changed_during_upload_is_not_recorded_until_resent(
     IndexFile f;
     bool found;
     Err err;
-    CHECK(index_file(m->idx, &a, "saving.txt", &f, &found, &err) && !found);
+    CHECK(index_file(m->idx, &a, "saving.txt", &f, &found, &err) == ERR_OK && !found);
     once(t, m);
     expect_in(t, dirs[0].dir, "saving.txt", "second, longer version");
-    CHECK(index_file(m->idx, &a, "saving.txt", &f, &found, &err) && found && f.size == (int64_t)strlen("second, longer version"));
+    CHECK(index_file(m->idx, &a, "saving.txt", &f, &found, &err) == ERR_OK && found && f.size == (int64_t)strlen("second, longer version"));
     arena_free(&a);
     xfree(local);
     free_machine(m);
@@ -1093,13 +1089,13 @@ typedef struct {
     char addr[64];
 } ServeRun;
 
-static bool no_metrics(void *arg, StrBuf *out, Err *err) { return true; }
+[[nodiscard]] static Error no_metrics(void *arg, StrBuf *out, Err *err) { return ERR_OK; }
 static long seven(void *arg) { return 7; }
 
 static void *serve_main(void *arg) {
     ServeRun *s = arg;
     Err err;
-    if (!daemon_serve(&s->ctx, s->addr, no_metrics, seven, NULL, &err)) fprintf(stderr, "serve: %s\n", err.msg);
+    if (daemon_serve(&s->ctx, s->addr, no_metrics, seven, NULL, &err) != ERR_OK) fprintf(stderr, "serve: %s\n", err.msg);
     return NULL;
 }
 
@@ -1131,9 +1127,9 @@ static void test_daemon_pid_file(T *t) {
     Err err;
     pid_t got;
     CHECK(!daemon_running(pid, &got));
-    CHECK(daemon_write_pid(pid, &err));
+    CHECK(daemon_write_pid(pid, &err) == ERR_OK);
     CHECK(daemon_running(pid, &got) && got == getpid());
-    CHECK(!daemon_write_pid(pid, &err));
+    CHECK(daemon_write_pid(pid, &err) != ERR_OK);
     daemon_remove_pid(pid);
     CHECK(!daemon_running(pid, &got));
     xfree(pid);
@@ -1143,7 +1139,7 @@ static void test_daemon_pid_file(T *t) {
 /* ---- service ---- */
 
 /* capture records service manager commands. launchctl print reports a service as gone, and bootout of a missing service fails like launchctl does. */
-static bool capture(void *user, char *const argv[], Err *err) {
+[[nodiscard]] static Error capture(void *user, char *const argv[], Err *err) {
     T *t = user;
     StrBuf line = {0};
     for (size_t i = 0; argv[i]; i++) sb_printf(&line, "%s%s", i ? " " : "", argv[i]);
@@ -1151,15 +1147,10 @@ static bool capture(void *user, char *const argv[], Err *err) {
     sb_free(&line);
     bool launchctl = strcmp(argv[0], "launchctl") == 0;
     if (launchctl && strcmp(argv[1], "bootstrap") == 0) t->loaded = true;
-    else if (launchctl && strcmp(argv[1], "bootout") == 0 && !t->loaded) {
-        err_set(err, "Boot-out failed: 3: No such process");
-        return false;
-    } else if (launchctl && strcmp(argv[1], "bootout") == 0) t->loaded = false;
-    else if (launchctl && strcmp(argv[1], "print") == 0 && !t->loaded) {
-        err_set(err, "Could not find service");
-        return false;
-    }
-    return true;
+    else if (launchctl && strcmp(argv[1], "bootout") == 0 && !t->loaded) return err_set(err, ERR_PLATFORM, "Boot-out failed: 3: No such process");
+    else if (launchctl && strcmp(argv[1], "bootout") == 0) t->loaded = false;
+    else if (launchctl && strcmp(argv[1], "print") == 0 && !t->loaded) return err_set(err, ERR_PLATFORM, "Could not find service");
+    return ERR_OK;
 }
 
 static char *joined_calls(T *t) {
@@ -1175,7 +1166,7 @@ static void test_service_enable_on_mac_writes_agent_and_bootstraps_it(T *t) {
     char *home = temp_dir(t);
     ServiceManager m = {.os = OS_DARWIN, .home = home, .config_home = home, .uid = 501, .run = capture, .run_user = t};
     Err err;
-    CHECK(service_manager_enable(&m, "/opt/homebrew/bin/dbox", &err));
+    CHECK(service_manager_enable(&m, "/opt/homebrew/bin/dbox", &err) == ERR_OK);
     char *unit = service_unit_path(&m);
     char *plist = read_text(unit);
     CHECK(strstr(plist, "<string>dbox</string>") != NULL);
@@ -1188,7 +1179,7 @@ static void test_service_enable_on_mac_writes_agent_and_bootstraps_it(T *t) {
     xfree(got);
     sb_free(&want);
     strlist_clear(&t->commands);
-    CHECK(service_manager_disable(&m, &err));
+    CHECK(service_manager_disable(&m, &err) == ERR_OK);
     got = joined_calls(t);
     CHECK_STR(got, "launchctl bootout gui/501/dbox\nlaunchctl print gui/501/dbox");
     xfree(got);
@@ -1202,7 +1193,7 @@ static void test_service_enable_on_linux_writes_unit_and_enables_it(T *t) {
     char *home = temp_dir(t), *config_home = temp_dir(t);
     ServiceManager m = {.os = OS_LINUX, .home = home, .config_home = config_home, .uid = 1000, .run = capture, .run_user = t};
     Err err;
-    CHECK(service_manager_enable(&m, "/home/me/go/bin/dbox", &err));
+    CHECK(service_manager_enable(&m, "/home/me/go/bin/dbox", &err) == ERR_OK);
     char *unit = service_unit_path(&m);
     char *text = read_text(unit);
     CHECK(strstr(text, "ExecStart=\"/home/me/go/bin/dbox\" run") != NULL);
@@ -1211,12 +1202,12 @@ static void test_service_enable_on_linux_writes_unit_and_enables_it(T *t) {
     CHECK_STR(got, "systemctl --user daemon-reload\nsystemctl --user enable --now dbox.service");
     xfree(got);
     strlist_clear(&t->commands);
-    CHECK(service_manager_disable(&m, &err));
+    CHECK(service_manager_disable(&m, &err) == ERR_OK);
     CHECK(access(unit, F_OK) != 0);
     got = joined_calls(t);
     CHECK_STR(got, "systemctl --user disable --now dbox.service\nsystemctl --user daemon-reload");
     xfree(got);
-    CHECK(!service_manager_disable(&m, &err));
+    CHECK(service_manager_disable(&m, &err) != ERR_OK);
     xfree(text);
     xfree(unit);
     xfree(home);

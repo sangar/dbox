@@ -199,18 +199,18 @@ typedef struct {
     Engine *engine;
 } Running;
 
-static bool metrics(void *arg, StrBuf *out, Err *err) {
+[[nodiscard]] static Error metrics(void *arg, StrBuf *out, Err *err) {
     Running *r = arg;
     sb_printf(out, "dbox_upload_backlog %zu\n", engine_backlog(r->engine));
     Arena a;
     arena_init(&a, 4096);
     size_t n;
     const char **names = config_store_names(r->cfg, &a, &n);
-    bool ok = true;
-    for (size_t i = 0; ok && i < n; i++) {
+    Error e = ERR_OK;
+    for (size_t i = 0; e == ERR_OK && i < n; i++) {
         Stats s;
-        ok = index_stats(r->idx, names[i], &s, err);
-        if (!ok) break;
+        e = index_stats(r->idx, names[i], &s, err);
+        if (e != ERR_OK) break;
         const char *role = role_name(config_store(r->cfg, names[i])->role);
         sb_printf(out, "dbox_files{store=\"%s\",role=\"%s\"} %lld\n", names[i], role, (long long)s.files);
         sb_printf(out, "dbox_replicas{store=\"%s\",role=\"%s\",state=\"verified\"} %lld\n", names[i], role, (long long)s.verified);
@@ -219,36 +219,34 @@ static bool metrics(void *arg, StrBuf *out, Err *err) {
         sb_printf(out, "dbox_verified_bytes{store=\"%s\",role=\"%s\"} %lld\n", names[i], role, (long long)s.verified_bytes);
     }
     arena_free(&a);
-    return ok;
+    return e;
 }
 
 static long backlog(void *arg) { return (long)engine_backlog(((Running *)arg)->engine); }
 
-typedef bool (*EngineFn)(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err);
+typedef Error (*EngineFn)(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err);
 
-static bool with_engine(App *app, Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, Err *err) {
-    if (!config_primary(cfg)) {
-        err_set(err, "%s: no stores configured", cfg->path);
-        return false;
-    }
+[[nodiscard]] static Error with_engine(App *app, Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, Err *err) {
+    if (!config_primary(cfg)) return err_set(err, ERR_INVALID_ARGUMENT, "%s: no stores configured", cfg->path);
     char *ip = index_path(cfg);
-    Index *idx = index_open(ip, err);
+    Index *idx;
+    Error result = index_open(ip, &idx, err);
     xfree(ip);
-    if (!idx) return false;
+    if (result != ERR_OK) return result;
     StoreSet stores;
-    bool ok = store_open_all(ctx, cfg, &stores, err);
-    if (ok) {
+    result = store_open_all(ctx, cfg, &stores, err);
+    if (result == ERR_OK) {
         logger_init(&app->log, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
         Engine *e = engine_new(cfg, idx, &stores, (EngineOptions){.dry_run = dry_run, .log = &app->log});
-        ok = fn(e, idx, ctx, cfg, &app->log, err);
+        result = fn(e, idx, ctx, cfg, &app->log, err);
         engine_free(e);
         storeset_close(&stores);
     }
     index_close(idx);
-    return ok;
+    return result;
 }
 
-static bool run_once(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) { return engine_once(e, ctx, err); }
+[[nodiscard]] static Error run_once(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) { return engine_once(e, ctx, err); }
 
 typedef struct {
     Ctx *ctx;
@@ -260,31 +258,31 @@ typedef struct {
 static void *serve_http(void *arg) {
     ServeArg *s = arg;
     Err err;
-    if (!daemon_serve(s->ctx, s->cfg->daemon.listen, metrics, backlog, &s->running, &err))
+    if (daemon_serve(s->ctx, s->cfg->daemon.listen, metrics, backlog, &s->running, &err) != ERR_OK)
         log_error(s->log, "health listener", log_str("addr", s->cfg->daemon.listen), log_err(&err), log_end());
     return NULL;
 }
 
-static bool run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) {
+[[nodiscard]] static Error run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) {
     ServeArg arg = {.ctx = ctx, .cfg = cfg, .log = log, .running = {cfg, idx, e}};
     pthread_t http;
     pthread_create(&http, NULL, serve_http, &arg);
-    bool ok = engine_run(e, ctx, err);
+    Error result = engine_run(e, ctx, err);
     ctx_cancel(ctx);
     pthread_join(http, NULL);
-    return ok;
+    return result;
 }
 
 /* serve runs the daemon for one config until ctx is done. */
-static bool serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
+[[nodiscard]] static Error serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
     logger_init(&app->log, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
     char *state = config_state_dir(cfg);
-    bool ok = mkdir_p(state, 0755, err);
+    Error result = mkdir_p(state, 0755, err);
     xfree(state);
-    if (!ok) return false;
+    if (result != ERR_OK) return result;
     char *pid = pid_path(cfg);
-    ok = daemon_write_pid(pid, err);
-    if (ok) {
+    result = daemon_write_pid(pid, err);
+    if (result == ERR_OK) {
         if (!config_primary(cfg)) {
             log_warn(&app->log, "no stores configured; add one to the config and send SIGHUP", log_str("config", cfg->path), log_end());
             ctx_lock(ctx);
@@ -292,12 +290,12 @@ static bool serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
             }
             ctx_unlock(ctx);
         } else {
-            ok = with_engine(app, ctx, cfg, false, run_daemon, err);
+            result = with_engine(app, ctx, cfg, false, run_daemon, err);
         }
         daemon_remove_pid(pid);
     }
     xfree(pid);
-    return ok;
+    return result;
 }
 
 static int cmd_run(App *app, int argc, char **argv) {
@@ -312,16 +310,16 @@ static int cmd_run(App *app, int argc, char **argv) {
     Config cfg;
     if (f.once || f.dry_run) {
         rc = EXIT_FAILURE;
-        if (config_load(f.config, &cfg, &err)) {
+        if (config_load(f.config, &cfg, &err) == ERR_OK) {
             char *pid = pid_path(&cfg);
             pid_t other;
             if (daemon_running(pid, &other) && !f.dry_run) {
-                err_set(&err, "the daemon is already syncing this folder (pid %d); stop it before running --once", (int)other);
+                (void)err_set(&err, ERR_PLATFORM, "the daemon is already syncing this folder (pid %d); stop it before running --once", (int)other);
             } else {
                 Ctx ctx;
                 ctx_init(&ctx);
                 begin_run(&app->signals, &ctx);
-                if (with_engine(app, &ctx, &cfg, f.dry_run, run_once, &err)) rc = EXIT_SUCCESS;
+                if (with_engine(app, &ctx, &cfg, f.dry_run, run_once, &err) == ERR_OK) rc = EXIT_SUCCESS;
                 end_run(&app->signals);
                 ctx_destroy(&ctx);
             }
@@ -333,27 +331,27 @@ static int cmd_run(App *app, int argc, char **argv) {
     }
 
     logger_init(&app->log, "info", "text", stderr);
-    if (!daemon_raise_file_limit(&err)) log_warn(&app->log, "raise open file limit", log_err(&err), log_end());
+    if (daemon_raise_file_limit(&err) != ERR_OK) log_warn(&app->log, "raise open file limit", log_err(&err), log_end());
     for (;;) {
-        if (!config_load(f.config, &cfg, &err)) {
+        if (config_load(f.config, &cfg, &err) != ERR_OK) {
             flags_free(&f);
             return fail(&err);
         }
         Ctx ctx;
         ctx_init(&ctx);
-        bool ok = true;
-        if (begin_run(&app->signals, &ctx)) ok = serve(app, &ctx, &cfg, &err);
+        Error served = ERR_OK;
+        if (begin_run(&app->signals, &ctx)) served = serve(app, &ctx, &cfg, &err);
         int sig = end_run(&app->signals);
         ctx_destroy(&ctx);
         if (sig == SIGHUP) {
             log_info(&app->log, "reloading config", log_str("path", cfg.path), log_end());
-            if (!ok) log_warn(&app->log, "stopped for reload", log_err(&err), log_end());
+            if (served != ERR_OK) log_warn(&app->log, "stopped for reload", log_err(&err), log_end());
             config_free(&cfg);
             continue;
         }
         config_free(&cfg);
         flags_free(&f);
-        return ok ? EXIT_SUCCESS : fail(&err);
+        return served == ERR_OK ? EXIT_SUCCESS : fail(&err);
     }
 }
 
@@ -373,9 +371,9 @@ static int cmd_status(int argc, char **argv) {
     }
     Err err;
     Config cfg;
-    bool loaded = config_load(f.config, &cfg, &err);
+    Error loaded = config_load(f.config, &cfg, &err);
     flags_free(&f);
-    if (!loaded) return fail(&err);
+    if (loaded != ERR_OK) return fail(&err);
     printf("config:  %s\nroot:    %s\n", cfg.path, cfg.sync.root);
     char *pid = pid_path(&cfg);
     pid_t running;
@@ -393,9 +391,10 @@ static int cmd_status(int argc, char **argv) {
     }
 
     char *ip = index_path(&cfg);
-    Index *idx = index_open(ip, &err);
+    Index *idx;
+    Error opened = index_open(ip, &idx, &err);
     xfree(ip);
-    if (!idx) {
+    if (opened != ERR_OK) {
         config_free(&cfg);
         return fail(&err);
     }
@@ -405,7 +404,7 @@ static int cmd_status(int argc, char **argv) {
     printf("\n%-12s %-9s %8s %8s %8s %8s %10s\n", "STORE", "ROLE", "FILES", "VERIFIED", "PENDING", "FAILED", "COPIED");
     UploadFailure *uploads;
     size_t upload_count;
-    if (!index_failed_uploads(idx, &a, &uploads, &upload_count, &err)) goto out;
+    if (index_failed_uploads(idx, &a, &uploads, &upload_count, &err) != ERR_OK) goto out;
     char backlog_text[32] = "-";
     long backlog;
     if (daemon_ask(cfg.daemon.listen, &backlog)) snprintf(backlog_text, sizeof backlog_text, "%ld", backlog);
@@ -417,7 +416,7 @@ static int cmd_status(int argc, char **argv) {
         Stats s;
         Replica *copies;
         size_t copy_count;
-        if (!index_stats(idx, names[i], &s, &err) || !index_failed(idx, &a, names[i], 10, &copies, &copy_count, &err)) {
+        if (index_stats(idx, names[i], &s, &err) != ERR_OK || index_failed(idx, &a, names[i], 10, &copies, &copy_count, &err) != ERR_OK) {
             strlist_free(&failed);
             goto out;
         }
@@ -452,10 +451,10 @@ static int store_arg(const char *command, int allowed, int argc, char **argv, Fl
     int rc = parse_flags(f, allowed, argc, argv);
     if (rc >= 0) return rc;
     if (f->positional.len != 1) return usage_fail("usage: dbox %s STORE", command);
-    if (!config_load(f->config, cfg, err)) return fail(err);
+    if (config_load(f->config, cfg, err) != ERR_OK) return fail(err);
     *name = f->positional.items[0];
     if (!config_store(cfg, *name)) {
-        err_set(err, "no store named \"%s\" in %s", *name, cfg->path);
+        (void)err_set(err, ERR_NOT_FOUND, "no store named \"%s\" in %s", *name, cfg->path);
         config_free(cfg);
         return fail(err);
     }
@@ -473,18 +472,19 @@ static int cmd_retry(int argc, char **argv) {
         return rc;
     }
     char *ip = index_path(&cfg);
-    Index *idx = index_open(ip, &err);
+    Index *idx;
+    Error opened = index_open(ip, &idx, &err);
     xfree(ip);
     rc = EXIT_FAILURE;
-    if (idx) {
+    if (opened == ERR_OK) {
         int64_t n;
         if (strcmp(name, config_primary(&cfg)) == 0) {
-            if (index_retry_failed_uploads(idx, &n, &err)) {
+            if (index_retry_failed_uploads(idx, &n, &err) == ERR_OK) {
                 char buf[48];
                 printf("%lld failed uploads to %s are due again; the daemon retries them within %s\n", (long long)n, name, format_duration(cfg.sync.pull_interval_ns, buf));
                 rc = EXIT_SUCCESS;
             }
-        } else if (index_retry_failed(idx, name, &n, &err)) {
+        } else if (index_retry_failed(idx, name, &n, &err) == ERR_OK) {
             printf("%lld failed copies on %s are pending again\n", (long long)n, name);
             rc = EXIT_SUCCESS;
         }
@@ -510,14 +510,15 @@ static int cmd_check(int argc, char **argv) {
     char *state = config_state_dir(&cfg);
     char *tmp = path_join(state, "tmp");
     rc = EXIT_FAILURE;
-    Store *s = store_open(&ctx, config_store(&cfg, name), cfg.sync.part_size, tmp, &err);
-    if (s) {
+    Store *s;
+    if (store_open(&ctx, config_store(&cfg, name), cfg.sync.part_size, tmp, &s, &err) == ERR_OK) {
         Err inner;
-        if (store_check(&ctx, s, &inner)) {
+        Error checked = store_check(&ctx, s, &inner);
+        if (checked == ERR_OK) {
             printf("%s: ok, wrote, read back and deleted a probe object\n", name);
             rc = EXIT_SUCCESS;
         } else {
-            err_set(&err, "%s: %s", name, inner.msg);
+            (void)err_set(&err, checked, "%s: %s", name, inner.msg);
         }
         store_close(s);
     }
@@ -546,27 +547,30 @@ static int cmd_promote(int argc, char **argv) {
         goto out;
     }
     char *ip = index_path(&cfg);
-    Index *idx = index_open(ip, &err);
-    xfree(ip);
-    if (!idx) goto out;
-    Stats stats;
-    bool ok = index_stats(idx, name, &stats, &err);
-    index_close(idx);
-    if (!ok) goto out;
-    if (stats_unverified(&stats) > 0 && !f.force) {
-        err_set(&err, "%s lacks a verified copy of %lld of %lld files; wait for backfill (see `dbox status`) or pass --force", name,
-                (long long)stats_unverified(&stats), (long long)stats.files);
+    Index *idx;
+    if (index_open(ip, &idx, &err) != ERR_OK) {
+        xfree(ip);
         goto out;
     }
-    if (!config_promote(cfg.path, name, &err)) goto out;
+    xfree(ip);
+    Stats stats;
+    Error e = index_stats(idx, name, &stats, &err);
+    index_close(idx);
+    if (e != ERR_OK) goto out;
+    if (stats_unverified(&stats) > 0 && !f.force) {
+        (void)err_set(&err, ERR_INVALID_ARGUMENT, "%s lacks a verified copy of %lld of %lld files; wait for backfill (see `dbox status`) or pass --force", name,
+                      (long long)stats_unverified(&stats), (long long)stats.files);
+        goto out;
+    }
+    if (config_promote(cfg.path, name, &err) != ERR_OK) goto out;
     printf("%s is now the primary, %s is a mirror (%s)\n", name, config_primary(&cfg), cfg.path);
     char *pid = pid_path(&cfg);
     bool reloaded;
     Err inner;
-    ok = daemon_reload(pid, &reloaded, &inner);
+    e = daemon_reload(pid, &reloaded, &inner);
     xfree(pid);
-    if (!ok) {
-        err_set(&err, "signal daemon: %s", inner.msg);
+    if (e != ERR_OK) {
+        (void)err_set(&err, e, "signal daemon: %s", inner.msg);
         goto out;
     }
     if (reloaded) printf("the running daemon is reloading its config\n");
@@ -583,13 +587,13 @@ static int cmd_service(int argc, char **argv) {
     char *unit = NULL;
     int rc = EXIT_FAILURE;
     if (strcmp(argv[0], "disable") == 0) {
-        if (service_disable(&unit, &err)) {
+        if (service_disable(&unit, &err) == ERR_OK) {
             printf("stopped and removed %s\n", unit);
             rc = EXIT_SUCCESS;
         }
     } else {
-        char *exe = service_executable_path(&err);
-        if (exe && service_enable(exe, &unit, &err)) {
+        char *exe;
+        if (service_executable_path(&exe, &err) == ERR_OK && service_enable(exe, &unit, &err) == ERR_OK) {
             printf("dbox run starts now and at every login (%s)\n", unit);
             rc = EXIT_SUCCESS;
         }
@@ -600,7 +604,7 @@ static int cmd_service(int argc, char **argv) {
 }
 
 /* run_editor runs $VISUAL or $EDITOR through the shell, so values with arguments such as "code --wait" work. */
-static bool run_editor(const char *path, Err *err) {
+[[nodiscard]] static Error run_editor(const char *path, Err *err) {
     const char *editor = getenv("VISUAL");
     if (!editor || !*editor) editor = getenv("EDITOR");
     if (!editor || !*editor) editor = "vi";
@@ -610,29 +614,30 @@ static bool run_editor(const char *path, Err *err) {
     pid_t pid;
     int rc = posix_spawnp(&pid, "sh", NULL, NULL, argv, environ);
     int status = 0;
-    bool ok = rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!ok) err_set(err, "editor \"%s\": exit status %d", editor, WIFEXITED(status) ? WEXITSTATUS(status) : rc);
+    Error e = ERR_OK;
+    if (!(rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0))
+        e = err_set(err, ERR_PLATFORM, "editor \"%s\": exit status %d", editor, WIFEXITED(status) ? WEXITSTATUS(status) : rc);
     xfree(script);
-    return ok;
+    return e;
 }
 
 /* edit_config opens the config in the user's editor, creating it first if needed, then validates it and asks a running daemon to reload it. */
-static bool edit_config(const char *path, Err *err) {
+[[nodiscard]] static Error edit_config(const char *path, Err *err) {
     bool created;
-    if (!config_write_starter(path, &created, err) || !run_editor(path, err)) return false;
+    Error e = config_write_starter(path, &created, err);
+    if (e == ERR_OK) e = run_editor(path, err);
+    if (e != ERR_OK) return e;
     Config cfg;
     Err inner;
-    if (!config_load(path, &cfg, &inner)) {
-        err_set(err, "%s\nrun `dbox config edit` again to fix it", inner.msg);
-        return false;
-    }
+    e = config_load(path, &cfg, &inner);
+    if (e != ERR_OK) return err_set(err, e, "%s\nrun `dbox config edit` again to fix it", inner.msg);
     char *pid = pid_path(&cfg);
     bool reloaded;
-    bool ok = daemon_reload(pid, &reloaded, err);
+    e = daemon_reload(pid, &reloaded, err);
     xfree(pid);
     config_free(&cfg);
-    if (ok) printf(reloaded ? "config is valid; the daemon is reloading it\n" : "config is valid\n");
-    return ok;
+    if (e == ERR_OK) printf(reloaded ? "config is valid; the daemon is reloading it\n" : "config is valid\n");
+    return e;
 }
 
 static int cmd_config(int argc, char **argv) {
@@ -645,20 +650,20 @@ static int cmd_config(int argc, char **argv) {
     Err err;
     rc = EXIT_FAILURE;
     if (f.positional.len == 1 && strcmp(f.positional.items[0], "edit") == 0) {
-        if (edit_config(f.config, &err)) rc = EXIT_SUCCESS;
+        if (edit_config(f.config, &err) == ERR_OK) rc = EXIT_SUCCESS;
     } else if (f.positional.len > 0) {
         rc = usage_fail("unknown config action \"%s\" (want edit)", f.positional.items[0]);
         flags_free(&f);
         return rc;
     } else if (f.init) {
         bool created;
-        if (config_write_starter(f.config, &created, &err)) {
+        if (config_write_starter(f.config, &created, &err) == ERR_OK) {
             printf(created ? "wrote %s\n" : "%s already exists\n", f.config);
             rc = EXIT_SUCCESS;
         }
     } else {
         Config cfg;
-        if (config_load(f.config, &cfg, &err)) {
+        if (config_load(f.config, &cfg, &err) == ERR_OK) {
             StrBuf out = {0};
             config_render(&cfg, &out);
             printf("# %s\n%s", cfg.path, sb_cstr(&out));
@@ -680,15 +685,16 @@ static int cmd_reload(int argc, char **argv) {
     }
     Err err;
     Config cfg;
-    bool loaded = config_load(f.config, &cfg, &err);
+    Error loaded = config_load(f.config, &cfg, &err);
     flags_free(&f);
-    if (!loaded) return fail(&err);
+    if (loaded != ERR_OK) return fail(&err);
     char *pid = pid_path(&cfg);
     bool reloaded;
     Err inner;
     rc = EXIT_FAILURE;
-    if (!daemon_reload(pid, &reloaded, &inner)) err_set(&err, "signal daemon: %s", inner.msg);
-    else if (!reloaded) err_set(&err, "no daemon is running (no live pid in %s)", pid);
+    Error signalled = daemon_reload(pid, &reloaded, &inner);
+    if (signalled != ERR_OK) (void)err_set(&err, signalled, "signal daemon: %s", inner.msg);
+    else if (!reloaded) (void)err_set(&err, ERR_NOT_FOUND, "no daemon is running (no live pid in %s)", pid);
     else {
         printf("config is valid; the daemon is reloading it\n");
         rc = EXIT_SUCCESS;

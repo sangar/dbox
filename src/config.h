@@ -62,18 +62,18 @@ const char *role_name(StoreRole r);
 const char *kind_name(StoreKind k);
 
 /* config_load reads the file, expands ${VAR}, applies DBOX_ overrides and defaults, and validates. */
-bool config_load(const char *path, Config *c, Err *err);
-bool config_parse(const char *path, const char *text, size_t len, char *const *environ, Config *c, Err *err);
+[[nodiscard]] Error config_load(const char *path, Config *c, Err *err);
+[[nodiscard]] Error config_parse(const char *path, const char *text, size_t len, char *const *environ, Config *c, Err *err);
 /* config_render writes the effective config as YAML with secrets masked. */
 void config_render(const Config *c, StrBuf *out);
 /* config_default_path is $DBOX_CONFIG, or config.yml under $XDG_CONFIG_HOME/dbox; an existing config.yaml wins over a missing config.yml. */
 char *config_default_path(void);
 /* config_write_starter creates a commented config unless the file exists; *created says which. */
-bool config_write_starter(const char *path, bool *created, Err *err);
+[[nodiscard]] Error config_write_starter(const char *path, bool *created, Err *err);
 /* config_promote rewrites the file so store is the primary and the old primary a mirror, keeping comments. */
-bool config_promote(const char *path, const char *store, Err *err);
+[[nodiscard]] Error config_promote(const char *path, const char *store, Err *err);
 
-bool parse_size(const char *s, int64_t *out, Err *err);
+[[nodiscard]] Error parse_size(const char *s, int64_t *out, Err *err);
 const char *format_size(int64_t n, char buf[32]);
 
 #endif

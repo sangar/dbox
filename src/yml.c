@@ -7,6 +7,7 @@ typedef struct {
     yaml_parser_t parser;
     Arena *arena;
     Err *err;
+    Error code;
     const char *source;
 } Loader;
 
@@ -67,7 +68,7 @@ bool yml_is_null(const YmlNode *n) { return !n || n->kind == YML_NULL || (n->kin
 
 static bool next_event(Loader *l, yaml_event_t *ev) {
     if (yaml_parser_parse(&l->parser, ev)) return true;
-    err_set(l->err, "line %d: %s", (int)l->parser.problem_mark.line + 1, l->parser.problem ? l->parser.problem : "invalid yaml");
+    l->code = err_set(l->err, ERR_INVALID_ARGUMENT, "line %d: %s", (int)l->parser.problem_mark.line + 1, l->parser.problem ? l->parser.problem : "invalid yaml");
     return false;
 }
 
@@ -90,7 +91,7 @@ static YmlNode *build_collection(Loader *l, YmlKind kind, int line) {
             continue;
         }
         if (ev.type != YAML_SCALAR_EVENT) {
-            err_set(l->err, "line %d: mapping keys must be scalars", (int)ev.start_mark.line + 1);
+            l->code = err_set(l->err, ERR_INVALID_ARGUMENT, "line %d: mapping keys must be scalars", (int)ev.start_mark.line + 1);
             yaml_event_delete(&ev);
             return NULL;
         }
@@ -123,14 +124,14 @@ static YmlNode *build(Loader *l, yaml_event_t *ev) {
     case YAML_SEQUENCE_START_EVENT:
         yaml_event_delete(ev);
         return build_collection(l, YML_SEQ, line);
-    case YAML_ALIAS_EVENT: err_set(l->err, "line %d: aliases are not supported", line); break;
-    default: err_set(l->err, "line %d: unexpected yaml structure", line); break;
+    case YAML_ALIAS_EVENT: l->code = err_set(l->err, ERR_INVALID_ARGUMENT, "line %d: aliases are not supported", line); break;
+    default: l->code = err_set(l->err, ERR_INVALID_ARGUMENT, "line %d: unexpected yaml structure", line); break;
     }
     yaml_event_delete(ev);
     return n;
 }
 
-YmlNode *yml_load(Arena *a, const char *text, size_t len, Err *err) {
+Error yml_load(Arena *a, const char *text, size_t len, YmlNode **root_out, Err *err) {
     Loader l = {.arena = a, .err = err, .source = text};
     yaml_parser_initialize(&l.parser);
     yaml_parser_set_input_string(&l.parser, (const unsigned char *)text, len);
@@ -155,5 +156,6 @@ YmlNode *yml_load(Arena *a, const char *text, size_t len, Err *err) {
     ok = true;
 out:
     yaml_parser_delete(&l.parser);
-    return ok ? root : NULL;
+    *root_out = ok ? root : NULL;
+    return ok ? ERR_OK : l.code;
 }

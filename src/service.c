@@ -18,12 +18,9 @@ extern char **environ;
 
 #define LABEL "dbox"
 
-bool service_run_command(void *user, char *const argv[], Err *err) {
+Error service_run_command(void *user, char *const argv[], Err *err) {
     int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        err_sys(err, "pipe");
-        return false;
-    }
+    if (pipe(pipefd) != 0) return err_set(err, ERR_PLATFORM, "pipe: %s", strerror(errno));
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
@@ -39,20 +36,20 @@ bool service_run_command(void *user, char *const argv[], Err *err) {
     while ((n = read(pipefd[0], buf, sizeof buf)) > 0) sb_append(&out, buf, (size_t)n);
     close(pipefd[0]);
     int status = 0;
-    bool ok = rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!ok) {
+    Error e = ERR_OK;
+    if (!(rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
         StrBuf cmd = {0};
         for (size_t i = 0; argv[i]; i++) sb_printf(&cmd, "%s%s", i ? " " : "", argv[i]);
         while (out.len > 0 && (out.data[out.len - 1] == '\n' || out.data[out.len - 1] == ' ')) out.len--;
-        if (rc) err_set(err, "%s: %s", sb_cstr(&cmd), strerror(rc));
-        else err_set(err, "%s: exit status %d: %s", sb_cstr(&cmd), WIFEXITED(status) ? WEXITSTATUS(status) : -1, sb_cstr(&out));
+        if (rc) e = err_set(err, ERR_PLATFORM, "%s: %s", sb_cstr(&cmd), strerror(rc));
+        else e = err_set(err, ERR_PLATFORM, "%s: exit status %d: %s", sb_cstr(&cmd), WIFEXITED(status) ? WEXITSTATUS(status) : -1, sb_cstr(&out));
         sb_free(&cmd);
     }
     sb_free(&out);
-    return ok;
+    return e;
 }
 
-bool service_manager(ServiceManager *m, Err *err) {
+Error service_manager(ServiceManager *m, Err *err) {
     memset(m, 0, sizeof *m);
     m->home = home_dir();
     const char *xdg = getenv("XDG_CONFIG_HOME");
@@ -68,11 +65,8 @@ bool service_manager(ServiceManager *m, Err *err) {
 #else
     m->os = OS_OTHER;
 #endif
-    if (m->os == OS_OTHER) {
-        err_set(err, "no user service manager known for this system; start `dbox run` from your session startup instead");
-        return false;
-    }
-    return true;
+    if (m->os == OS_OTHER) return err_set(err, ERR_PLATFORM, "no user service manager known for this system; start `dbox run` from your session startup instead");
+    return ERR_OK;
 }
 
 char *service_unit_path(const ServiceManager *m) {
@@ -146,74 +140,76 @@ static void launchd_target(const ServiceManager *m, char buf[64]) { snprintf(buf
  * launchctl returns as soon as the stop signal is sent, and a bootstrap while
  * the old registration lingers fails with an I/O error.
  */
-static bool bootout(const ServiceManager *m, Err *err) {
+[[nodiscard]] static Error bootout(const ServiceManager *m, Err *err) {
     char target[64];
     launchd_target(m, target);
     char *argv[] = {"launchctl", "bootout", target, NULL};
-    if (!m->run(m->run_user, argv, err)) return strstr(err->msg, "No such process") != NULL;
+    Error e = m->run(m->run_user, argv, err);
+    if (e != ERR_OK) return strstr(err->msg, "No such process") ? ERR_OK : e;
     char *print[] = {"launchctl", "print", target, NULL};
     for (int i = 0; i < 150; i++) {
         Err ignored;
-        if (!m->run(m->run_user, print, &ignored)) return true;
+        if (m->run(m->run_user, print, &ignored) != ERR_OK) return ERR_OK;
         usleep(100 * 1000);
     }
-    err_set(err, "launchctl bootout: the dbox agent did not stop within 15 seconds");
-    return false;
+    return err_set(err, ERR_PLATFORM, "launchctl bootout: the dbox agent did not stop within 15 seconds");
 }
 
-bool service_manager_enable(const ServiceManager *m, const char *executable, Err *err) {
+Error service_manager_enable(const ServiceManager *m, const char *executable, Err *err) {
     char *unit = service_unit_path(m);
     char *text = definition(m, executable);
     char *dir = path_dir(unit);
-    bool ok = mkdir_p(dir, 0755, err) && write_file(unit, text, strlen(text), 0644, err);
-    if (ok && m->os == OS_DARWIN) {
+    Error e = mkdir_p(dir, 0755, err);
+    if (e == ERR_OK) e = write_file(unit, text, strlen(text), 0644, err);
+    if (e == ERR_OK && m->os == OS_DARWIN) {
         char domain[32];
         snprintf(domain, sizeof domain, "gui/%d", m->uid);
         char *argv[] = {"launchctl", "bootstrap", domain, unit, NULL};
-        ok = bootout(m, err) && m->run(m->run_user, argv, err);
-    } else if (ok) {
+        e = bootout(m, err);
+        if (e == ERR_OK) e = m->run(m->run_user, argv, err);
+    } else if (e == ERR_OK) {
         char *reload[] = {"systemctl", "--user", "daemon-reload", NULL};
         char *enable[] = {"systemctl", "--user", "enable", "--now", LABEL ".service", NULL};
-        ok = m->run(m->run_user, reload, err) && m->run(m->run_user, enable, err);
+        e = m->run(m->run_user, reload, err);
+        if (e == ERR_OK) e = m->run(m->run_user, enable, err);
     }
     xfree(dir);
     xfree(text);
     xfree(unit);
-    return ok;
+    return e;
 }
 
-bool service_manager_disable(const ServiceManager *m, Err *err) {
+Error service_manager_disable(const ServiceManager *m, Err *err) {
     char *unit = service_unit_path(m);
     struct stat st;
-    bool ok = false;
+    Error e;
     if (stat(unit, &st) != 0) {
-        err_set(err, "no service installed at %s", unit);
+        e = err_set(err, ERR_NOT_FOUND, "no service installed at %s", unit);
     } else {
         char *stop[] = {"systemctl", "--user", "disable", "--now", LABEL ".service", NULL};
-        ok = m->os == OS_DARWIN ? bootout(m, err) : m->run(m->run_user, stop, err);
-        if (ok && unlink(unit) != 0) {
-            err_sys(err, "%s", unit);
-            ok = false;
-        }
-        if (ok && m->os != OS_DARWIN) {
+        e = m->os == OS_DARWIN ? bootout(m, err) : m->run(m->run_user, stop, err);
+        if (e == ERR_OK && unlink(unit) != 0) e = err_sys(err, "%s", unit);
+        if (e == ERR_OK && m->os != OS_DARWIN) {
             char *reload[] = {"systemctl", "--user", "daemon-reload", NULL};
-            ok = m->run(m->run_user, reload, err);
+            e = m->run(m->run_user, reload, err);
         }
     }
     xfree(unit);
-    return ok;
+    return e;
 }
 
-bool service_enable(const char *executable, char **unit, Err *err) {
+Error service_enable(const char *executable, char **unit, Err *err) {
     ServiceManager m;
-    if (!service_manager(&m, err)) return false;
+    Error e = service_manager(&m, err);
+    if (e != ERR_OK) return e;
     *unit = service_unit_path(&m);
     return service_manager_enable(&m, executable, err);
 }
 
-bool service_disable(char **unit, Err *err) {
+Error service_disable(char **unit, Err *err) {
     ServiceManager m;
-    if (!service_manager(&m, err)) return false;
+    Error e = service_manager(&m, err);
+    if (e != ERR_OK) return e;
     *unit = service_unit_path(&m);
     return service_manager_disable(&m, err);
 }
@@ -222,7 +218,7 @@ bool service_installed(char **unit) {
     ServiceManager m;
     Err err;
     *unit = NULL;
-    if (!service_manager(&m, &err)) return false;
+    if (service_manager(&m, &err) != ERR_OK) return false;
     *unit = service_unit_path(&m);
     struct stat st;
     return stat(*unit, &st) == 0;
@@ -256,18 +252,18 @@ static char *find_on_path(const char *name) {
     return found;
 }
 
-char *service_executable_path(Err *err) {
+Error service_executable_path(char **out, Err *err) {
+    *out = NULL;
     char *exe = running_executable();
-    if (!exe) {
-        err_set(err, "cannot find the running executable");
-        return NULL;
-    }
+    if (!exe) return err_set(err, ERR_PLATFORM, "cannot find the running executable");
     char *on_path = find_on_path(LABEL);
     struct stat a, b;
     if (on_path && stat(on_path, &a) == 0 && stat(exe, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
         xfree(exe);
-        return on_path;
+        *out = on_path;
+        return ERR_OK;
     }
     xfree(on_path);
-    return exe;
+    *out = exe;
+    return ERR_OK;
 }

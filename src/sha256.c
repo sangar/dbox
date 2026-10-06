@@ -143,36 +143,30 @@ void hmac_sha256(const void *key, size_t key_len, const void *data, size_t len, 
     sha256_final(&h, out);
 }
 
-int64_t copy_fd(int in, int out, Sha256 *h, Err *err) {
+Error copy_fd(int in, int out, Sha256 *h, int64_t *copied, Err *err) {
     char buf[1 << 16];
-    int64_t total = 0;
+    *copied = 0;
     for (;;) {
         ssize_t n = read(in, buf, sizeof buf);
         if (n < 0) {
             if (errno == EINTR) continue;
-            err_sys(err, "read");
-            return -1;
+            return err_sys(err, "read");
         }
-        if (n == 0) return total;
+        if (n == 0) return ERR_OK;
         if (h) sha256_update(h, buf, (size_t)n);
-        if (out >= 0 && !write_all(out, buf, (size_t)n)) {
-            err_sys(err, "write");
-            return -1;
-        }
-        total += n;
+        if (out >= 0 && !write_all(out, buf, (size_t)n)) return err_sys(err, "write");
+        *copied += n;
     }
 }
 
-bool sha256_file(const char *path, char out[SHA256_HEX_LEN], Err *err) {
+Error sha256_file(const char *path, char out[SHA256_HEX_LEN], Err *err) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        err_sys(err, "%s", path);
-        return false;
-    }
+    if (fd < 0) return err_sys(err, "%s", path);
     Sha256 h;
     sha256_init(&h);
-    bool ok = copy_fd(fd, -1, &h, err) >= 0;
+    int64_t copied;
+    Error e = copy_fd(fd, -1, &h, &copied, err);
     close(fd);
-    if (ok) sha256_hex(&h, out);
-    return ok;
+    if (e == ERR_OK) sha256_hex(&h, out);
+    return e;
 }
