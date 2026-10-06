@@ -8,6 +8,7 @@
 #include "daemon.h"
 #include "debounce.h"
 #include "engine.h"
+#include "http.h"
 #include "ignore.h"
 #include "index.h"
 #include "log.h"
@@ -1220,7 +1221,7 @@ int main(void) {
     ctx_init(&t.background);
     logger_init(&t.discard, "error", "text", NULL);
     logger_init(&t.verbose, "debug", "text", stderr);
-    s3_global_init();
+    http_global_init();
     env_unset("DBOX_CONFIG");
 
     test_config_loads_stores_with_defaults_and_expanded_secrets(&t);

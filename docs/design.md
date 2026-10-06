@@ -309,7 +309,8 @@ dbox/
   src/debounce.c            per-path quiet period on one timer thread
   src/index.c               SQLite: files, replicas, upload failures
   src/store.h               the Store interface; disk.c and s3.c implement it
-  src/s3.c                  S3 over libcurl: Signature V4, metadata, multipart above part_size, paginated listing
+  src/http.c                the HTTP client: the one module that talks to libcurl
+  src/s3.c                  S3 over http.c: Signature V4, metadata, multipart above part_size, paginated listing
   src/watch.c               recursive watcher over the platform's file system events
   src/queue.c               the de-duplicating path queue and per-path locks
   src/engine.c              reconcile, the primary workers, poll, conflicts, downloads
@@ -320,6 +321,7 @@ dbox/
   src/alloc.c               the heap allocator; arena.c for objects that die together
   src/platform/             every OS call: posix.c, plus macos.c (FSEvents) and linux.c (inotify)
   src/util.c, strbuf.c, strmap.c, sha256.c, ctx.c, log.c   building blocks
+  deps/sqlite, deps/libyaml vendored sources at the versions in deps.lock
   tests/test_dbox.c         config, index, ignore, debounce, engine scenarios, daemon, service
   tests/test_s3.c           the S3 store against the compose MinIOs
   docker-compose.yml        two MinIO instances for local dev and tests
@@ -340,14 +342,15 @@ kind (SFTP, WebDAV) is one file and never touches the sync logic.
 
 ## Dependencies
 
-| Purpose | Library |
-|---|---|
-| fs events | inotify (Linux), CoreServices FSEvents (macOS) |
-| S3 | libcurl, with a hand-written Signature V4 signer |
-| index | SQLite |
-| config | libyaml |
+| Purpose | Library | From |
+|---|---|---|
+| fs events | inotify (Linux), CoreServices FSEvents (macOS) | the OS, in `src/platform/` |
+| HTTP | libcurl, wrapped by `src/http.c`; `s3.c` adds the Signature V4 signer | the system, for its TLS stack and certificate store |
+| index | SQLite, wrapped by `src/index.c` | `deps/sqlite`, pinned in `deps.lock` |
+| config | libyaml, wrapped by `src/yml.c` | `deps/libyaml`, pinned in `deps.lock` |
 
-Everything else is C11 and POSIX. Credentials come from the config,
+Everything else is C23 and POSIX. Each library is included from exactly one
+wrapper module, so swapping one changes one file. Credentials come from the config,
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
 `~/.aws/credentials`; instance metadata and SSO are not supported. Requests
 are retried three times on transport errors and 5xx responses.

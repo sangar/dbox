@@ -5,21 +5,23 @@ override CFLAGS += -std=c23 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE \
            -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter \
            -pthread -Isrc -DDBOX_VERSION='"$(VERSION)"'
 PKG_CONFIG ?= pkg-config
-DEPS     = yaml-0.1 libcurl sqlite3
-override CFLAGS += $(shell $(PKG_CONFIG) --cflags $(DEPS) 2>/dev/null)
-LDLIBS  += $(shell $(PKG_CONFIG) --libs $(DEPS) 2>/dev/null || echo -lyaml -lcurl -lsqlite3) -pthread
+# libcurl is the one system library: it carries the platform TLS stack and certificate store.
+override CFLAGS += $(shell $(PKG_CONFIG) --cflags libcurl 2>/dev/null) -Ideps/sqlite -Ideps/libyaml/include
+LDLIBS  += $(shell $(PKG_CONFIG) --libs libcurl 2>/dev/null || echo -lcurl) -pthread -lm
+
+# Vendored sources build with their own relaxed flags; they are not held to this project's warnings.
+DEP_CFLAGS = -std=gnu11 -O2 -w -pthread -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=1 \
+             -Ideps/libyaml/include -Ideps/libyaml/src -DYAML_DECLARE_STATIC \
+             -DYAML_VERSION_MAJOR=0 -DYAML_VERSION_MINOR=2 -DYAML_VERSION_PATCH=5 -DYAML_VERSION_STRING='"0.2.5"'
+DEP_SRC = deps/sqlite/sqlite3.c $(wildcard deps/libyaml/src/*.c)
+DEP_OBJ = $(DEP_SRC:deps/%.c=build/deps/%.o)
 
 ifeq ($(shell uname -s),Darwin)
-BREW := $(shell brew --prefix 2>/dev/null)
-ifneq ($(BREW),)
-override CFLAGS += -I$(BREW)/include
-LDFLAGS += -L$(BREW)/lib
-endif
 LDLIBS  += -framework CoreServices
 endif
 
 LIB_SRC = $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/platform/*.c)
-LIB_OBJ = $(LIB_SRC:src/%.c=build/%.o)
+LIB_OBJ = $(LIB_SRC:src/%.c=build/%.o) $(DEP_OBJ)
 HEADERS = $(wildcard src/*.h) $(wildcard src/platform/*.h)
 
 .PHONY: all test integration sanitize minio run clean
@@ -38,6 +40,10 @@ build/test_s3: $(LIB_OBJ) build/tests/test_s3.o
 build/%.o: src/%.c $(HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/deps/%.o: deps/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(DEP_CFLAGS) -c -o $@ $<
 
 build/tests/%.o: tests/%.c $(HEADERS)
 	@mkdir -p $(dir $@)

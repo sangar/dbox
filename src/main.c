@@ -7,6 +7,7 @@
 #include "ctx.h"
 #include "daemon.h"
 #include "engine.h"
+#include "http.h"
 #include "index.h"
 #include "log.h"
 #include "platform/platform.h"
@@ -696,7 +697,7 @@ int main(int argc, char **argv) {
         print_usage(stdout);
         return EXIT_SUCCESS;
     }
-    s3_global_init();
+    http_global_init();
     App app = {0};
     const char *cmd = argv[1];
     int n = argc - 2;

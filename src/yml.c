@@ -1,7 +1,7 @@
 #include "yml.h"
 
 #include <string.h>
-#include <yaml.h>
+#include "yaml.h"
 
 typedef struct {
     yaml_parser_t parser;

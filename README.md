@@ -44,14 +44,19 @@ Windows is not a target: dbox is POSIX throughout and its login service is a
 launchd agent or a systemd user unit. Warnings are errors, and the test suite
 also runs under AddressSanitizer and UndefinedBehaviorSanitizer.
 
+SQLite and libyaml are vendored under `deps/` at the versions pinned in
+`deps.lock` and built from source with the project. libcurl is the one system
+library, because it carries the platform's TLS stack and certificate store,
+which should track OS security updates rather than a pinned copy.
+
 ## Build
 
-Requires a C11 compiler, `make`, `pkg-config` and three libraries:
-libcurl, SQLite and libyaml. On macOS it also links CoreServices for FSEvents.
+Requires a C23 compiler, `make`, `pkg-config` and libcurl. On macOS it also
+links CoreServices for FSEvents.
 
 ```sh
-brew install libyaml                                   # macOS; curl and sqlite ship with the system
-sudo apt install libyaml-dev libcurl4-openssl-dev libsqlite3-dev pkg-config   # Debian, Ubuntu
+# macOS: nothing to install; libcurl ships with the system
+sudo apt install libcurl4-openssl-dev pkg-config       # Debian, Ubuntu
 
 make                  # ./dbox
 make VERSION=1.2.3    # what `dbox version` prints (default: git describe or "dev")
@@ -174,8 +179,8 @@ before the C rewrite. The C version keeps the command line, config file,
 index database, object layout and metadata, so either binary can take over a
 folder and its stores from the other. Where they differ:
 
-- **S3 client.** libcurl with a hand-written Signature V4 signer instead of
-  the AWS SDK. Credentials come from the config, `AWS_ACCESS_KEY_ID` and
+- **S3 client.** libcurl behind `src/http.c`, with a hand-written Signature
+  V4 signer instead of the AWS SDK. Credentials come from the config, `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
   `~/.aws/credentials`; instance metadata and SSO are not supported.
   Requests are retried three times on transport errors and 5xx responses.

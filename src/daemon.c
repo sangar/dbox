@@ -1,10 +1,10 @@
 #include "daemon.h"
 
-#include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "http.h"
 #include "platform/platform.h"
 
 Error daemon_write_pid(const char *path, Err *err) {
@@ -103,32 +103,21 @@ Error daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn back
     return ERR_OK;
 }
 
-static size_t collect(char *data, size_t size, size_t nmemb, void *userdata) {
-    sb_append(userdata, data, size * nmemb);
-    return size * nmemb;
-}
-
 bool daemon_ask(const char *addr, long *backlog) {
     if (!*addr) return false;
-    CURL *curl = curl_easy_init();
-    if (!curl) return false;
-    StrBuf url = {0}, body = {0};
+    StrBuf url = {0};
     sb_printf(&url, "http://%s/status", addr);
-    curl_easy_setopt(curl, CURLOPT_URL, url.data);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    long status = 0;
-    bool ok = curl_easy_perform(curl) == CURLE_OK && curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status) == CURLE_OK && status == 200;
+    HttpRequest req = {.method = "GET", .url = sb_cstr(&url), .body_fd = -1, .sink_fd = -1, .timeout_ms = 2000};
+    HttpResponse resp;
+    http_response_init(&resp);
+    bool ok = http_perform(NULL, &req, &resp, NULL) == ERR_OK && resp.status == 200;
     if (ok) {
-        const char *key = strstr(sb_cstr(&body), "\"backlog\"");
+        const char *key = strstr(sb_cstr(&resp.body), "\"backlog\"");
         const char *colon = key ? strchr(key, ':') : NULL;
         ok = colon != NULL;
         if (ok) *backlog = strtol(colon + 1, NULL, 10);
     }
-    curl_easy_cleanup(curl);
+    http_response_free(&resp);
     sb_free(&url);
-    sb_free(&body);
     return ok;
 }

@@ -131,7 +131,7 @@ static void describe(FileStat *out, const struct stat *st) {
     out->mode = st->st_mode & 0777;
 }
 
-static Error info_from(int rc, const char *path, const struct stat *st, FileStat *out, Err *err) {
+[[nodiscard]] static Error info_from(int rc, const char *path, const struct stat *st, FileStat *out, Err *err) {
     memset(out, 0, sizeof *out);
     if (rc == 0) {
         describe(out, st);
@@ -320,7 +320,7 @@ static void describe_command(StrBuf *sb, char *const argv[]) {
     for (size_t i = 0; argv[i]; i++) sb_printf(sb, "%s%s", i ? " " : "", argv[i]);
 }
 
-static Error exit_status(char *const argv[], int rc, pid_t pid, const StrBuf *out, Err *err) {
+[[nodiscard]] static Error exit_status(char *const argv[], int rc, pid_t pid, const StrBuf *out, Err *err) {
     int status = 0;
     if (rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) return ERR_OK;
     StrBuf cmd = {0};

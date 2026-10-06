@@ -5,6 +5,7 @@
 
 #include "config.h"
 #include "ctx.h"
+#include "http.h"
 #include "platform/platform.h"
 #include "store.h"
 
@@ -193,7 +194,7 @@ static void test_keys_with_special_characters(T *t) {
 
 int main(void) {
     T t = {.tmp_dir = "/tmp/dbox-s3-test-XXXXXX"};
-    s3_global_init();
+    http_global_init();
     ctx_init(&t.ctx);
     if (dir_make_temp(t.tmp_dir, NULL) != ERR_OK) return 1;
     test_round_trip_keeps_metadata(&t);

@@ -1,0 +1,3 @@
+# name version url hash
+sqlite 3.53.4 https://sqlite.org/2026/sqlite-amalgamation-3530400.zip sha256:1ac04027c567f4e9a595a803e29ea6b959387761f7b9f33a1a1fe7d4594dfd0e
+libyaml 0.2.5 https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz sha256:bed9f44d988e9964a121748623b248781113b12c28abc941594a2fc85c029bb5

@@ -1,18 +1,18 @@
 /*
- * S3 stores objects in a bucket under a prefix, over libcurl with AWS
+ * S3 stores objects in a bucket under a prefix, over HTTP with AWS
  * Signature Version 4. Content hash and modification time ride along as
  * object metadata. Uploads above part_size go as multipart uploads, and
  * downloads are staged in a temp directory because callers want a readable
  * descriptor.
  */
 #include <ctype.h>
-#include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
 
+#include "http.h"
 #include "platform/platform.h"
 #include "store.h"
 
@@ -50,16 +50,13 @@ typedef struct {
 } Request;
 
 typedef struct {
-    long status;
-    StrBuf body; /* the body unless it went to sink_fd */
+    HttpResponse http;
     char etag[ETAG_MAX];
     int64_t content_length;
     int64_t last_modified_ns;
     char meta_sha256[SHA256_HEX_LEN];
     int64_t meta_mtime_ns;
 } Response;
-
-void s3_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
 /* ---- encoding ---- */
 
@@ -198,80 +195,15 @@ static int64_t parse_rfc1123(const char *s) {
 
 /* ---- the HTTP layer ---- */
 
-typedef struct {
-    int fd;
-    int64_t off, len, pos;
-    const char *mem;
-    size_t mem_len;
-} BodySource;
-
-static size_t read_body(char *buf, size_t size, size_t nitems, void *userdata) {
-    BodySource *src = userdata;
-    size_t want = size * nitems;
-    if (src->mem) {
-        size_t n = min_size(want, src->mem_len - (size_t)src->pos);
-        memcpy(buf, src->mem + src->pos, n);
-        src->pos += (int64_t)n;
-        return n;
-    }
-    int64_t remaining = src->len - src->pos;
-    if (remaining <= 0) return 0;
-    size_t n;
-    if (file_pread(src->fd, buf, min_size(want, (size_t)remaining), src->off + src->pos, &n, NULL) != ERR_OK) return CURL_READFUNC_ABORT;
-    src->pos += (int64_t)n;
-    return n;
-}
-
-static int seek_body(void *userdata, curl_off_t offset, int origin) {
-    BodySource *src = userdata;
-    if (origin != SEEK_SET) return CURL_SEEKFUNC_CANTSEEK;
-    src->pos = offset;
-    return CURL_SEEKFUNC_OK;
-}
-
-typedef struct {
-    CURL *curl;
-    Response *resp;
-    int sink_fd;
-    bool failed;
-} Sink;
-
-static size_t write_body(char *data, size_t size, size_t nmemb, void *userdata) {
-    Sink *sink = userdata;
-    size_t n = size * nmemb;
-    long status = 0;
-    curl_easy_getinfo(sink->curl, CURLINFO_RESPONSE_CODE, &status);
-    if (status >= 200 && status < 300 && sink->sink_fd >= 0) {
-        if (!file_write_all(sink->sink_fd, data, n)) {
-            sink->failed = true;
-            return 0;
-        }
-        return n;
-    }
-    sb_append(&sink->resp->body, data, n);
-    return n;
-}
-
-static size_t read_header(char *line, size_t size, size_t nitems, void *userdata) {
-    Response *r = userdata;
-    size_t n = size * nitems;
-    if (n >= 5 && strncmp(line, "HTTP/", 5) == 0) {
+/* on_header picks the object metadata out of the response headers; a new status line resets it. */
+static void on_header(void *user, const char *line, size_t name_len, const char *value) {
+    Response *r = user;
+    if (!line) {
         r->etag[0] = r->meta_sha256[0] = '\0';
         r->content_length = -1;
         r->last_modified_ns = r->meta_mtime_ns = 0;
-        return n;
+        return;
     }
-    const char *colon = memchr(line, ':', n);
-    if (!colon) return n;
-    size_t name_len = (size_t)(colon - line);
-    const char *v = colon + 1;
-    const char *end = line + n;
-    while (v < end && (*v == ' ' || *v == '\t')) v++;
-    while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) end--;
-    char value[1024];
-    size_t vlen = min_size((size_t)(end - v), sizeof value - 1);
-    memcpy(value, v, vlen);
-    value[vlen] = '\0';
     if (name_len == 4 && strncasecmp(line, "etag", 4) == 0) {
         snprintf(r->etag, sizeof r->etag, "%.*s", ETAG_MAX - 1, value);
         strip_quotes(r->etag);
@@ -284,11 +216,6 @@ static size_t read_header(char *line, size_t size, size_t nitems, void *userdata
     } else if (name_len == strlen(META_MTIME) && strncasecmp(line, META_MTIME, name_len) == 0) {
         r->meta_mtime_ns = strtoll(value, NULL, 10);
     }
-    return n;
-}
-
-static int check_cancel(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
-    return ctx_done((Ctx *)userdata) ? 1 : 0;
 }
 
 static void canonical_uri(const S3 *s, const Request *req, StrBuf *out) {
@@ -331,8 +258,8 @@ static void hmac_hex_chain(const S3 *s, const char *date, const char *string_to_
     hex_encode(sig, SHA256_LEN, signature);
 }
 
-/* sign builds the signed header list for req; uri and query are the canonical forms also used in the URL. */
-static struct curl_slist *sign(const S3 *s, const Request *req, const char *uri, const char *query, const char *payload_hash) {
+/* sign builds the signed header lines for req; uri and query are the canonical forms also used in the URL. */
+static void sign(const S3 *s, const Request *req, const char *uri, const char *query, const char *payload_hash, StrList *lines) {
     char amz_date[20], date[9];
     time_t now = time(NULL);
     struct tm tm;
@@ -365,34 +292,33 @@ static struct curl_slist *sign(const S3 *s, const Request *req, const char *uri,
     char signature[SHA256_HEX_LEN];
     hmac_hex_chain(s, date, sb_cstr(&to_sign), signature);
 
-    struct curl_slist *list = NULL;
     StrBuf line = {0};
     for (size_t i = 0; i < n; i++) {
         if (strcmp(headers[i].key, "host") == 0) continue;
         sb_clear(&line);
         sb_printf(&line, "%s: %s", headers[i].key, headers[i].value);
-        list = curl_slist_append(list, sb_cstr(&line));
+        strlist_push(lines, sb_cstr(&line));
     }
     sb_clear(&line);
     sb_printf(&line, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", s->access_key, sb_cstr(&scope),
               sb_cstr(&signed_names), signature);
-    list = curl_slist_append(list, sb_cstr(&line));
-    list = curl_slist_append(list, "Expect:");
+    strlist_push(lines, sb_cstr(&line));
+    strlist_push(lines, "Expect:");
     sb_free(&line);
     sb_free(&canonical);
     sb_free(&signed_names);
     sb_free(&scope);
     sb_free(&to_sign);
-    return list;
 }
 
-static bool retryable(CURLcode code, long status) {
-    if (code != CURLE_OK) return code != CURLE_ABORTED_BY_CALLBACK;
+/* retryable says whether a failed attempt is worth another: any transport failure except cancellation, or a throttling or server error status. */
+static bool retryable(Error e, long status) {
+    if (e != ERR_OK) return e != ERR_CANCELLED;
     return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 }
 
 /* perform sends req once and fills resp; transport failures are the error, HTTP statuses are left in resp. */
-[[nodiscard]] static Error perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, CURLcode *code, Err *err) {
+[[nodiscard]] static Error perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
     StrBuf uri = {0}, query = {0}, url = {0};
     canonical_uri(s, req, &uri);
     canonical_query(req, &query);
@@ -403,51 +329,23 @@ static bool retryable(CURLcode code, long status) {
     if (req->body_fd >= 0) snprintf(payload_hash, sizeof payload_hash, "UNSIGNED-PAYLOAD");
     else if (req->body) sha256_of(req->body, req->body_size, payload_hash);
     else snprintf(payload_hash, sizeof payload_hash, EMPTY_SHA256);
-    struct curl_slist *headers = sign(s, req, sb_cstr(&uri), sb_cstr(&query), payload_hash);
+    StrList headers = {0};
+    sign(s, req, sb_cstr(&uri), sb_cstr(&query), payload_hash, &headers);
 
-    CURL *curl = curl_easy_init();
-    BodySource src = {.fd = req->body_fd, .off = req->body_off, .len = req->body_len, .mem = req->body, .mem_len = req->body_size};
-    Sink sink = {.curl = curl, .resp = resp, .sink_fd = req->sink_fd};
-    sb_clear(&resp->body);
-    resp->status = 0;
-    curl_easy_setopt(curl, CURLOPT_URL, sb_cstr(&url));
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, read_header);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, resp);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, check_cancel);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, ctx);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    if (strcmp(req->method, "HEAD") == 0) {
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    } else if (strcmp(req->method, "PUT") == 0) {
-        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_body);
-        curl_easy_setopt(curl, CURLOPT_READDATA, &src);
-        curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION, seek_body);
-        curl_easy_setopt(curl, CURLOPT_SEEKDATA, &src);
-        curl_off_t size = req->body_fd >= 0 ? req->body_len : (curl_off_t)req->body_size;
-        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, size);
-    } else if (strcmp(req->method, "POST") == 0) {
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req->body ? req->body : "");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)req->body_size);
-    } else if (strcmp(req->method, "DELETE") == 0) {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    }
-    *code = curl_easy_perform(curl);
-    Error e = ERR_OK;
-    if (*code == CURLE_OK && !sink.failed) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
-    else if (sink.failed) e = err_set(err, ERR_IO, "write download failed");
-    else if (*code == CURLE_ABORTED_BY_CALLBACK) e = err_set(err, ERR_CANCELLED, "cancelled");
-    else e = err_set(err, ERR_REMOTE, "%s %s: %s", req->method, sb_cstr(&url), curl_easy_strerror(*code));
-    curl_easy_cleanup(curl);
-    curl_slist_free_all(headers);
+    HttpRequest http = {.method = req->method,
+                        .url = sb_cstr(&url),
+                        .headers = (const char *const *)headers.items,
+                        .header_count = headers.len,
+                        .body_fd = req->body_fd,
+                        .body_off = req->body_off,
+                        .body_len = req->body_len,
+                        .body = req->body,
+                        .body_size = req->body_size,
+                        .sink_fd = req->sink_fd,
+                        .on_header = on_header,
+                        .user = resp};
+    Error e = http_perform(ctx, &http, &resp->http, err);
+    strlist_free(&headers);
     sb_free(&uri);
     sb_free(&query);
     sb_free(&url);
@@ -456,10 +354,11 @@ static bool retryable(CURLcode code, long status) {
 
 static void response_init(Response *r) {
     memset(r, 0, sizeof *r);
+    http_response_init(&r->http);
     r->content_length = -1;
 }
 
-static void response_free(Response *r) { sb_free(&r->body); }
+static void response_free(Response *r) { http_response_free(&r->http); }
 
 /* request sends req, retrying transient failures, and leaves the status in resp. */
 [[nodiscard]] static Error request(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
@@ -472,21 +371,20 @@ static void response_free(Response *r) { sb_free(&r->body); }
                 if (truncated != ERR_OK) return truncated;
             }
         }
-        CURLcode code;
-        Error e = perform(s, ctx, req, resp, &code, err);
-        if (!retryable(code, e == ERR_OK ? resp->status : 0) || attempt + 1 == MAX_TRIES) return e;
+        Error e = perform(s, ctx, req, resp, err);
+        if (!retryable(e, e == ERR_OK ? resp->http.status : 0) || attempt + 1 == MAX_TRIES) return e;
     }
 }
 
 /* fail_status describes a non-2xx response. */
 [[nodiscard]] static Error fail_status(const Request *req, Response *resp, Err *err) {
-    if (resp->status == 404) return ERR_NOT_FOUND;
+    if (resp->http.status == 404) return ERR_NOT_FOUND;
     Arena a;
     arena_init(&a, 4096);
-    const char *end = resp->body.data ? resp->body.data + resp->body.len : NULL;
-    const char *code = end ? xml_text(&a, resp->body.data, end, "Code") : "";
-    const char *message = end ? xml_text(&a, resp->body.data, end, "Message") : "";
-    Error e = err_set(err, ERR_REMOTE, "%s %s: HTTP %ld%s%s%s%s", req->method, req->key ? req->key : "/", resp->status, *code ? " " : "", code,
+    const char *end = resp->http.body.data ? resp->http.body.data + resp->http.body.len : NULL;
+    const char *code = end ? xml_text(&a, resp->http.body.data, end, "Code") : "";
+    const char *message = end ? xml_text(&a, resp->http.body.data, end, "Message") : "";
+    Error e = err_set(err, ERR_REMOTE, "%s %s: HTTP %ld%s%s%s%s", req->method, req->key ? req->key : "/", resp->http.status, *code ? " " : "", code,
                       *message ? ": " : "", message);
     arena_free(&a);
     return e;
@@ -515,7 +413,7 @@ static size_t meta_headers(const S3 *s, const Meta *meta, KV out[4], char mtime[
     response_init(&resp);
     Error e = request(s, ctx, &req, &resp, err);
     if (e == ERR_OK) {
-        if (ok_status(resp.status)) snprintf(etag, ETAG_MAX, "%s", resp.etag);
+        if (ok_status(resp.http.status)) snprintf(etag, ETAG_MAX, "%s", resp.etag);
         else e = fail_status(&req, &resp, err);
     }
     response_free(&resp);
@@ -543,11 +441,11 @@ static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id
     Request start = {.method = "POST", .key = key, .query = start_query, .query_count = 1, .headers = headers, .header_count = meta_headers(s, meta, headers, mtime), .body_fd = -1, .sink_fd = -1};
     Error e = request(s, ctx, &start, &resp, err);
     if (e != ERR_OK) goto out;
-    if (!ok_status(resp.status)) {
+    if (!ok_status(resp.http.status)) {
         e = fail_status(&start, &resp, err);
         goto out;
     }
-    char *upload_id = xml_text(&a, resp.body.data, resp.body.data + resp.body.len, "UploadId");
+    char *upload_id = xml_text(&a, resp.http.body.data, resp.http.body.data + resp.http.body.len, "UploadId");
     if (!*upload_id) {
         e = err_set(err, ERR_REMOTE, "POST %s: no UploadId in response", key);
         goto out;
@@ -560,7 +458,7 @@ static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id
         KV query[] = {{"partNumber", num}, {"uploadId", upload_id}};
         Request part = {.method = "PUT", .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_off = off, .body_len = min_i64(s->part_size, size - off), .sink_fd = -1};
         e = request(s, ctx, &part, &resp, err);
-        if (e == ERR_OK && !ok_status(resp.status)) e = fail_status(&part, &resp, err);
+        if (e == ERR_OK && !ok_status(resp.http.status)) e = fail_status(&part, &resp, err);
         if (e == ERR_OK) sb_printf(&parts, "<Part><PartNumber>%s</PartNumber><ETag>\"%s\"</ETag></Part>", num, resp.etag);
     }
     sb_puts(&parts, "</CompleteMultipartUpload>");
@@ -568,14 +466,14 @@ static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id
         KV query[] = {{"uploadId", upload_id}};
         Request complete = {.method = "POST", .key = key, .query = query, .query_count = 1, .body_fd = -1, .body = parts.data, .body_size = parts.len, .sink_fd = -1};
         e = request(s, ctx, &complete, &resp, err);
-        if (e == ERR_OK && !ok_status(resp.status)) e = fail_status(&complete, &resp, err);
+        if (e == ERR_OK && !ok_status(resp.http.status)) e = fail_status(&complete, &resp, err);
         if (e == ERR_OK) {
-            const char *end = resp.body.data + resp.body.len;
-            char *code = xml_text(&a, resp.body.data, end, "Code");
+            const char *end = resp.http.body.data + resp.http.body.len;
+            char *code = xml_text(&a, resp.http.body.data, end, "Code");
             if (*code) {
-                e = err_set(err, ERR_REMOTE, "POST %s: %s: %s", key, code, xml_text(&a, resp.body.data, end, "Message"));
+                e = err_set(err, ERR_REMOTE, "POST %s: %s: %s", key, code, xml_text(&a, resp.http.body.data, end, "Message"));
             } else {
-                char *tag = xml_text(&a, resp.body.data, end, "ETag");
+                char *tag = xml_text(&a, resp.http.body.data, end, "ETag");
                 strip_quotes(tag);
                 snprintf(etag, ETAG_MAX, "%s", *tag ? tag : resp.etag);
             }
@@ -614,7 +512,7 @@ static void describe(Object *obj, const char *key, const Response *resp) {
     response_init(&resp);
     e = request(s, ctx, &req, &resp, err);
     if (e == ERR_OK) {
-        if (ok_status(resp.status)) {
+        if (ok_status(resp.http.status)) {
             describe(obj, key, &resp);
             if (resp.content_length < 0) obj->size = file_position(tmp);
             (void)file_seek_start(tmp, NULL);
@@ -635,9 +533,9 @@ static void describe(Object *obj, const char *key, const Response *resp) {
     response_init(&resp);
     Error e = request(s, ctx, &req, &resp, err);
     if (e == ERR_OK) {
-        if (ok_status(resp.status)) describe(obj, key, &resp);
-        else if (resp.status == 404) e = ERR_NOT_FOUND;
-        else e = err_set(err, ERR_REMOTE, "HEAD %s: HTTP %ld", key, resp.status);
+        if (ok_status(resp.http.status)) describe(obj, key, &resp);
+        else if (resp.http.status == 404) e = ERR_NOT_FOUND;
+        else e = err_set(err, ERR_REMOTE, "HEAD %s: HTTP %ld", key, resp.http.status);
     }
     response_free(&resp);
     return e;
@@ -649,7 +547,7 @@ static void describe(Object *obj, const char *key, const Response *resp) {
     Response resp;
     response_init(&resp);
     Error e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK && !ok_status(resp.status) && resp.status != 404) e = fail_status(&req, &resp, err);
+    if (e == ERR_OK && !ok_status(resp.http.status) && resp.http.status != 404) e = fail_status(&req, &resp, err);
     response_free(&resp);
     return e;
 }
@@ -670,11 +568,11 @@ static void describe(Object *obj, const char *key, const Response *resp) {
         if (token) query[qn++] = (KV){"continuation-token", token};
         Request req = {.method = "GET", .query = query, .query_count = qn, .body_fd = -1, .sink_fd = -1};
         if ((e = request(s, ctx, &req, &resp, err)) != ERR_OK) goto out;
-        if (!ok_status(resp.status)) {
+        if (!ok_status(resp.http.status)) {
             e = fail_status(&req, &resp, err);
             goto out;
         }
-        const char *p = resp.body.data, *end = p + resp.body.len;
+        const char *p = resp.http.body.data, *end = p + resp.http.body.len;
         for (;;) {
             const char *item_end;
             const char *item = xml_element(p, end, "Contents", &item_end);
@@ -694,8 +592,8 @@ static void describe(Object *obj, const char *key, const Response *resp) {
             }
             p = item_end;
         }
-        bool truncated = strcmp(xml_text(&scratch, resp.body.data, end, "IsTruncated"), "true") == 0;
-        token = truncated ? xml_text(&scratch, resp.body.data, end, "NextContinuationToken") : NULL;
+        bool truncated = strcmp(xml_text(&scratch, resp.http.body.data, end, "IsTruncated"), "true") == 0;
+        token = truncated ? xml_text(&scratch, resp.http.body.data, end, "NextContinuationToken") : NULL;
         if (!token || !*token) break;
     }
 out:
@@ -714,10 +612,10 @@ Error s3_create_bucket(Store *base, Ctx *ctx, Err *err) {
     Response resp;
     response_init(&resp);
     Error e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK && !ok_status(resp.status)) {
+    if (e == ERR_OK && !ok_status(resp.http.status)) {
         Arena a;
         arena_init(&a, 4096);
-        const char *code = xml_text(&a, resp.body.data, resp.body.data + resp.body.len, "Code");
+        const char *code = xml_text(&a, resp.http.body.data, resp.http.body.data + resp.http.body.len, "Code");
         if (strcmp(code, "BucketAlreadyOwnedByYou") != 0) e = fail_status(&req, &resp, err);
         arena_free(&a);
     }
@@ -815,7 +713,7 @@ static bool credentials_file(const char *profile, char **access, char **secret, 
     return err_set(err, ERR_INVALID_ARGUMENT, "no credentials: set access_key and secret_key, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or ~/.aws/credentials");
 }
 
-/* parse_endpoint splits scheme://host[:port][/...] into scheme and host, as curl sends it in the Host header. */
+/* parse_endpoint splits scheme://host[:port][/...] into scheme and host, as it goes in the Host header. */
 [[nodiscard]] static Error parse_endpoint(const char *endpoint, char **scheme, char **host, Err *err) {
     const char *sep = strstr(endpoint, "://");
     if (!sep) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %s: want scheme://host[:port]", endpoint);
