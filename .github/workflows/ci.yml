@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macos-aarch64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build libcurl4-openssl-dev
+          echo "CC=clang-18" >> "$GITHUB_ENV"
+          sudo ln -sf /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy
+
+      - name: Install the toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Configure, build and test under the sanitizers
+        run: cmake --workflow --preset debug
+
+      - name: Static analysis
+        run: cmake --build --preset check
+
+      - name: Release build
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+          ./out/release/dbox version
