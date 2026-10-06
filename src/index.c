@@ -60,14 +60,14 @@ static bool db_fail(Index *x, Err *err, const char *what) {
 Index *index_open(const char *path, Err *err) {
     char *dir = path_dir(path);
     bool ok = mkdir_p(dir, 0755, err);
-    free(dir);
+    xfree(dir);
     if (!ok) return NULL;
     Index *x = xcalloc(1, sizeof *x);
     pthread_mutex_init(&x->mu, NULL);
     if (sqlite3_open_v2(path, &x->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         err_set(err, "%s: %s", path, x->db ? sqlite3_errmsg(x->db) : "cannot open");
         sqlite3_close(x->db);
-        free(x);
+        xfree(x);
         return NULL;
     }
     sqlite3_busy_timeout(x->db, 10000);
@@ -77,7 +77,7 @@ Index *index_open(const char *path, Err *err) {
         err_set(err, "%s: %s", path, msg ? msg : sqlite3_errmsg(x->db));
         sqlite3_free(msg);
         sqlite3_close(x->db);
-        free(x);
+        xfree(x);
         return NULL;
     }
     return x;
@@ -87,7 +87,7 @@ void index_close(Index *x) {
     if (!x) return;
     sqlite3_close(x->db);
     pthread_mutex_destroy(&x->mu);
-    free(x);
+    xfree(x);
 }
 
 /* ---- statement helpers ---- */
@@ -183,7 +183,7 @@ static bool collect_files(Index *x, Arena *a, Stmt *s, IndexFile **out, size_t *
     sqlite3_finalize(s->stmt);
     IndexFile *copy = arena_alloc(a, (n + 1) * sizeof *copy);
     memcpy(copy, files, n * sizeof *copy);
-    free(files);
+    xfree(files);
     *out = copy;
     *count = n;
     return ok;
@@ -205,7 +205,7 @@ bool index_files_under(Index *x, Arena *a, const char *dir, IndexFile **out, siz
         char *prefix = path_join(dir, "");
         bind_int(&s, (int64_t)strlen(prefix));
         bind_text(&s, prefix);
-        free(prefix);
+        xfree(prefix);
         ok = collect_files(x, a, &s, out, count, err);
     }
     unlock(x);
@@ -387,7 +387,7 @@ static bool collect_replicas(Index *x, Arena *a, Stmt *s, Replica **out, size_t 
     sqlite3_finalize(s->stmt);
     Replica *copy = arena_alloc(a, (n + 1) * sizeof *copy);
     memcpy(copy, rows, n * sizeof *copy);
-    free(rows);
+    xfree(rows);
     *out = copy;
     *count = n;
     return ok;
@@ -612,7 +612,7 @@ bool index_failed_uploads(Index *x, Arena *a, UploadFailure **out, size_t *count
         sqlite3_finalize(s.stmt);
         UploadFailure *copy = arena_alloc(a, (n + 1) * sizeof *copy);
         memcpy(copy, rows, n * sizeof *copy);
-        free(rows);
+        xfree(rows);
         *out = copy;
         *count = n;
     }

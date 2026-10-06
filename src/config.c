@@ -71,7 +71,7 @@ void config_init(Config *c) {
 }
 
 void config_free(Config *c) {
-    free(c->stores);
+    xfree(c->stores);
     arena_free(&c->arena);
     memset(c, 0, sizeof *c);
 }
@@ -168,7 +168,7 @@ bool parse_size(const char *s, int64_t *out, Err *err) {
     char *digits = xstrndup(s, n);
     int64_t v;
     bool ok = parse_int64(digits, &v);
-    free(digits);
+    xfree(digits);
     if (!ok) {
         err_set(err, "size %s: want a number with an optional KiB, MiB or GiB suffix", original);
         return false;
@@ -198,13 +198,13 @@ char *config_default_path(void) {
     char *dir = xdg && *xdg ? xstrdup(xdg) : path_join(home_dir(), ".config");
     char *yml = path_join(dir, "dbox/config.yml");
     char *yaml = path_join(dir, "dbox/config.yaml");
-    free(dir);
+    xfree(dir);
     struct stat st;
     if (stat(yml, &st) != 0 && errno == ENOENT && stat(yaml, &st) == 0) {
-        free(yml);
+        xfree(yml);
         return yaml;
     }
-    free(yaml);
+    xfree(yaml);
     return yml;
 }
 
@@ -214,7 +214,7 @@ bool config_write_starter(const char *path, bool *created, Err *err) {
     if (stat(path, &st) == 0) return true;
     char *dir = path_dir(path);
     bool ok = mkdir_p(dir, 0755, err);
-    free(dir);
+    xfree(dir);
     if (!ok) return false;
     /* Private to the user because it may come to hold store secrets. */
     if (!write_file(path, starter_yml, sizeof starter_yml - 1, 0600, err)) return false;
@@ -253,7 +253,7 @@ static bool expand_string(Expander *x, const char *s, char **out) {
                 } else {
                     char *missing = xstrndup(name, n);
                     if (!strlist_contains(&x->missing, missing)) strlist_push_owned(&x->missing, missing);
-                    else free(missing);
+                    else xfree(missing);
                 }
                 changed = true;
                 p = q + 1;
@@ -297,7 +297,7 @@ static void apply_overrides(Arena *a, YmlNode *root, char *const *environ) {
         if (!eq || !has_prefix(environ[i], "DBOX_")) continue;
         char *key = xstrndup(environ[i], (size_t)(eq - environ[i]));
         if (strstr(key, "__")) strlist_push_owned(&keys, key);
-        else free(key);
+        else xfree(key);
     }
     strlist_sort(&keys);
     for (size_t i = 0; i < keys.len; i++) {
@@ -319,7 +319,7 @@ static void apply_overrides(Arena *a, YmlNode *root, char *const *environ) {
             part = sep + 2;
         }
         yml_set(a, node, part, yml_new_scalar(a, value ? value : "", false));
-        free(lower);
+        xfree(lower);
     }
     strlist_free(&keys);
 }
@@ -498,7 +498,7 @@ static bool valid_store_name(const char *name) {
 static const char *expand_home_into(Arena *a, const char *p) {
     char *expanded = expand_home(p);
     const char *out = arena_strdup(a, expanded);
-    free(expanded);
+    xfree(expanded);
     return out;
 }
 

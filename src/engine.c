@@ -55,7 +55,7 @@ void engine_free(Engine *e) {
     ignore_free(&e->ignore);
     if (e->log == &e->own_log) logger_destroy(&e->own_log);
     arena_free(&e->arena);
-    free(e);
+    xfree(e);
 }
 
 char *engine_abs(const Engine *e, const char *rel) { return path_join(e->root, rel); }
@@ -95,7 +95,7 @@ void run_workers(Engine *e, int workers, void **items, size_t count, void (*fn)(
     pthread_t *threads = xcalloc(n + 1, sizeof *threads);
     for (size_t i = 0; i < n; i++) pthread_create(&threads[i], NULL, work_main, &w);
     for (size_t i = 0; i < n; i++) pthread_join(threads[i], NULL);
-    free(threads);
+    xfree(threads);
 }
 
 static int primary_workers(const Engine *e) { return config_store(e->cfg, e->primary_name)->workers; }
@@ -112,7 +112,7 @@ bool engine_local(Engine *e, const char *rel, const IndexFile *f, LocalFile *out
             err_sys(err, "%s", abs);
             ok = false;
         }
-        free(abs);
+        xfree(abs);
         return ok;
     }
     out->exists = true;
@@ -127,7 +127,7 @@ bool engine_local(Engine *e, const char *rel, const IndexFile *f, LocalFile *out
         ok = sha256_file(abs, sum, err);
         if (ok) out->changed = strcmp(sum, f->sha256) != 0;
     }
-    free(abs);
+    xfree(abs);
     return ok;
 }
 
@@ -150,7 +150,7 @@ static bool upload(Engine *e, const char *rel, const char *sum, const struct sta
     int fd = open(abs, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         err_sys(err, "%s", abs);
-        free(abs);
+        xfree(abs);
         return false;
     }
     Meta meta = {.mtime_ns = stat_mtime_ns(info)};
@@ -161,12 +161,12 @@ static bool upload(Engine *e, const char *rel, const char *sum, const struct sta
     close(fd);
     if (!ok) {
         err_set(err, "upload to %s: %s", e->primary_name, inner.msg);
-        free(abs);
+        xfree(abs);
         return false;
     }
     struct stat after;
     bool unchanged = lstat(abs, &after) == 0 && after.st_size == info->st_size && stat_mtime_ns(&after) == stat_mtime_ns(info);
-    free(abs);
+    xfree(abs);
     if (!unchanged) {
         log_info(e->log, "changed during upload; syncing again", log_str("path", rel), log_end());
         queue_push(&e->queue, e->ctx, rel);
@@ -223,11 +223,11 @@ static bool push(Engine *e, const char *rel, Err *err) {
     if (lstat(abs, &st) != 0) {
         bool missing = errno == ENOENT || errno == ENOTDIR;
         if (!missing) err_sys(err, "%s", abs);
-        free(abs);
+        xfree(abs);
         return missing ? push_delete(e, rel, err) : false;
     }
     if (!S_ISREG(st.st_mode)) {
-        free(abs);
+        xfree(abs);
         return true;
     }
     Arena a;
@@ -248,7 +248,7 @@ static bool push(Engine *e, const char *rel, Err *err) {
         else if (ok) ok = upload(e, rel, sum, &st, err);
     }
     arena_free(&a);
-    free(abs);
+    xfree(abs);
     return ok;
 }
 
@@ -286,7 +286,7 @@ static void *primary_worker(void *arg) {
     char *p;
     while ((p = queue_pop(&e->queue, e->ctx, &e->stopping))) {
         process(e, p);
-        free(p);
+        xfree(p);
     }
     return NULL;
 }
@@ -325,8 +325,8 @@ static bool walk(Engine *e, const char *dir, StrList *paths, Err *err) {
             if (S_ISDIR(st.st_mode)) ok = walk(e, p, paths, err);
             else if (S_ISREG(st.st_mode)) strlist_push(paths, rel);
         }
-        free(rel);
-        free(p);
+        xfree(rel);
+        xfree(p);
     }
     strlist_free(&names);
     return ok;
@@ -357,7 +357,7 @@ static bool push_all(Engine *e, Err *err) {
             unique[m++] = paths.items[i];
         }
         run_workers(e, primary_workers(e), unique, m, process_item);
-        free(unique);
+        xfree(unique);
         strmap_free(&seen);
     }
     arena_free(&a);
@@ -434,11 +434,11 @@ done:
     if (out >= 0) close(out);
     if (!ok) unlink(tmp);
     close(body);
-    free(parent);
-    free(abs);
-    free(tmp);
-    free(tmp_dir);
-    free(state);
+    xfree(parent);
+    xfree(abs);
+    xfree(tmp);
+    xfree(tmp_dir);
+    xfree(state);
     return ok;
 }
 
@@ -471,7 +471,7 @@ static bool conflict(Engine *e, const char *rel, Err *err) {
     } else {
         ok = sha256_file(abs, sum, err) && upload(e, rel, sum, &st, err);
     }
-    free(abs);
+    xfree(abs);
 out:
     sb_free(&copy);
     return ok;
@@ -488,7 +488,7 @@ static bool adopt_or_conflict(Engine *e, const Object *obj, const LocalFile *loc
     char *abs = engine_abs(e, obj->key);
     char sum[SHA256_HEX_LEN];
     bool ok = sha256_file(abs, sum, err);
-    free(abs);
+    xfree(abs);
     if (!ok) return false;
     if (strcmp(head.sha256, sum) != 0) return conflict(e, obj->key, err);
     if (e->dry_run) {
@@ -574,7 +574,7 @@ static bool remote_gone(Engine *e, const IndexFile *f, Err *err) {
         err_sys(err, "%s", abs);
         ok = false;
     }
-    free(abs);
+    xfree(abs);
     if (!ok) goto out;
     log_info(e->log, "deleted locally, gone from primary", log_str("path", f->path), log_end());
     ok = index_tombstone(e->idx, f->path, e->primary_name, false, err);
@@ -760,7 +760,7 @@ static void start(Threads *t, void *(*fn)(void *), void *arg) {
 
 static void join_all(Threads *t) {
     for (size_t i = 0; i < t->count; i++) pthread_join(t->threads[i], NULL);
-    free(t->threads);
+    xfree(t->threads);
     memset(t, 0, sizeof *t);
 }
 
@@ -785,7 +785,7 @@ bool engine_run(Engine *e, Ctx *ctx, Err *err) {
         atomic_store(&e->stopping, true);
         ctx_notify(ctx);
         join_all(&threads);
-        free(mirror_args);
+        xfree(mirror_args);
         return false;
     }
     WatchArg watch_arg = {watcher, ctx};
@@ -810,6 +810,6 @@ bool engine_run(Engine *e, Ctx *ctx, Err *err) {
     ctx_unlock(ctx);
     join_all(&threads);
     watcher_free(watcher);
-    free(mirror_args);
+    xfree(mirror_args);
     return true;
 }

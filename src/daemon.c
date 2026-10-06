@@ -64,7 +64,7 @@ static int listen_on(const char *addr, Err *err) {
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE | AI_NUMERICSERV};
     struct addrinfo *res;
     int rc = getaddrinfo(*host ? host : NULL, colon + 1, &hints, &res);
-    free(host);
+    xfree(host);
     if (rc != 0) {
         err_set(err, "listen %s: %s", addr, gai_strerror(rc));
         return -1;

@@ -11,8 +11,8 @@ void queue_init(PathQueue *q) {
 }
 
 void queue_free(PathQueue *q) {
-    for (size_t i = 0; i < q->len; i++) free(q->items[(q->head + i) % q->cap]);
-    free(q->items);
+    for (size_t i = 0; i < q->len; i++) xfree(q->items[(q->head + i) % q->cap]);
+    xfree(q->items);
     strmap_free(&q->waiting);
     memset(q, 0, sizeof *q);
 }
@@ -24,7 +24,7 @@ void queue_push(PathQueue *q, Ctx *ctx, const char *path) {
             size_t cap = q->cap ? q->cap * 2 : 64;
             char **items = xmalloc(cap * sizeof *items);
             for (size_t i = 0; i < q->len; i++) items[i] = q->items[(q->head + i) % q->cap];
-            free(q->items);
+            xfree(q->items);
             q->items = items;
             q->cap = cap;
             q->head = 0;

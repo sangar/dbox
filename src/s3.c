@@ -318,7 +318,7 @@ static void canonical_query(const Request *req, StrBuf *out) {
         sb_putc(out, '=');
         uri_encode(out, sorted[i].value, false);
     }
-    free(sorted);
+    xfree(sorted);
 }
 
 static void hmac_hex_chain(const S3 *s, const char *date, const char *string_to_sign, char signature[SHA256_HEX_LEN]) {
@@ -728,7 +728,7 @@ static StoreStatus s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, si
 out:
     *objects = arena_alloc(a, (n + 1) * sizeof **objects);
     memcpy(*objects, out, n * sizeof **objects);
-    free(out);
+    xfree(out);
     *count = n;
     response_free(&resp);
     arena_free(&scratch);
@@ -755,17 +755,17 @@ bool s3_create_bucket(Store *base, Ctx *ctx, Err *err) {
 
 static void s3_close(Store *base) {
     S3 *s = (S3 *)base;
-    free(s->bucket);
-    free(s->prefix);
-    free(s->region);
-    free(s->storage_class);
-    free(s->access_key);
-    free(s->secret_key);
-    free(s->session_token);
-    free(s->scheme);
-    free(s->host);
-    free(s->tmp_dir);
-    free(s);
+    xfree(s->bucket);
+    xfree(s->prefix);
+    xfree(s->region);
+    xfree(s->storage_class);
+    xfree(s->access_key);
+    xfree(s->secret_key);
+    xfree(s->session_token);
+    xfree(s->scheme);
+    xfree(s->host);
+    xfree(s->tmp_dir);
+    xfree(s);
 }
 
 static const StoreOps s3_ops = {s3_put, s3_get, s3_head, s3_delete, s3_list, s3_close};
@@ -779,7 +779,7 @@ static bool credentials_file(const char *profile, char **access, char **secret, 
     StrBuf raw = {0};
     Err ignored;
     bool ok = read_file(path, &raw, &ignored);
-    free(path);
+    xfree(path);
     if (!ok) return false;
     bool in_profile = false;
     char *save = NULL;
@@ -801,7 +801,7 @@ static bool credentials_file(const char *profile, char **access, char **secret, 
         while (k > 0 && (key[k - 1] == ' ' || key[k - 1] == '\t')) key[--k] = '\0';
         char **dst = strcmp(key, "aws_access_key_id") == 0 ? access : strcmp(key, "aws_secret_access_key") == 0 ? secret : strcmp(key, "aws_session_token") == 0 ? token : NULL;
         if (dst) {
-            free(*dst);
+            xfree(*dst);
             *dst = xstrdup(value);
         }
     }
@@ -821,7 +821,7 @@ static bool resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
         s->access_key = xstrdup(access);
         s->secret_key = xstrdup(secret);
         if (token && *token) {
-            free(s->session_token);
+            xfree(s->session_token);
             s->session_token = xstrdup(token);
         }
         return true;
@@ -832,14 +832,14 @@ static bool resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
         s->access_key = a;
         s->secret_key = k;
         if (t) {
-            free(s->session_token);
+            xfree(s->session_token);
             s->session_token = t;
         }
         return true;
     }
-    free(a);
-    free(k);
-    free(t);
+    xfree(a);
+    xfree(k);
+    xfree(t);
     err_set(err, "no credentials: set access_key and secret_key, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or ~/.aws/credentials");
     return false;
 }
@@ -883,7 +883,7 @@ Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *
         endpoint = sb.data;
     }
     bool ok = parse_endpoint(endpoint, &s->scheme, &s->host, err) && resolve_credentials(cfg, s, err);
-    free(endpoint);
+    xfree(endpoint);
     if (!ok) {
         s3_close(&s->base);
         return NULL;
@@ -892,7 +892,7 @@ Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *
         char *virtual_host = s->host;
         s->host = path_join(s->bucket, virtual_host);
         s->host[strlen(s->bucket)] = '.';
-        free(virtual_host);
+        xfree(virtual_host);
     }
     return &s->base;
 }

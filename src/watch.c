@@ -41,13 +41,13 @@ static int compare_names(const void *a, const void *b) { return strcmp(*(const c
 static bool add_tree(Watcher *w, const char *dir, bool report, Err *err) {
     char *rel = relative(w, dir);
     if (rel && w->ignored(w->ctx, rel, true)) {
-        free(rel);
+        xfree(rel);
         return true;
     }
     pthread_mutex_lock(&w->mu);
     strmap_put(&w->dirs, rel ? rel : ".", NULL);
     pthread_mutex_unlock(&w->mu);
-    free(rel);
+    xfree(rel);
     if (!backend_add_dir(w->backend, dir, err)) return watch_limit_hint(dir, err);
     DIR *d = opendir(dir);
     if (!d) return errno == ENOENT ? true : watch_limit_hint(dir, err);
@@ -68,9 +68,9 @@ static bool add_tree(Watcher *w, const char *dir, bool report, Err *err) {
             } else if (child && report && !w->ignored(w->ctx, child, false)) {
                 w->changed(w->ctx, child);
             }
-            free(child);
+            xfree(child);
         }
-        free(p);
+        xfree(p);
     }
     strlist_free(&names);
     return ok;
@@ -87,7 +87,7 @@ static void forget_dir(Watcher *w, const char *rel) {
         if (has_prefix(key, prefix)) strlist_push(&below, key);
     for (size_t i = 0; i < below.len; i++) strmap_remove(&w->dirs, below.items[i], NULL);
     strlist_free(&below);
-    free(prefix);
+    xfree(prefix);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -104,7 +104,7 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
     bool exists = lstat(abs_path, &st) == 0;
     bool is_directory = exists && S_ISDIR(st.st_mode);
     if (w->ignored(w->ctx, rel, is_directory)) {
-        free(rel);
+        xfree(rel);
         return;
     }
     if (is_directory) {
@@ -116,12 +116,12 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
             Err err;
             if (!add_tree(w, abs_path, true, &err)) log_error(w->log, "watch new directory", log_str("path", rel), log_err(&err), log_end());
         }
-        free(rel);
+        xfree(rel);
         return;
     }
     if (!exists) forget_dir(w, rel);
     w->changed(w->ctx, rel);
-    free(rel);
+    xfree(rel);
 }
 
 Watcher *watcher_new(const char *root, IgnoreFn ignored, ChangedFn changed, void *ctx, Logger *log, Err *err) {
@@ -150,7 +150,7 @@ void watcher_free(Watcher *w) {
     if (w->backend) backend_close(w->backend);
     strmap_free(&w->dirs);
     pthread_mutex_destroy(&w->mu);
-    free(w->root);
-    free(w->real_root);
-    free(w);
+    xfree(w->root);
+    xfree(w->real_root);
+    xfree(w);
 }

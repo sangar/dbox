@@ -63,9 +63,9 @@ static StoreStatus disk_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t
 out:
     if (out >= 0) close(out);
     if (status != STORE_OK && tmp) unlink(tmp);
-    free(tmp);
-    free(dir);
-    free(target);
+    xfree(tmp);
+    xfree(dir);
+    xfree(target);
     return status;
 }
 
@@ -93,7 +93,7 @@ static StoreStatus open_object(Disk *d, const char *key, Object *obj, int *fd, E
     *fd = f;
     status = STORE_OK;
 out:
-    free(path);
+    xfree(path);
     return status;
 }
 
@@ -119,7 +119,7 @@ static StoreStatus disk_delete(Store *s, Ctx *ctx, const char *key, Err *err) {
         err_sys(err, "%s", path);
         status = STORE_ERROR;
     }
-    free(path);
+    xfree(path);
     return status;
 }
 
@@ -151,11 +151,11 @@ static bool walk(Disk *d, Listing *l, const char *dir, const char *rel, Err *err
                 describe(&l->objects[l->count++], arena_strdup(l->arena, key), &st);
             }
         }
-        free(key);
-        free(path);
+        xfree(key);
+        xfree(path);
     }
-    for (int i = 0; i < n; i++) free(entries[i]);
-    free(entries);
+    for (int i = 0; i < n; i++) xfree(entries[i]);
+    xfree(entries);
     return ok;
 }
 
@@ -171,7 +171,7 @@ static StoreStatus disk_list(Store *s, Ctx *ctx, Arena *a, Object **objects, siz
     }
     Object *out = arena_alloc(a, (l.count + 1) * sizeof *out);
     memcpy(out, l.objects, l.count * sizeof *out);
-    free(l.objects);
+    xfree(l.objects);
     *objects = out;
     *count = l.count;
     return ok ? STORE_OK : STORE_ERROR;
@@ -179,8 +179,8 @@ static StoreStatus disk_list(Store *s, Ctx *ctx, Arena *a, Object **objects, siz
 
 static void disk_close(Store *s) {
     Disk *d = (Disk *)s;
-    free(d->dir);
-    free(d);
+    xfree(d->dir);
+    xfree(d);
 }
 
 static const StoreOps disk_ops = {disk_put, disk_get, disk_head, disk_delete, disk_list, disk_close};

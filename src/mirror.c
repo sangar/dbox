@@ -102,7 +102,7 @@ static int source(Engine *e, const IndexFile *f, Meta *meta, bool *source_missin
     char *abs = engine_abs(e, f->path);
     fd = open(abs, O_RDONLY | O_CLOEXEC);
     if (fd < 0) err_sys(err, "%s", abs);
-    free(abs);
+    xfree(abs);
     snprintf(meta->sha256, sizeof meta->sha256, "%s", f->sha256);
     return fd;
 }

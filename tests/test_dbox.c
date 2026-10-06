@@ -81,7 +81,7 @@ static void write_text(T *t, const char *path, const char *content) {
     char *dir = path_dir(path);
     Err err;
     CHECK(mkdir_p(dir, 0755, &err));
-    free(dir);
+    xfree(dir);
     CHECK(write_file(path, content, strlen(content), 0644, &err));
 }
 
@@ -103,7 +103,7 @@ static void expect_file(T *t, const char *path, const char *want) {
         t->failures++;
         fprintf(stderr, "%s = \"%s\", want \"%s\"\n", path, got, want);
     }
-    free(got);
+    xfree(got);
 }
 
 static char *join(const char *a, const char *b) { return path_join(a, b); }
@@ -156,7 +156,7 @@ static void test_config_loads_stores_with_defaults_and_expanded_secrets(T *t) {
     config_free(&cfg);
 out:
     sb_free(&yaml);
-    free(nas);
+    xfree(nas);
 }
 
 static void test_config_references_expand_in_values_but_not_comments(T *t) {
@@ -260,17 +260,17 @@ static void test_config_promote_swaps_roles_and_keeps_comments(T *t) {
     }
     char *raw = read_text(path);
     CHECK(strstr(raw, "# my stores") && strstr(raw, "# home server"));
-    free(raw);
+    xfree(raw);
     CHECK(!config_promote(path, "nope", &err));
-    free(path);
-    free(dir);
+    xfree(path);
+    xfree(dir);
 }
 
 static void test_config_default_path_honours_environment(T *t) {
     setenv("DBOX_CONFIG", "/elsewhere/dbox.yaml", 1);
     char *got = config_default_path();
     CHECK_STR(got, "/elsewhere/dbox.yaml");
-    free(got);
+    xfree(got);
     unsetenv("DBOX_CONFIG");
 
     char *dir = temp_dir(t);
@@ -278,15 +278,15 @@ static void test_config_default_path_honours_environment(T *t) {
     char *yml = join(dir, "dbox/config.yml"), *yaml = join(dir, "dbox/config.yaml");
     got = config_default_path();
     CHECK_STR(got, yml);
-    free(got);
+    xfree(got);
     write_text(t, yaml, "");
     got = config_default_path();
     CHECK_STR(got, yaml);
-    free(got);
+    xfree(got);
     unsetenv("XDG_CONFIG_HOME");
-    free(yml);
-    free(yaml);
-    free(dir);
+    xfree(yml);
+    xfree(yaml);
+    xfree(dir);
 }
 
 static void test_config_starter_loads_and_renders_without_secrets(T *t) {
@@ -327,8 +327,8 @@ static void test_config_starter_loads_and_renders_without_secrets(T *t) {
     sb_free(&out);
     config_free(&cfg);
 out:
-    free(path);
-    free(dir);
+    xfree(path);
+    xfree(dir);
 }
 
 static void test_durations_and_sizes(T *t) {
@@ -415,8 +415,8 @@ static Index *open_index(T *t) {
     Err err;
     Index *idx = index_open(path, &err);
     if (!idx) fprintf(stderr, "index_open: %s\n", err.msg);
-    free(path);
-    free(dir);
+    xfree(path);
+    xfree(dir);
     return idx;
 }
 
@@ -557,8 +557,8 @@ static Machine *new_machine(T *t, StoreDir *dirs, size_t ndirs, const RoleSpec *
     Err err;
     m->idx = index_open(path, &err);
     if (!m->idx) fprintf(stderr, "index: %s\n", err.msg);
-    free(path);
-    free(state);
+    xfree(path);
+    xfree(state);
     return m;
 }
 
@@ -566,8 +566,8 @@ static void free_machine(Machine *m) {
     index_close(m->idx);
     storeset_close(&m->stores);
     config_free(&m->cfg);
-    free(m->root);
-    free(m);
+    xfree(m->root);
+    xfree(m);
 }
 
 static Engine *machine_engine(T *t, Machine *m) {
@@ -590,25 +590,25 @@ static void once(T *t, Machine *m) {
 static void mwrite(T *t, Machine *m, const char *rel, const char *content) {
     char *p = join(m->root, rel);
     write_text(t, p, content);
-    free(p);
+    xfree(p);
 }
 
 static void mexpect(T *t, Machine *m, const char *rel, const char *want) {
     char *p = join(m->root, rel);
     expect_file(t, p, want);
-    free(p);
+    xfree(p);
 }
 
 static void expect_in(T *t, const char *dir, const char *rel, const char *want) {
     char *p = join(dir, rel);
     expect_file(t, p, want);
-    free(p);
+    xfree(p);
 }
 
 static void remove_in(const char *dir, const char *rel) {
     char *p = join(dir, rel);
     unlink(p);
-    free(p);
+    xfree(p);
 }
 
 static Store *replace_store(Machine *m, const char *name, Store *wrapper) {
@@ -765,7 +765,7 @@ static void w_close(Store *s) {
     store_close(w->inner);
     pthread_mutex_destroy(&w->mu);
     pthread_cond_destroy(&w->cv);
-    free(w);
+    xfree(w);
 }
 
 static const StoreOps wrapped_ops = {w_put, w_get, w_head, w_del, w_list, w_close};
@@ -813,7 +813,7 @@ static void test_engine_identical_file_on_second_machine_is_adopted_not_conflict
     glob_t g;
     CHECK(glob(pattern, 0, NULL, &g) == GLOB_NOMATCH);
     globfree(&g);
-    free(pattern);
+    xfree(pattern);
     Stats s;
     Err err;
     CHECK(index_stats(b->idx, "home", &s, &err) && s.files == 1 && s.verified == 1);
@@ -842,7 +842,7 @@ static void test_engine_edit_on_both_sides_keeps_local_and_saves_remote_beside(T
     CHECK(rc == 0 && g.gl_pathc == 1);
     if (rc == 0 && g.gl_pathc == 1) expect_file(t, g.gl_pathv[0], "from a");
     globfree(&g);
-    free(pattern);
+    xfree(pattern);
     free_machine(a);
     free_machine(b);
 }
@@ -898,7 +898,7 @@ static void test_engine_mirror_reconcile_adopts_copies_made_by_other_tools(T *t)
     CHECK(index_stats(m->idx, "nas", &s, &err) && s.verified == 1);
     stat(copy, &after);
     CHECK(stat_mtime_ns(&before) == stat_mtime_ns(&after));
-    free(copy);
+    xfree(copy);
     free_machine(m);
 }
 
@@ -937,7 +937,7 @@ static bool file_is(void *arg) {
     const char **pair = arg;
     char *got = read_text(pair[0]);
     bool ok = strcmp(got, pair[1]) == 0;
-    free(got);
+    xfree(got);
     return ok;
 }
 
@@ -983,13 +983,13 @@ static void test_engine_daemon_pushes_edits_as_they_happen(T *t) {
     CHECK(run.ok);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
-    free(tmp);
-    free(target);
-    free(nas_copy);
-    free(remote);
-    free(pulled_local);
-    free(new_dir);
-    free(home_copy);
+    xfree(tmp);
+    xfree(target);
+    xfree(nas_copy);
+    xfree(remote);
+    xfree(pulled_local);
+    xfree(new_dir);
+    xfree(home_copy);
     free_machine(m);
 }
 
@@ -1017,7 +1017,7 @@ static void test_engine_daemon_retries_reconcile_instead_of_exiting(T *t) {
     CHECK(run.ok);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
-    free(copy);
+    xfree(copy);
     free_machine(m);
 }
 
@@ -1033,8 +1033,8 @@ static void test_engine_poll_downloads_in_parallel(T *t) {
     once(t, m);
     mexpect(t, m, "one.txt", "1");
     mexpect(t, m, "two.txt", "2");
-    free(one);
-    free(two);
+    xfree(one);
+    xfree(two);
     free_machine(m);
 }
 
@@ -1082,7 +1082,7 @@ static void test_engine_file_changed_during_upload_is_not_recorded_until_resent(
     expect_in(t, dirs[0].dir, "saving.txt", "second, longer version");
     CHECK(index_file(m->idx, &a, "saving.txt", &f, &found, &err) && found && f.size == (int64_t)strlen("second, longer version"));
     arena_free(&a);
-    free(local);
+    xfree(local);
     free_machine(m);
 }
 
@@ -1136,8 +1136,8 @@ static void test_daemon_pid_file(T *t) {
     CHECK(!daemon_write_pid(pid, &err));
     daemon_remove_pid(pid);
     CHECK(!daemon_running(pid, &got));
-    free(pid);
-    free(dir);
+    xfree(pid);
+    xfree(dir);
 }
 
 /* ---- service ---- */
@@ -1185,16 +1185,16 @@ static void test_service_enable_on_mac_writes_agent_and_bootstraps_it(T *t) {
     StrBuf want = {0};
     sb_printf(&want, "launchctl bootout gui/501/dbox\nlaunchctl bootstrap gui/501 %s", unit);
     CHECK_STR(got, want.data);
-    free(got);
+    xfree(got);
     sb_free(&want);
     strlist_clear(&t->commands);
     CHECK(service_manager_disable(&m, &err));
     got = joined_calls(t);
     CHECK_STR(got, "launchctl bootout gui/501/dbox\nlaunchctl print gui/501/dbox");
-    free(got);
-    free(plist);
-    free(unit);
-    free(home);
+    xfree(got);
+    xfree(plist);
+    xfree(unit);
+    xfree(home);
 }
 
 static void test_service_enable_on_linux_writes_unit_and_enables_it(T *t) {
@@ -1209,24 +1209,24 @@ static void test_service_enable_on_linux_writes_unit_and_enables_it(T *t) {
     CHECK(strstr(text, "WantedBy=default.target") != NULL);
     char *got = joined_calls(t);
     CHECK_STR(got, "systemctl --user daemon-reload\nsystemctl --user enable --now dbox.service");
-    free(got);
+    xfree(got);
     strlist_clear(&t->commands);
     CHECK(service_manager_disable(&m, &err));
     CHECK(access(unit, F_OK) != 0);
     got = joined_calls(t);
     CHECK_STR(got, "systemctl --user disable --now dbox.service\nsystemctl --user daemon-reload");
-    free(got);
+    xfree(got);
     CHECK(!service_manager_disable(&m, &err));
-    free(text);
-    free(unit);
-    free(home);
-    free(config_home);
+    xfree(text);
+    xfree(unit);
+    xfree(home);
+    xfree(config_home);
 }
 
 static void test_service_plist_escapes_paths(T *t) {
     char *plist = service_launchd_plist("/Apps/a&b/dbox", "/l.log");
     CHECK(strstr(plist, "/Apps/a&amp;b/dbox") != NULL);
-    free(plist);
+    xfree(plist);
 }
 
 int main(void) {

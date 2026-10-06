@@ -36,7 +36,7 @@ WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
     CFRelease(paths);
     if (!b->stream) {
         err_set(err, "FSEvents: cannot create event stream for %s", root);
-        free(b);
+        xfree(b);
         return NULL;
     }
     b->dispatch = dispatch_queue_create("dbox.fsevents", DISPATCH_QUEUE_SERIAL);
@@ -46,7 +46,7 @@ WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
         FSEventStreamInvalidate(b->stream);
         FSEventStreamRelease(b->stream);
         dispatch_release(b->dispatch);
-        free(b);
+        xfree(b);
         return NULL;
     }
     return b;
@@ -70,7 +70,7 @@ void backend_close(WatchBackend *b) {
     FSEventStreamRelease(b->stream);
     dispatch_sync_f(b->dispatch, NULL, drain_nothing);
     dispatch_release(b->dispatch);
-    free(b);
+    xfree(b);
 }
 
 #endif

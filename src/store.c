@@ -22,7 +22,7 @@ bool store_open_all(Ctx *ctx, const Config *cfg, StoreSet *set, Err *err) {
     qsort(set->names, cfg->store_count, sizeof *set->names, compare_strings);
     char *state = config_state_dir(cfg);
     char *tmp = path_join(state, "tmp");
-    free(state);
+    xfree(state);
     bool ok = true;
     for (size_t i = 0; ok && i < cfg->store_count; i++) {
         Err inner;
@@ -33,7 +33,7 @@ bool store_open_all(Ctx *ctx, const Config *cfg, StoreSet *set, Err *err) {
         }
         set->count = i + 1;
     }
-    free(tmp);
+    xfree(tmp);
     if (!ok) storeset_close(set);
     return ok;
 }
@@ -46,8 +46,8 @@ Store *storeset_get(const StoreSet *set, const char *name) {
 
 void storeset_close(StoreSet *set) {
     for (size_t i = 0; i < set->count; i++) store_close(set->stores[i]);
-    free(set->names);
-    free(set->stores);
+    xfree(set->names);
+    xfree(set->stores);
     memset(set, 0, sizeof *set);
 }
 
@@ -57,7 +57,7 @@ int temp_file(const char *dir, Err *err) {
     int fd = mkstemp(tmpl);
     if (fd < 0) err_sys(err, "%s", tmpl);
     else unlink(tmpl);
-    free(tmpl);
+    xfree(tmpl);
     return fd;
 }
 

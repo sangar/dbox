@@ -61,7 +61,7 @@ typedef struct {
 static void print_usage(FILE *out) {
     char *path = config_default_path();
     fprintf(out, usage_text, path);
-    free(path);
+    xfree(path);
 }
 
 static int fail(const Err *err) {
@@ -92,7 +92,7 @@ typedef struct {
 } Flags;
 
 static void flags_free(Flags *f) {
-    free(f->config);
+    xfree(f->config);
     strlist_free(&f->positional);
 }
 
@@ -118,7 +118,7 @@ static int parse_flags(Flags *f, int allowed, int argc, char **argv) {
                 if (i + 1 >= argc) return usage_fail("flag needs an argument: %s", arg);
                 value = argv[++i];
             }
-            free(f->config);
+            xfree(f->config);
             f->config = xstrdup(value);
             continue;
         }
@@ -134,14 +134,14 @@ static int parse_flags(Flags *f, int allowed, int argc, char **argv) {
 static char *pid_path(const Config *cfg) {
     char *state = config_state_dir(cfg);
     char *p = path_join(state, "daemon.pid");
-    free(state);
+    xfree(state);
     return p;
 }
 
 static char *index_path(const Config *cfg) {
     char *state = config_state_dir(cfg);
     char *p = path_join(state, "index.db");
-    free(state);
+    xfree(state);
     return p;
 }
 
@@ -233,7 +233,7 @@ static bool with_engine(App *app, Ctx *ctx, const Config *cfg, bool dry_run, Eng
     }
     char *ip = index_path(cfg);
     Index *idx = index_open(ip, err);
-    free(ip);
+    xfree(ip);
     if (!idx) return false;
     StoreSet stores;
     bool ok = store_open_all(ctx, cfg, &stores, err);
@@ -280,7 +280,7 @@ static bool serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
     logger_init(&app->log, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
     char *state = config_state_dir(cfg);
     bool ok = mkdir_p(state, 0755, err);
-    free(state);
+    xfree(state);
     if (!ok) return false;
     char *pid = pid_path(cfg);
     ok = daemon_write_pid(pid, err);
@@ -296,7 +296,7 @@ static bool serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
         }
         daemon_remove_pid(pid);
     }
-    free(pid);
+    xfree(pid);
     return ok;
 }
 
@@ -325,7 +325,7 @@ static int cmd_run(App *app, int argc, char **argv) {
                 end_run(&app->signals);
                 ctx_destroy(&ctx);
             }
-            free(pid);
+            xfree(pid);
             config_free(&cfg);
         }
         flags_free(&f);
@@ -381,11 +381,11 @@ static int cmd_status(int argc, char **argv) {
     pid_t running;
     if (daemon_running(pid, &running)) printf("daemon:  running, pid %d\n", (int)running);
     else printf("daemon:  not running\n");
-    free(pid);
+    xfree(pid);
     char *unit;
     if (service_installed(&unit)) printf("service: enabled, %s\n", unit);
     else printf("service: not enabled (run `dbox service enable` to start dbox run at login)\n");
-    free(unit);
+    xfree(unit);
     if (cfg.store_count == 0) {
         printf("stores:  none configured\n");
         config_free(&cfg);
@@ -394,7 +394,7 @@ static int cmd_status(int argc, char **argv) {
 
     char *ip = index_path(&cfg);
     Index *idx = index_open(ip, &err);
-    free(ip);
+    xfree(ip);
     if (!idx) {
         config_free(&cfg);
         return fail(&err);
@@ -474,7 +474,7 @@ static int cmd_retry(int argc, char **argv) {
     }
     char *ip = index_path(&cfg);
     Index *idx = index_open(ip, &err);
-    free(ip);
+    xfree(ip);
     rc = EXIT_FAILURE;
     if (idx) {
         int64_t n;
@@ -521,8 +521,8 @@ static int cmd_check(int argc, char **argv) {
         }
         store_close(s);
     }
-    free(tmp);
-    free(state);
+    xfree(tmp);
+    xfree(state);
     ctx_destroy(&ctx);
     config_free(&cfg);
     flags_free(&f);
@@ -547,7 +547,7 @@ static int cmd_promote(int argc, char **argv) {
     }
     char *ip = index_path(&cfg);
     Index *idx = index_open(ip, &err);
-    free(ip);
+    xfree(ip);
     if (!idx) goto out;
     Stats stats;
     bool ok = index_stats(idx, name, &stats, &err);
@@ -564,7 +564,7 @@ static int cmd_promote(int argc, char **argv) {
     bool reloaded;
     Err inner;
     ok = daemon_reload(pid, &reloaded, &inner);
-    free(pid);
+    xfree(pid);
     if (!ok) {
         err_set(&err, "signal daemon: %s", inner.msg);
         goto out;
@@ -593,9 +593,9 @@ static int cmd_service(int argc, char **argv) {
             printf("dbox run starts now and at every login (%s)\n", unit);
             rc = EXIT_SUCCESS;
         }
-        free(exe);
+        xfree(exe);
     }
-    free(unit);
+    xfree(unit);
     return rc == EXIT_SUCCESS ? rc : fail(&err);
 }
 
@@ -612,7 +612,7 @@ static bool run_editor(const char *path, Err *err) {
     int status = 0;
     bool ok = rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (!ok) err_set(err, "editor \"%s\": exit status %d", editor, WIFEXITED(status) ? WEXITSTATUS(status) : rc);
-    free(script);
+    xfree(script);
     return ok;
 }
 
@@ -629,7 +629,7 @@ static bool edit_config(const char *path, Err *err) {
     char *pid = pid_path(&cfg);
     bool reloaded;
     bool ok = daemon_reload(pid, &reloaded, err);
-    free(pid);
+    xfree(pid);
     config_free(&cfg);
     if (ok) printf(reloaded ? "config is valid; the daemon is reloading it\n" : "config is valid\n");
     return ok;
@@ -693,7 +693,7 @@ static int cmd_reload(int argc, char **argv) {
         printf("config is valid; the daemon is reloading it\n");
         rc = EXIT_SUCCESS;
     }
-    free(pid);
+    xfree(pid);
     config_free(&cfg);
     return rc == EXIT_SUCCESS ? rc : fail(&err);
 }

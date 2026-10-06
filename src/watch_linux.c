@@ -34,9 +34,9 @@ WatchBackend *backend_open(Watcher *w, const char *root, Err *err) {
 
 void backend_close(WatchBackend *b) {
     close(b->fd);
-    for (size_t i = 0; i < b->dir_cap; i++) free(b->dirs[i]);
-    free(b->dirs);
-    free(b);
+    for (size_t i = 0; i < b->dir_cap; i++) xfree(b->dirs[i]);
+    xfree(b->dirs);
+    xfree(b);
 }
 
 bool backend_add_dir(WatchBackend *b, const char *path, Err *err) {
@@ -49,7 +49,7 @@ bool backend_add_dir(WatchBackend *b, const char *path, Err *err) {
         memset(b->dirs + b->dir_cap, 0, (cap - b->dir_cap) * sizeof *b->dirs);
         b->dir_cap = cap;
     }
-    free(b->dirs[wd]);
+    xfree(b->dirs[wd]);
     b->dirs[wd] = xstrdup(path);
     return true;
 }
@@ -64,7 +64,7 @@ static void read_events(WatchBackend *b) {
             p += sizeof *e + e->len;
             if (e->wd < 0 || (size_t)e->wd >= b->dir_cap || !b->dirs[e->wd]) continue;
             if (e->mask & IN_IGNORED) {
-                free(b->dirs[e->wd]);
+                xfree(b->dirs[e->wd]);
                 b->dirs[e->wd] = NULL;
                 continue;
             }
@@ -76,7 +76,7 @@ static void read_events(WatchBackend *b) {
             if (!e->len || !e->name[0]) continue;
             char *path = path_join(b->dirs[e->wd], e->name);
             watcher_event(b->watcher, path, false);
-            free(path);
+            xfree(path);
         }
     }
 }

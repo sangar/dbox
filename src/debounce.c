@@ -128,14 +128,14 @@ size_t debounce_pending(Debouncer *d) {
 void debounce_stop(Debouncer *d) {
     pthread_mutex_lock(&d->mu);
     d->stopped = true;
-    for (size_t i = 0; i < d->count; i++) free(d->items[i].key);
+    for (size_t i = 0; i < d->count; i++) xfree(d->items[i].key);
     d->count = 0;
     pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->mu);
     pthread_join(d->thread, NULL);
     strmap_free(&d->index);
-    free(d->items);
+    xfree(d->items);
     pthread_mutex_destroy(&d->mu);
     pthread_cond_destroy(&d->cv);
-    free(d);
+    xfree(d);
 }

@@ -10,38 +10,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static void out_of_memory(void) {
-    fputs("dbox: out of memory\n", stderr);
-    abort();
-}
-
-void *xmalloc(size_t size) {
-    void *p = malloc(size ? size : 1);
-    if (!p) out_of_memory();
-    return p;
-}
-
-void *xcalloc(size_t count, size_t size) {
-    void *p = calloc(count ? count : 1, size ? size : 1);
-    if (!p) out_of_memory();
-    return p;
-}
-
-void *xrealloc(void *ptr, size_t size) {
-    void *p = realloc(ptr, size ? size : 1);
-    if (!p) out_of_memory();
-    return p;
-}
-
-char *xstrdup(const char *s) { return xstrndup(s, strlen(s)); }
-
-char *xstrndup(const char *s, size_t n) {
-    char *p = xmalloc(n + 1);
-    memcpy(p, s, n);
-    p[n] = '\0';
-    return p;
-}
-
 void err_set(Err *err, const char *fmt, ...) {
     if (!err) return;
     va_list ap;
@@ -106,7 +74,7 @@ const char *sb_cstr(StrBuf *sb) {
 }
 
 void sb_free(StrBuf *sb) {
-    free(sb->data);
+    xfree(sb->data);
     *sb = (StrBuf){0};
 }
 
@@ -121,13 +89,13 @@ void strlist_push_owned(StrList *l, char *s) {
 void strlist_push(StrList *l, const char *s) { strlist_push_owned(l, xstrdup(s)); }
 
 void strlist_clear(StrList *l) {
-    for (size_t i = 0; i < l->len; i++) free(l->items[i]);
+    for (size_t i = 0; i < l->len; i++) xfree(l->items[i]);
     l->len = 0;
 }
 
 void strlist_free(StrList *l) {
     strlist_clear(l);
-    free(l->items);
+    xfree(l->items);
     *l = (StrList){0};
 }
 
@@ -293,14 +261,14 @@ bool mkdir_p(const char *path, mode_t mode, Err *err) {
         *s = '\0';
         if (mkdir(p, mode) != 0 && errno != EEXIST) {
             err_sys(err, "mkdir %s", p);
-            free(p);
+            xfree(p);
             return false;
         }
         *s = '/';
     }
     bool ok = mkdir(p, mode) == 0 || errno == EEXIST;
     if (!ok) err_sys(err, "mkdir %s", p);
-    free(p);
+    xfree(p);
     return ok;
 }
 
@@ -399,7 +367,7 @@ bool write_file(const char *path, const void *data, size_t len, mode_t mode, Err
 bool write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
     char *dir = path_dir(path);
     bool ok = mkdir_p(dir, 0755, err);
-    free(dir);
+    xfree(dir);
     if (!ok) return false;
     char *tmp = path_join(path, "");
     tmp[strlen(tmp) - 1] = '\0';
@@ -412,7 +380,7 @@ bool write_file_atomic(const char *path, const void *data, size_t len, mode_t mo
         ok = false;
     }
     if (!ok) unlink(tmp);
-    free(tmp);
+    xfree(tmp);
     return ok;
 }
 

@@ -20,14 +20,14 @@ void strmap_init(StrMap *m) { *m = (StrMap){0}; }
 
 void strmap_clear(StrMap *m) {
     for (size_t i = 0; i < m->cap; i++)
-        if (m->slots[i].key && !is_tombstone(m, m->slots[i].key)) free(m->slots[i].key);
+        if (m->slots[i].key && !is_tombstone(m, m->slots[i].key)) xfree(m->slots[i].key);
     if (m->slots) memset(m->slots, 0, m->cap * sizeof *m->slots);
     m->used = m->live = 0;
 }
 
 void strmap_free(StrMap *m) {
     strmap_clear(m);
-    free(m->slots);
+    xfree(m->slots);
     *m = (StrMap){0};
 }
 
@@ -71,7 +71,7 @@ static void grow(StrMap *m) {
     m->used = m->live = 0;
     for (size_t i = 0; i < old_cap; i++)
         if (old[i].key && !is_tombstone(m, old[i].key)) insert_fresh(m, old[i].key, old[i].value, old[i].hash);
-    free(old);
+    xfree(old);
 }
 
 void strmap_put(StrMap *m, const char *key, void *value) {
@@ -89,7 +89,7 @@ bool strmap_remove(StrMap *m, const char *key, void **old) {
     StrMapEntry *e = find_slot(m, key, hash_string(key));
     if (!e) return false;
     if (old) *old = e->value;
-    free(e->key);
+    xfree(e->key);
     e->key = &m->tombstone;
     e->value = NULL;
     m->live--;

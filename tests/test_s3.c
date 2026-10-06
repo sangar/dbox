@@ -109,7 +109,7 @@ static void test_round_trip_keeps_metadata(T *t) {
     char *content = read_fd(body);
     CHECK_STR(content, "hello");
     CHECK_STR(got.sha256, "abc");
-    free(content);
+    xfree(content);
     close(body);
 
     Arena a;

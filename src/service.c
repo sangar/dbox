@@ -135,7 +135,7 @@ static char *definition(const ServiceManager *m, const char *executable) {
     if (m->os != OS_DARWIN) return systemd_unit(executable);
     char *log = path_join(m->home, "Library/Logs/" LABEL ".log");
     char *plist = service_launchd_plist(executable, log);
-    free(log);
+    xfree(log);
     return plist;
 }
 
@@ -176,9 +176,9 @@ bool service_manager_enable(const ServiceManager *m, const char *executable, Err
         char *enable[] = {"systemctl", "--user", "enable", "--now", LABEL ".service", NULL};
         ok = m->run(m->run_user, reload, err) && m->run(m->run_user, enable, err);
     }
-    free(dir);
-    free(text);
-    free(unit);
+    xfree(dir);
+    xfree(text);
+    xfree(unit);
     return ok;
 }
 
@@ -200,7 +200,7 @@ bool service_manager_disable(const ServiceManager *m, Err *err) {
             ok = m->run(m->run_user, reload, err);
         }
     }
-    free(unit);
+    xfree(unit);
     return ok;
 }
 
@@ -250,9 +250,9 @@ static char *find_on_path(const char *name) {
     for (char *dir = strtok_r(copy, ":", &save); dir && !found; dir = strtok_r(NULL, ":", &save)) {
         char *candidate = path_join(*dir ? dir : ".", name);
         if (access(candidate, X_OK) == 0) found = candidate;
-        else free(candidate);
+        else xfree(candidate);
     }
-    free(copy);
+    xfree(copy);
     return found;
 }
 
@@ -265,9 +265,9 @@ char *service_executable_path(Err *err) {
     char *on_path = find_on_path(LABEL);
     struct stat a, b;
     if (on_path && stat(on_path, &a) == 0 && stat(exe, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
-        free(exe);
+        xfree(exe);
         return on_path;
     }
-    free(on_path);
+    xfree(on_path);
     return exe;
 }
