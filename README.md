@@ -38,7 +38,14 @@ Language:   C23
 Compilers:  clang >= 18 (primary), gcc >= 14
 Targets:    linux-x86_64, linux-aarch64, macos-aarch64
 Extensions: __attribute__((format(printf, ...))) on variadic formatters
+Level:      Modern C Level 2, Managed C
 ```
+
+The code follows the Modern C profile: one `Error` enum returned by every
+fallible function, no global mutable state, allocation through `alloc.c` and
+arenas, and every OS call behind `src/platform/`. The test binaries keep
+their `CHECK` macros, which exist for `__FILE__`, `__LINE__` and the
+expression text.
 
 Windows is not a target: dbox is POSIX throughout and its login service is a
 launchd agent or a systemd user unit. Warnings are errors, and the test suite
