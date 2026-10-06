@@ -31,22 +31,21 @@ kernel extensions.
 
 State lives in `<folder>/.dbox/`, which is never synced.
 
-## Install
+## Build
 
-Linux: install the `.deb`, `.rpm`, `.apk` or `.pkg.tar.zst` from the releases
-page, then run `dbox service enable` once your config is ready.
-
-macOS:
+Requires a C11 compiler, `make`, `pkg-config` and three libraries:
+libcurl, SQLite and libyaml. On macOS it also links CoreServices for FSEvents.
 
 ```sh
-brew install OWNER/tap/dbox
+brew install libyaml                                   # macOS; curl and sqlite ship with the system
+sudo apt install libyaml-dev libcurl4-openssl-dev libsqlite3-dev pkg-config   # Debian, Ubuntu
+
+make                  # ./dbox
+make VERSION=1.2.3    # what `dbox version` prints (default: git describe or "dev")
 ```
 
-From source, with Go 1.26 or newer:
-
-```sh
-go install .
-```
+Copy `./dbox` somewhere on your `PATH`, then run `dbox service enable` once
+your config is ready.
 
 ## Quick start
 
@@ -103,7 +102,7 @@ sync:
 ```
 
 - `kind` is `s3` (AWS, MinIO, R2, B2, …) or `disk`. `role` is `primary` (exactly one), `mirror` or `detached`.
-- `${VAR}` is replaced from the environment, which keeps secrets out of the file. Leave the keys out to use the AWS credential chain.
+- `${VAR}` is replaced from the environment, which keeps secrets out of the file. Leave the keys out to use `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`.
 - Unknown keys are an error. `dbox config` prints the effective config with secrets masked.
 
 All keys, their defaults and the `DBOX_SECTION__KEY` overrides are in
@@ -143,17 +142,42 @@ on Linux a systemd user unit (`journalctl --user -u dbox`). It starts the
 ## More
 
 - [docs/configuration.md](docs/configuration.md): every config key, with examples for R2, AWS and a NAS
-- [docs/design.md](docs/design.md): architecture, the sync rules, stores and roles, and why dbox doesn't mount S3
+- [docs/design.md](docs/design.md): architecture, the sync rules, stores and roles, the source layout, and why dbox doesn't mount S3
 
 ## Development
 
 ```sh
-make minio         # two MinIOs on :9200 and :9300 with a dbox bucket each
-make test          # go vet + go test -race ./..., no network
-make integration   # S3 store tests against the MinIOs
-make run           # daemon on dev.config.yml, syncing ./tmp/box
-make snapshot      # archives, Linux packages and the Homebrew cask in dist/
+make test             # unit tests and engine scenarios on disk stores, no network
+make minio            # two MinIOs on :9200 and :9300 with a dbox bucket each
+make integration      # the S3 store against both MinIOs
+make sanitize         # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
+make run              # daemon on dev.config.yml, syncing ./tmp/box
 ```
+
+## Compared with the Go version
+
+dbox was first written in Go; that version is in this repository's history
+before the C rewrite. The C version keeps the command line, config file,
+index database, object layout and metadata, so either binary can take over a
+folder and its stores from the other. Where they differ:
+
+- **S3 client.** libcurl with a hand-written Signature V4 signer instead of
+  the AWS SDK. Credentials come from the config, `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
+  `~/.aws/credentials`; instance metadata and SSO are not supported.
+  Requests are retried three times on transport errors and 5xx responses.
+- **Downloads are staged.** `Get` on an S3 store downloads to a temp file
+  under `<root>/.dbox/tmp` and hands back a descriptor, so a mirror copy
+  passes through local disk once. Multipart uploads send their parts one
+  after another.
+- **macOS watches with FSEvents**, not kqueue, so large trees do not cost
+  one descriptor per directory.
+- **`dbox config`** prints the effective config with keys in a fixed order,
+  not alphabetically as Go's YAML encoder does.
+- **No release packages yet.** The Go version shipped `.deb`, `.rpm`, `.apk`
+  and Homebrew packages through goreleaser; the C version is built from
+  source for now. The `packaging/` scripts are kept for a later pipeline.
+- Windows is not supported.
 
 ## License
 

@@ -1,6 +1,6 @@
 # dbox design
 
-A small Go daemon that keeps a local folder in sync with one or more stores:
+A small C daemon that keeps a local folder in sync with one or more stores:
 S3-compatible buckets (AWS, MinIO, R2, Backblaze B2) or plain directories.
 Sync-folder style: files live on disk, are always available offline, and changes are
 pushed in the background. Remote changes are pulled on a poll interval.
@@ -66,7 +66,7 @@ Why a mount does not fit the sync-folder model:
 Where a mount *is* the better answer: a single machine that needs read-mostly
 access to a huge bucket that will never fit on local disk (media libraries,
 datasets). That is a different product. If that use case shows up later,
-shelling out to `rclone mount` is the pragmatic answer, not writing FUSE in Go.
+shelling out to `rclone mount` is the pragmatic answer, not writing a FUSE filesystem.
 
 Decision: **watcher + local index + uploader**, no mount.
 
@@ -122,7 +122,7 @@ Rollback at any step is the reverse edit.
 ```
             ┌────────────┐   events    ┌───────────┐  paths   ┌──────────┐
  local fs ─►│  watcher   │────────────►│ debouncer │─────────►│  queue   │
-            │ (fsnotify) │             │ per path  │          │ (chan)   │
+            │ (platform) │             │ per path  │          │ (dedup)  │
             └────────────┘             └───────────┘          └────┬─────┘
                                                                    │
             ┌────────────┐                                    ┌────▼─────┐
@@ -143,30 +143,27 @@ Rollback at any step is the reverse edit.
 
 ### Components
 
-**watcher** — `github.com/fsnotify/fsnotify`. Backends: inotify on Linux,
-kqueue on macOS. fsnotify is not recursive, so walk the tree at start and add
-every directory; add new directories as they appear in Create events. Ignore
-patterns (`.git`, `.DS_Store`, `*.swp`, `~$*`, the index file itself) are
-applied here so noise never enters the pipeline.
+**watcher** — `src/watch.c` with one backend per platform: inotify on Linux
+(`watch_linux.c`) and FSEvents on macOS (`watch_macos.c`). inotify is not
+recursive, so the tree is walked at start and every directory added; new
+directories are added as they appear in create events. FSEvents watches the
+root recursively and costs no descriptor per directory. Ignore patterns
+(`.git`, `.DS_Store`, `*.swp`, `~$*`, the index file itself) are applied here
+so noise never enters the pipeline.
 
 Platform caveats:
 
 - Linux: `fs.inotify.max_user_watches` defaults to 8192 on some distros. The
-  daemon logs a clear error pointing at `sysctl` if `AddWatch` fails with
-  `ENOSPC`.
-- macOS: kqueue holds one file descriptor per watched directory. Raise the
-  soft `RLIMIT_NOFILE` to the hard limit at startup. For trees beyond ~10k
-  directories swap the backend for FSEvents (`github.com/fsnotify/fsevents`)
-  behind the same `Watcher` interface. Not needed for the POC.
+  Linux packages ship a sysctl snippet from `packaging/` that raises it.
+- The daemon raises the soft `RLIMIT_NOFILE` to the hard limit at startup.
 
-**debouncer** — map of path to `*time.Timer`. Each event resets the timer;
+**debouncer** — a per-path deadline on one timer thread. Each event resets it;
 when it fires (default 750ms) the path is sent to the queue. Coalesces the
 burst of Write events during a save, and the Rename+Create pair from
 atomic-save editors. On expiry the path is re-stated so the pipeline acts on
 what is actually on disk now, not on what the event said.
 
-**index** — SQLite via `modernc.org/sqlite` (pure Go, no cgo, so cross-compile
-works). Two tables:
+**index** — SQLite. Two tables:
 
 ```sql
 CREATE TABLE files (
@@ -198,7 +195,7 @@ down are detected on reconcile). `replicas` is immish's `blob_replicas`: one
 row per file per store, so backfill, promotion checks and `dbox status` are
 plain queries.
 
-**primary workers** — N goroutines reading from the queue. Per path:
+**primary workers** — N threads reading from the queue. Per path:
 
 1. `stat`. Missing → delete from primary, turn the `files` row into a
    tombstone and every mirror row `pending`, so mirrors delete their copies.
@@ -207,10 +204,9 @@ plain queries.
    queued.
 2. size+mtime match index → skip.
 3. Hash. Hash matches index → update mtime in index, skip.
-4. Upload to the primary with `manager.Uploader`, which sends one
-   `PutObject` below `part_size` and multipart above it. Set metadata `x-amz-meta-sha256` and
-   `x-amz-meta-mtime` so the remote side carries enough to compare without
-   downloading.
+4. Upload to the primary: one `PutObject` below `part_size`, a multipart
+   upload above it. Set metadata `x-amz-meta-sha256` and `x-amz-meta-mtime`
+   so the remote side carries enough to compare without downloading.
 5. Stat again. If size or mtime moved during the upload, record nothing and
    queue the path again, so the index never describes a version other than
    the one the primary holds. Otherwise update `files`, set the primary
@@ -271,8 +267,8 @@ out by name. Config is re-read on `SIGHUP` (sent by `dbox config edit` and `dbox
 removed store's workers are stopped and its replica rows left in place (they
 are harmless and come back if the store is re-added under the same name).
 
-**daemon** — `signal.NotifyContext` for SIGINT/SIGTERM, structured logs via
-`log/slog`, a `/healthz`, `/metrics` and `/status` HTTP listener on localhost
+**daemon** — a `Ctx` that SIGINT/SIGTERM cancel, structured key=value logs,
+a `/healthz`, `/metrics` and `/status` HTTP listener on localhost
 (optional). `dbox status` reads the upload backlog from `/status`.
 Supervised by launchd on macOS and systemd on Linux; no self-daemonising.
 
@@ -306,36 +302,52 @@ Mirror actions follow from replica rows rather than events:
 
 ```
 dbox/
-  main.go                   flag parsing, config load, wiring, signal handling
-  internal/config/          yaml + env + defaults + validation
-  internal/watch/           fsnotify wrapper, recursive add, ignore filter
-  internal/debounce/        per-path timer coalescing
-  internal/index/           sqlite: files + replicas
-  internal/store/           Store interface, s3 and disk implementations, registry by name
-  internal/ignore/          ignore patterns from config, always .dbox/
-  internal/engine/          primary workers, mirror workers, backfiller, poller, reconcile, conflicts
-  internal/daemon/          pid file, health/metrics listener, open-file limit
-  internal/service/         `service enable|disable`: launchd agent / systemd user unit
+  src/main.c                command line: subcommands and flag parsing, the reload loop
+  src/config.c              config.yml: ${VAR} expansion, DBOX_SECTION__KEY overrides, defaults, validation, promote
+  src/yml.c                 libyaml read into a tree that remembers where each scalar sits in the file
+  src/ignore.c              ignore patterns from config, always .dbox/
+  src/debounce.c            per-path quiet period on one timer thread
+  src/index.c               SQLite: files, replicas, upload failures
+  src/store.h               the Store interface; disk.c and s3.c implement it
+  src/s3.c                  S3 over libcurl: Signature V4, metadata, multipart above part_size, paginated listing
+  src/watch.c               recursive watcher; watch_macos.c (FSEvents) and watch_linux.c (inotify)
+  src/queue.c               the de-duplicating path queue and per-path locks
+  src/engine.c              reconcile, the primary workers, poll, conflicts, downloads
+  src/mirror.c              mirror workers, backfill adoption, verification
+  src/daemon.c              pid file, /healthz /metrics /status listener, status client, file limit
+  src/service.c             `service enable|disable`: launchd agent / systemd user unit
+  src/util.c, arena.c, strmap.c, sha256.c, ctx.c, log.c   building blocks
+  tests/test_dbox.c         config, index, ignore, debounce, engine scenarios, daemon, service
+  tests/test_s3.c           the S3 store against the compose MinIOs
   docker-compose.yml        two MinIO instances for local dev and tests
   Makefile
 ```
 
-`internal/store` exposes a five-method interface (`Put`, `Get`, `Delete`,
-`List`, `Head`) with `s3` and `disk` implementations. Unit tests use `disk`
+Threads replace goroutines: a fixed set of primary workers reads the queue,
+one loop per mirror drains its pending replicas, and short-lived worker sets
+run the parallel parts of a reconcile. Cancellation is a `Ctx` passed through
+every call; its condition variable is also what the queue and the mirror
+loops wait on, so cancelling wakes everything at once.
+
+`src/store.h` exposes a five-method interface (`put`, `get`, `del`, `list`,
+`head`) with `s3` and `disk` implementations. Unit tests use `disk`
 stores in temp directories; MinIO is only needed for the integration suite. Mirror copy
 is `Get` from one store piped into `Put` on another, so adding a new backend
 kind (SFTP, WebDAV) is one file and never touches the sync logic.
 
 ## Dependencies
 
-| Purpose | Module |
+| Purpose | Library |
 |---|---|
-| fs events | `github.com/fsnotify/fsnotify` |
-| S3 | `github.com/aws/aws-sdk-go-v2`, `.../service/s3`, `.../feature/s3/manager` |
-| index | `modernc.org/sqlite` |
-| config | `gopkg.in/yaml.v3` |
+| fs events | inotify (Linux), CoreServices FSEvents (macOS) |
+| S3 | libcurl, with a hand-written Signature V4 signer |
+| index | SQLite |
+| config | libyaml |
 
-Everything else is standard library.
+Everything else is C11 and POSIX. Credentials come from the config,
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
+`~/.aws/credentials`; instance metadata and SSO are not supported. Requests
+are retried three times on transport errors and 5xx responses.
 
 ## Running as a daemon
 
@@ -348,7 +360,7 @@ dbox service disable          # stop and remove it
 dbox status                   # shows whether the daemon answers and whether the service is installed
 ```
 
-`internal/service` is a port of eind's package of the same name:
+`src/service.c` is a port of eind's `internal/service` package:
 
 - **macOS** writes `~/Library/LaunchAgents/dbox.plist` with `RunAtLoad` and
   `KeepAlive`, logging to `~/Library/Logs/dbox.log`, then
@@ -362,8 +374,7 @@ dbox status                   # shows whether the daemon answers and whether the
   plus a final `daemon-reload`.
 - **Executable path.** The unit starts the `dbox` found on `PATH` when that
   is the same file as the running binary, otherwise the running binary's
-  absolute path. Upgrading in place with `go install` or Homebrew then needs
-  no re-enable.
+  absolute path. Upgrading the binary in place then needs no re-enable.
 - **Config path** is not baked into the unit. The daemon resolves
   `~/.config/dbox/config.yml` itself, so editing config and `SIGHUP` (or
   `dbox promote`) is enough.
@@ -391,7 +402,7 @@ Description=dbox folder sync
 After=network-online.target
 
 [Service]
-ExecStart="/home/gard/go/bin/dbox" run
+ExecStart="/usr/local/bin/dbox" run
 Restart=on-failure
 RestartSec=5
 
@@ -421,8 +432,8 @@ not enabled on install, because dbox needs a config first.
   both compose MinIOs, metadata round trip, not-found mapping, and a 12 MiB
   multipart copy streamed from one MinIO's `Get` into the other's `Put`.
 - **Platform:** planned CI matrix on `ubuntu-latest` and `macos-latest`. The watcher
-  tests are the only ones that differ meaningfully between inotify and kqueue.
-  `internal/service` is tested with the `run` function swapped for a recorder,
+  tests are the only ones that differ meaningfully between inotify and FSEvents.
+  `src/service.c` is tested with the command runner swapped for a recorder,
   as in eind, so no real `launchctl` or `systemctl` is invoked.
 
 ## Open questions
@@ -437,7 +448,5 @@ not enabled on install, because dbox needs a config first.
 - Should the daemon follow symlinks? Default no; most sync tools do not either.
 - Hash choice: SHA-256 is fine on Apple Silicon and modern x86. BLAKE3 is
   faster but adds a dependency. Decide after measuring on a 10 GB tree.
-- Large trees on macOS: measure kqueue fd usage at 5k and 20k directories to
-  decide if FSEvents is needed before the POC ships.
 - Should `.dbox/index.db` be excluded from Time Machine? Probably, via
   `tmutil addexclusion`, done at first run.
