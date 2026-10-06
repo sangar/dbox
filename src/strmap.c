@@ -5,8 +5,7 @@
 
 #include "util.h"
 
-static char tombstone_marker;
-#define TOMBSTONE (&tombstone_marker)
+static bool is_tombstone(const StrMap *m, const char *key) { return key == &m->tombstone; }
 
 uint64_t hash_string(const char *s) {
     uint64_t h = 1469598103934665603ULL;
@@ -21,7 +20,7 @@ void strmap_init(StrMap *m) { *m = (StrMap){0}; }
 
 void strmap_clear(StrMap *m) {
     for (size_t i = 0; i < m->cap; i++)
-        if (m->slots[i].key && m->slots[i].key != TOMBSTONE) free(m->slots[i].key);
+        if (m->slots[i].key && !is_tombstone(m, m->slots[i].key)) free(m->slots[i].key);
     if (m->slots) memset(m->slots, 0, m->cap * sizeof *m->slots);
     m->used = m->live = 0;
 }
@@ -40,7 +39,7 @@ static StrMapEntry *find_slot(const StrMap *m, const char *key, uint64_t h) {
     for (size_t i = h & mask;; i = (i + 1) & mask) {
         StrMapEntry *e = &m->slots[i];
         if (!e->key) return NULL;
-        if (e->key != TOMBSTONE && e->hash == h && strcmp(e->key, key) == 0) return e;
+        if (!is_tombstone(m, e->key) && e->hash == h && strcmp(e->key, key) == 0) return e;
     }
 }
 
@@ -55,7 +54,7 @@ static void insert_fresh(StrMap *m, char *key, void *value, uint64_t h) {
     size_t mask = m->cap - 1;
     for (size_t i = h & mask;; i = (i + 1) & mask) {
         StrMapEntry *e = &m->slots[i];
-        if (!e->key || e->key == TOMBSTONE) {
+        if (!e->key || is_tombstone(m, e->key)) {
             if (!e->key) m->used++;
             *e = (StrMapEntry){key, value, h};
             m->live++;
@@ -71,7 +70,7 @@ static void grow(StrMap *m) {
     m->slots = xcalloc(m->cap, sizeof *m->slots);
     m->used = m->live = 0;
     for (size_t i = 0; i < old_cap; i++)
-        if (old[i].key && old[i].key != TOMBSTONE) insert_fresh(m, old[i].key, old[i].value, old[i].hash);
+        if (old[i].key && !is_tombstone(m, old[i].key)) insert_fresh(m, old[i].key, old[i].value, old[i].hash);
     free(old);
 }
 
@@ -91,7 +90,7 @@ bool strmap_remove(StrMap *m, const char *key, void **old) {
     if (!e) return false;
     if (old) *old = e->value;
     free(e->key);
-    e->key = TOMBSTONE;
+    e->key = &m->tombstone;
     e->value = NULL;
     m->live--;
     return true;
@@ -100,7 +99,7 @@ bool strmap_remove(StrMap *m, const char *key, void **old) {
 bool strmap_next(const StrMap *m, StrMapIter *it, const char **key, void **value) {
     for (; it->i < m->cap; it->i++) {
         StrMapEntry *e = &m->slots[it->i];
-        if (e->key && e->key != TOMBSTONE) {
+        if (e->key && !is_tombstone(m, e->key)) {
             *key = e->key;
             if (value) *value = e->value;
             it->i++;

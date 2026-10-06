@@ -9,15 +9,21 @@
 
 typedef enum { OS_DARWIN, OS_LINUX, OS_OTHER } ServiceOs;
 
+/* ServiceRunner executes a service manager command such as launchctl or systemctl; tests record them instead. */
+typedef bool (*ServiceRunner)(void *user, char *const argv[], Err *err);
+
 typedef struct {
     ServiceOs os;
     const char *home;
     const char *config_home;
     int uid;
+    ServiceRunner run;
+    void *run_user;
+    char config_home_storage[1024];
 } ServiceManager;
 
-/* service_run executes a service manager command; tests replace it. */
-extern bool (*service_run)(char *const argv[], Err *err);
+/* service_run_command is the ServiceRunner that spawns the command and captures its output. */
+bool service_run_command(void *user, char *const argv[], Err *err);
 
 /* service_manager describes this user's session; it fails where no service manager is known. */
 bool service_manager(ServiceManager *m, Err *err);

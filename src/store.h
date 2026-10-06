@@ -82,6 +82,8 @@ void storeset_close(StoreSet *set);
 /* store_check writes, reads back and deletes a probe object. */
 bool store_check(Ctx *ctx, Store *s, Err *err);
 
+/* s3_global_init readies the HTTP client; main calls it once before any thread starts. */
+void s3_global_init(void);
 Store *disk_open(const char *root, const char *prefix);
 Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Err *err);
 /* s3_create_bucket creates the bucket if it does not exist yet. */

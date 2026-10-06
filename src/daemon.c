@@ -14,8 +14,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-void dbox_curl_init(void);
-
 bool daemon_write_pid(const char *path, Err *err) {
     pid_t pid;
     if (daemon_running(path, &pid)) {
@@ -162,7 +160,6 @@ static size_t collect(char *data, size_t size, size_t nmemb, void *userdata) {
 
 bool daemon_ask(const char *addr, long *backlog) {
     if (!*addr) return false;
-    dbox_curl_init();
     CURL *curl = curl_easy_init();
     if (!curl) return false;
     StrBuf url = {0}, body = {0};

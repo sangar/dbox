@@ -20,6 +20,7 @@ typedef struct {
     size_t cap;  /* power of two, or 0 */
     size_t used; /* live entries plus tombstones */
     size_t live;
+    char tombstone; /* a removed slot's key points here */
 } StrMap;
 
 void strmap_init(StrMap *m);

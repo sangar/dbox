@@ -18,7 +18,7 @@ extern char **environ;
 
 #define LABEL "dbox"
 
-static bool run_command(char *const argv[], Err *err) {
+bool service_run_command(void *user, char *const argv[], Err *err) {
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         err_sys(err, "pipe");
@@ -52,17 +52,15 @@ static bool run_command(char *const argv[], Err *err) {
     return ok;
 }
 
-bool (*service_run)(char *const argv[], Err *err) = run_command;
-
 bool service_manager(ServiceManager *m, Err *err) {
     memset(m, 0, sizeof *m);
     m->home = home_dir();
     const char *xdg = getenv("XDG_CONFIG_HOME");
-    static char config_home[PATH_MAX];
-    if (xdg && *xdg) snprintf(config_home, sizeof config_home, "%s", xdg);
-    else snprintf(config_home, sizeof config_home, "%s/.config", m->home);
-    m->config_home = config_home;
+    if (xdg && *xdg) snprintf(m->config_home_storage, sizeof m->config_home_storage, "%s", xdg);
+    else snprintf(m->config_home_storage, sizeof m->config_home_storage, "%s/.config", m->home);
+    m->config_home = m->config_home_storage;
     m->uid = (int)getuid();
+    m->run = service_run_command;
 #if defined(__APPLE__)
     m->os = OS_DARWIN;
 #elif defined(__linux__)
@@ -152,11 +150,11 @@ static bool bootout(const ServiceManager *m, Err *err) {
     char target[64];
     launchd_target(m, target);
     char *argv[] = {"launchctl", "bootout", target, NULL};
-    if (!service_run(argv, err)) return strstr(err->msg, "No such process") != NULL;
+    if (!m->run(m->run_user, argv, err)) return strstr(err->msg, "No such process") != NULL;
     char *print[] = {"launchctl", "print", target, NULL};
     for (int i = 0; i < 150; i++) {
         Err ignored;
-        if (!service_run(print, &ignored)) return true;
+        if (!m->run(m->run_user, print, &ignored)) return true;
         usleep(100 * 1000);
     }
     err_set(err, "launchctl bootout: the dbox agent did not stop within 15 seconds");
@@ -172,11 +170,11 @@ bool service_manager_enable(const ServiceManager *m, const char *executable, Err
         char domain[32];
         snprintf(domain, sizeof domain, "gui/%d", m->uid);
         char *argv[] = {"launchctl", "bootstrap", domain, unit, NULL};
-        ok = bootout(m, err) && service_run(argv, err);
+        ok = bootout(m, err) && m->run(m->run_user, argv, err);
     } else if (ok) {
         char *reload[] = {"systemctl", "--user", "daemon-reload", NULL};
         char *enable[] = {"systemctl", "--user", "enable", "--now", LABEL ".service", NULL};
-        ok = service_run(reload, err) && service_run(enable, err);
+        ok = m->run(m->run_user, reload, err) && m->run(m->run_user, enable, err);
     }
     free(dir);
     free(text);
@@ -192,14 +190,14 @@ bool service_manager_disable(const ServiceManager *m, Err *err) {
         err_set(err, "no service installed at %s", unit);
     } else {
         char *stop[] = {"systemctl", "--user", "disable", "--now", LABEL ".service", NULL};
-        ok = m->os == OS_DARWIN ? bootout(m, err) : service_run(stop, err);
+        ok = m->os == OS_DARWIN ? bootout(m, err) : m->run(m->run_user, stop, err);
         if (ok && unlink(unit) != 0) {
             err_sys(err, "%s", unit);
             ok = false;
         }
         if (ok && m->os != OS_DARWIN) {
             char *reload[] = {"systemctl", "--user", "daemon-reload", NULL};
-            ok = service_run(reload, err);
+            ok = m->run(m->run_user, reload, err);
         }
     }
     free(unit);

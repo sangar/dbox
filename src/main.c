@@ -44,7 +44,19 @@ static const char usage_text[] =
 /* Exit statuses: 1 for failures, 2 for mistakes on the command line. */
 enum { EXIT_USAGE = 2 };
 
-static Logger logger;
+/* Signals is what the signal thread shares with the run it may cancel. */
+typedef struct {
+    pthread_mutex_t mu;
+    sigset_t set;
+    Ctx *current;
+    int pending;
+} Signals;
+
+/* App is the process-wide state, created in main and passed down. */
+typedef struct {
+    Logger log;
+    Signals signals;
+} App;
 
 static void print_usage(FILE *out) {
     char *path = config_default_path();
@@ -135,51 +147,47 @@ static char *index_path(const Config *cfg) {
 
 /* ---- signals ---- */
 
-static pthread_mutex_t signal_mu = PTHREAD_MUTEX_INITIALIZER;
-static Ctx *current_ctx;
-static int pending_signal;
-
 /* signal_main waits for the signals the main thread blocked and cancels whatever run is current. */
 static void *signal_main(void *arg) {
-    sigset_t *set = arg;
+    Signals *s = arg;
     for (;;) {
         int sig;
-        if (sigwait(set, &sig) != 0) continue;
-        pthread_mutex_lock(&signal_mu);
-        pending_signal = sig;
-        if (current_ctx) ctx_cancel(current_ctx);
-        pthread_mutex_unlock(&signal_mu);
+        if (sigwait(&s->set, &sig) != 0) continue;
+        pthread_mutex_lock(&s->mu);
+        s->pending = sig;
+        if (s->current) ctx_cancel(s->current);
+        pthread_mutex_unlock(&s->mu);
     }
     return NULL;
 }
 
-static void watch_signals(void) {
-    static sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    sigaddset(&set, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
+static void watch_signals(Signals *s) {
+    pthread_mutex_init(&s->mu, NULL);
+    sigemptyset(&s->set);
+    sigaddset(&s->set, SIGINT);
+    sigaddset(&s->set, SIGTERM);
+    sigaddset(&s->set, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &s->set, NULL);
     pthread_t t;
-    pthread_create(&t, NULL, signal_main, &set);
+    pthread_create(&t, NULL, signal_main, s);
     pthread_detach(t);
 }
 
 /* begin_run makes ctx the one signals cancel; it reports false when a stop signal already arrived. */
-static bool begin_run(Ctx *ctx) {
-    pthread_mutex_lock(&signal_mu);
-    bool stopped = pending_signal == SIGINT || pending_signal == SIGTERM;
-    if (!stopped) current_ctx = ctx;
-    pthread_mutex_unlock(&signal_mu);
+static bool begin_run(Signals *s, Ctx *ctx) {
+    pthread_mutex_lock(&s->mu);
+    bool stopped = s->pending == SIGINT || s->pending == SIGTERM;
+    if (!stopped) s->current = ctx;
+    pthread_mutex_unlock(&s->mu);
     return !stopped;
 }
 
-static int end_run(void) {
-    pthread_mutex_lock(&signal_mu);
-    current_ctx = NULL;
-    int sig = pending_signal;
-    if (sig == SIGHUP) pending_signal = 0;
-    pthread_mutex_unlock(&signal_mu);
+static int end_run(Signals *s) {
+    pthread_mutex_lock(&s->mu);
+    s->current = NULL;
+    int sig = s->pending;
+    if (sig == SIGHUP) s->pending = 0;
+    pthread_mutex_unlock(&s->mu);
     return sig;
 }
 
@@ -216,9 +224,9 @@ static bool metrics(void *arg, StrBuf *out, Err *err) {
 
 static long backlog(void *arg) { return (long)engine_backlog(((Running *)arg)->engine); }
 
-typedef bool (*EngineFn)(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Err *err);
+typedef bool (*EngineFn)(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err);
 
-static bool with_engine(Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, Err *err) {
+static bool with_engine(App *app, Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, Err *err) {
     if (!config_primary(cfg)) {
         err_set(err, "%s: no stores configured", cfg->path);
         return false;
@@ -230,9 +238,9 @@ static bool with_engine(Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, 
     StoreSet stores;
     bool ok = store_open_all(ctx, cfg, &stores, err);
     if (ok) {
-        logger_init(&logger, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
-        Engine *e = engine_new(cfg, idx, &stores, (EngineOptions){.dry_run = dry_run, .log = &logger});
-        ok = fn(e, idx, ctx, cfg, err);
+        logger_init(&app->log, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
+        Engine *e = engine_new(cfg, idx, &stores, (EngineOptions){.dry_run = dry_run, .log = &app->log});
+        ok = fn(e, idx, ctx, cfg, &app->log, err);
         engine_free(e);
         storeset_close(&stores);
     }
@@ -240,11 +248,12 @@ static bool with_engine(Ctx *ctx, const Config *cfg, bool dry_run, EngineFn fn, 
     return ok;
 }
 
-static bool run_once(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Err *err) { return engine_once(e, ctx, err); }
+static bool run_once(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) { return engine_once(e, ctx, err); }
 
 typedef struct {
     Ctx *ctx;
     const Config *cfg;
+    Logger *log;
     Running running;
 } ServeArg;
 
@@ -252,12 +261,12 @@ static void *serve_http(void *arg) {
     ServeArg *s = arg;
     Err err;
     if (!daemon_serve(s->ctx, s->cfg->daemon.listen, metrics, backlog, &s->running, &err))
-        log_error(&logger, "health listener", log_str("addr", s->cfg->daemon.listen), log_err(&err), log_end());
+        log_error(s->log, "health listener", log_str("addr", s->cfg->daemon.listen), log_err(&err), log_end());
     return NULL;
 }
 
-static bool run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Err *err) {
-    ServeArg arg = {.ctx = ctx, .cfg = cfg, .running = {cfg, idx, e}};
+static bool run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) {
+    ServeArg arg = {.ctx = ctx, .cfg = cfg, .log = log, .running = {cfg, idx, e}};
     pthread_t http;
     pthread_create(&http, NULL, serve_http, &arg);
     bool ok = engine_run(e, ctx, err);
@@ -267,8 +276,8 @@ static bool run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Err *
 }
 
 /* serve runs the daemon for one config until ctx is done. */
-static bool serve(Ctx *ctx, const Config *cfg, Err *err) {
-    logger_init(&logger, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
+static bool serve(App *app, Ctx *ctx, const Config *cfg, Err *err) {
+    logger_init(&app->log, cfg->daemon.log_level, cfg->daemon.log_format, stderr);
     char *state = config_state_dir(cfg);
     bool ok = mkdir_p(state, 0755, err);
     free(state);
@@ -277,13 +286,13 @@ static bool serve(Ctx *ctx, const Config *cfg, Err *err) {
     ok = daemon_write_pid(pid, err);
     if (ok) {
         if (!config_primary(cfg)) {
-            log_warn(&logger, "no stores configured; add one to the config and send SIGHUP", log_str("config", cfg->path), log_end());
+            log_warn(&app->log, "no stores configured; add one to the config and send SIGHUP", log_str("config", cfg->path), log_end());
             ctx_lock(ctx);
             while (ctx_wait(ctx, 0)) {
             }
             ctx_unlock(ctx);
         } else {
-            ok = with_engine(ctx, cfg, false, run_daemon, err);
+            ok = with_engine(app, ctx, cfg, false, run_daemon, err);
         }
         daemon_remove_pid(pid);
     }
@@ -291,14 +300,14 @@ static bool serve(Ctx *ctx, const Config *cfg, Err *err) {
     return ok;
 }
 
-static int cmd_run(int argc, char **argv) {
+static int cmd_run(App *app, int argc, char **argv) {
     Flags f;
     int rc = parse_flags(&f, FLAG_ONCE | FLAG_DRY_RUN, argc, argv);
     if (rc >= 0) {
         flags_free(&f);
         return rc;
     }
-    watch_signals();
+    watch_signals(&app->signals);
     Err err;
     Config cfg;
     if (f.once || f.dry_run) {
@@ -311,9 +320,9 @@ static int cmd_run(int argc, char **argv) {
             } else {
                 Ctx ctx;
                 ctx_init(&ctx);
-                begin_run(&ctx);
-                if (with_engine(&ctx, &cfg, f.dry_run, run_once, &err)) rc = EXIT_SUCCESS;
-                end_run();
+                begin_run(&app->signals, &ctx);
+                if (with_engine(app, &ctx, &cfg, f.dry_run, run_once, &err)) rc = EXIT_SUCCESS;
+                end_run(&app->signals);
                 ctx_destroy(&ctx);
             }
             free(pid);
@@ -323,8 +332,8 @@ static int cmd_run(int argc, char **argv) {
         return rc == EXIT_SUCCESS ? rc : fail(&err);
     }
 
-    logger_init(&logger, "info", "text", stderr);
-    if (!daemon_raise_file_limit(&err)) log_warn(&logger, "raise open file limit", log_err(&err), log_end());
+    logger_init(&app->log, "info", "text", stderr);
+    if (!daemon_raise_file_limit(&err)) log_warn(&app->log, "raise open file limit", log_err(&err), log_end());
     for (;;) {
         if (!config_load(f.config, &cfg, &err)) {
             flags_free(&f);
@@ -333,12 +342,12 @@ static int cmd_run(int argc, char **argv) {
         Ctx ctx;
         ctx_init(&ctx);
         bool ok = true;
-        if (begin_run(&ctx)) ok = serve(&ctx, &cfg, &err);
-        int sig = end_run();
+        if (begin_run(&app->signals, &ctx)) ok = serve(app, &ctx, &cfg, &err);
+        int sig = end_run(&app->signals);
         ctx_destroy(&ctx);
         if (sig == SIGHUP) {
-            log_info(&logger, "reloading config", log_str("path", cfg.path), log_end());
-            if (!ok) log_warn(&logger, "stopped for reload", log_err(&err), log_end());
+            log_info(&app->log, "reloading config", log_str("path", cfg.path), log_end());
+            if (!ok) log_warn(&app->log, "stopped for reload", log_err(&err), log_end());
             config_free(&cfg);
             continue;
         }
@@ -694,10 +703,12 @@ int main(int argc, char **argv) {
         print_usage(stdout);
         return EXIT_SUCCESS;
     }
+    s3_global_init();
+    App app = {0};
     const char *cmd = argv[1];
     int n = argc - 2;
     char **rest = argv + 2;
-    if (strcmp(cmd, "run") == 0) return cmd_run(n, rest);
+    if (strcmp(cmd, "run") == 0) return cmd_run(&app, n, rest);
     if (strcmp(cmd, "status") == 0) return cmd_status(n, rest);
     if (strcmp(cmd, "retry") == 0) return cmd_retry(n, rest);
     if (strcmp(cmd, "check") == 0) return cmd_check(n, rest);

@@ -15,16 +15,6 @@ void logger_init(Logger *l, const char *level, const char *format, FILE *out) {
 
 void logger_destroy(Logger *l) { pthread_mutex_destroy(&l->mu); }
 
-Logger *logger_discard(void) {
-    static Logger discard;
-    static bool ready;
-    if (!ready) {
-        logger_init(&discard, "error", "text", NULL);
-        ready = true;
-    }
-    return &discard;
-}
-
 static const char *level_name(LogLevel level) {
     switch (level) {
     case LOG_DEBUG: return "DEBUG";

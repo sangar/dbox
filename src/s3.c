@@ -62,9 +62,7 @@ typedef struct {
     int64_t meta_mtime_ns;
 } Response;
 
-static pthread_once_t curl_once = PTHREAD_ONCE_INIT;
-static void curl_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
-void dbox_curl_init(void) { pthread_once(&curl_once, curl_init); }
+void s3_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
 /* ---- encoding ---- */
 
@@ -869,7 +867,6 @@ static bool parse_endpoint(const char *endpoint, char **scheme, char **host, Err
 }
 
 Store *s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Err *err) {
-    dbox_curl_init();
     S3 *s = xcalloc(1, sizeof *s);
     s->base.ops = &s3_ops;
     s->bucket = xstrdup(cfg->bucket);

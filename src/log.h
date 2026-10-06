@@ -39,8 +39,6 @@ static inline LogAttr log_end(void) { return (LogAttr){NULL, ATTR_END, NULL, 0};
 /* logger_init takes the config's level ("debug", "info", "warn", "error") and format ("text", "json"). */
 void logger_init(Logger *l, const char *level, const char *format, FILE *out);
 void logger_destroy(Logger *l);
-/* logger_discard drops everything, for tests. */
-Logger *logger_discard(void);
 
 /* Each takes LogAttr values and ends with log_end(). */
 void log_debug(Logger *l, const char *msg, ...);
