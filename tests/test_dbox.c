@@ -47,17 +47,6 @@ typedef struct {
         }                                                                                                                    \
     } while (0)
 
-#define CHECK_OK(call)                                                                                   /* modern-c: allow function-macro */ \
-    do {                                                                                                 \
-        Err e_;                                                                                          \
-        e_.msg[0] = '\0';                                                                                \
-        t->checks++;                                                                                        \
-        if (!(call)) {                                                                                   \
-            t->failures++;                                                                                  \
-            fprintf(stderr, "%s:%d: %s: %s failed: %s\n", __FILE__, __LINE__, __func__, #call, e_.msg); \
-        }                                                                                                \
-    } while (0)
-
 /* ---- t->scratch files ---- */
 
 static char *temp_dir(T *t) {

@@ -41,7 +41,6 @@ void logger_init(Logger *l, const char *level, const char *format, FILE *out);
 void logger_destroy(Logger *l);
 
 /* Each takes LogAttr values and ends with log_end(). */
-void log_debug(Logger *l, const char *msg, ...);
 void log_info(Logger *l, const char *msg, ...);
 void log_warn(Logger *l, const char *msg, ...);
 void log_error(Logger *l, const char *msg, ...);

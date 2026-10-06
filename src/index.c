@@ -39,14 +39,6 @@ static const char schema[] =
     "  last_error      TEXT    NOT NULL"
     ");";
 
-const char *replica_state_name(ReplicaState s) {
-    switch (s) {
-    case REPLICA_PENDING: return "pending";
-    case REPLICA_VERIFIED: return "verified";
-    default: return "failed";
-    }
-}
-
 static ReplicaState parse_state(const char *s) {
     if (strcmp(s, "verified") == 0) return REPLICA_VERIFIED;
     if (strcmp(s, "failed") == 0) return REPLICA_FAILED;

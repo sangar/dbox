@@ -153,8 +153,8 @@ so noise never enters the pipeline.
 
 Platform caveats:
 
-- Linux: `fs.inotify.max_user_watches` defaults to 8192 on some distros. The
-  Linux packages ship a sysctl snippet from `packaging/` that raises it.
+- Linux: `fs.inotify.max_user_watches` defaults to 8192 on some distros; the
+  daemon's error message says how to raise it with `sysctl`.
 - The daemon raises the soft `RLIMIT_NOFILE` to the hard limit at startup.
 
 **debouncer** — a per-path deadline on one timer thread. Each event resets it;
@@ -416,11 +416,6 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 ```
-
-The Linux packages (`.deb`, `.rpm`, `.apk`, Arch) ship
-`/usr/lib/systemd/user/dbox.service` and a sysctl snippet for
-`fs.inotify.max_user_watches` from `packaging/`. Unlike eind's, the unit is
-not enabled on install, because dbox needs a config first.
 
 ## Testing
 

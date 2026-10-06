@@ -97,6 +97,4 @@ void index_close(Index *x);
 
 [[nodiscard]] Error index_stats(Index *x, const char *store, Stats *out, Err *err);
 
-const char *replica_state_name(ReplicaState s);
-
 #endif

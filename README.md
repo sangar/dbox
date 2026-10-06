@@ -205,7 +205,7 @@ folder and its stores from the other. Where they differ:
   not alphabetically as Go's YAML encoder does.
 - **No release packages yet.** The Go version shipped `.deb`, `.rpm`, `.apk`
   and Homebrew packages through goreleaser; the C version is built from
-  source for now. The `packaging/` scripts are kept for a later pipeline.
+  source.
 - Windows is not supported.
 
 ## License

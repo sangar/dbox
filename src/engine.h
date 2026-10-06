@@ -11,7 +11,7 @@
 
 /*
  * Engine keeps a local folder, the primary store and every mirror in sync.
- * See docs/design.md in the Go version for the decision tables it
+ * See docs/design.md for the decision tables it
  * implements. Build it with engine_new, then call engine_run for the daemon
  * or engine_once for a single reconcile.
  */

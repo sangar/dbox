@@ -107,13 +107,6 @@ static void log_vat(Logger *l, LogLevel level, const char *msg, va_list ap) {
     sb_free(&sb);
 }
 
-void log_debug(Logger *l, const char *msg, ...) {
-    va_list ap;
-    va_start(ap, msg);
-    log_vat(l, LOG_DEBUG, msg, ap);
-    va_end(ap);
-}
-
 void log_info(Logger *l, const char *msg, ...) {
     va_list ap;
     va_start(ap, msg);

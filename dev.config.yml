@@ -1,5 +1,5 @@
-# Local development against `docker compose up -d`. Run with:
-#   make run
+# Local development against the MinIOs from tools/minio.sh. Run with:
+#   out/debug/dbox run --config dev.config.yml
 stores:
   minio-a:
     kind: s3

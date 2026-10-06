@@ -9,7 +9,7 @@
 
 /*
  * Config is ~/.config/dbox/config.yml: the stores, their roles and the sync
- * settings. See docs/configuration.md in the Go version for the format.
+ * settings. See docs/configuration.md for the format.
  */
 typedef enum { KIND_NONE, KIND_S3, KIND_DISK } StoreKind;
 typedef enum { ROLE_NONE, ROLE_PRIMARY, ROLE_MIRROR, ROLE_DETACHED } StoreRole;
