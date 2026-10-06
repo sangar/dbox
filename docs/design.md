@@ -325,7 +325,8 @@ dbox/
   tests/test_dbox.c         config, index, ignore, debounce, engine scenarios, daemon, service
   tests/test_s3.c           the S3 store against the compose MinIOs
   docker-compose.yml        two MinIO instances for local dev and tests
-  Makefile
+  CMakeLists.txt, CMakePresets.json
+  tools/minio.sh            starts the MinIOs and creates their buckets
 ```
 
 Threads replace goroutines: a fixed set of primary workers reads the queue,
@@ -423,7 +424,7 @@ not enabled on install, because dbox needs a config first.
 
 ## Testing
 
-- **Unit** (`make test`): debouncer coalescing, index tombstones and
+- **Unit** (`cmake --workflow --preset debug`): debouncer coalescing, index tombstones and
   conditional verify, ignore matching, config validation (two primaries,
   no primary, bad names, missing env vars, unknown keys) and `Promote`
   keeping comments. Engine scenarios run against `disk` stores in temp
@@ -434,10 +435,10 @@ not enabled on install, because dbox needs a config first.
   backfill → promote → detach, mirror adopts copies made by other tools,
   mirror falls back to the local file, and the live daemon handling a new
   directory, an editor-style rename save, a remote change and a removed tree.
-- **Integration** (`make minio && make integration`): the S3 store against
+- **Integration** (`tools/minio.sh && ctest --preset integration`): the S3 store against
   both compose MinIOs, metadata round trip, not-found mapping, and a 12 MiB
   multipart copy streamed from one MinIO's `Get` into the other's `Put`.
-- **Platform:** planned CI matrix on `ubuntu-latest` and `macos-latest`. The watcher
+- **Platform:** CI builds and tests on linux-x86_64, linux-aarch64 and macos-aarch64. The watcher
   tests are the only ones that differ meaningfully between inotify and FSEvents.
   `src/service.c` is tested with the command runner swapped for a recorder,
   as in eind, so no real `launchctl` or `systemctl` is invoked.

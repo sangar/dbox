@@ -599,8 +599,9 @@ static int cmd_service(int argc, char **argv) {
     const char *editor = getenv("VISUAL");
     if (!editor || !*editor) editor = getenv("EDITOR");
     if (!editor || !*editor) editor = "vi";
-    char *script = xmalloc(strlen(editor) + 8);
-    sprintf(script, "%s \"$1\"", editor);
+    size_t script_len = strlen(editor) + 8;
+    char *script = xmalloc(script_len);
+    snprintf(script, script_len, "%s \"$1\"", editor);
     char *argv[] = {"sh", "-c", script, "sh", (char *)path, NULL};
     Err inner;
     Error e = process_run_interactive(argv, &inner);

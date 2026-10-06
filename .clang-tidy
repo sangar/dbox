@@ -1,0 +1,13 @@
+# The checks dbox holds its own sources to. Vendored code under deps/ is not analysed.
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  readability-implicit-bool-conversion,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -misc-include-cleaner,
+  -misc-no-recursion
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^src/'

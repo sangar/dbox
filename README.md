@@ -51,19 +51,19 @@ which should track OS security updates rather than a pinned copy.
 
 ## Build
 
-Requires a C23 compiler, `make`, `pkg-config` and libcurl. On macOS it also
+Requires clang 18 or gcc 14, CMake 3.25, Ninja and libcurl. On macOS it also
 links CoreServices for FSEvents.
 
 ```sh
-# macOS: nothing to install; libcurl ships with the system
-sudo apt install libcurl4-openssl-dev pkg-config       # Debian, Ubuntu
+brew install cmake ninja                                       # macOS; libcurl ships with the system
+sudo apt install clang-18 cmake ninja-build libcurl4-openssl-dev   # Debian, Ubuntu
 
-make                  # ./dbox
-make VERSION=1.2.3    # what `dbox version` prints (default: git describe or "dev")
+cmake --preset release && cmake --build --preset release      # out/release/dbox
+cmake --preset release -DDBOX_VERSION=1.2.3                   # what `dbox version` prints (default: git describe)
 ```
 
-Copy `./dbox` somewhere on your `PATH`, then run `dbox service enable` once
-your config is ready.
+Copy `out/release/dbox` somewhere on your `PATH`, then run `dbox service
+enable` once your config is ready.
 
 ## Quick start
 
@@ -165,12 +165,16 @@ on Linux a systemd user unit (`journalctl --user -u dbox`). It starts the
 ## Development
 
 ```sh
-make test             # unit tests and engine scenarios on disk stores, no network
-make minio            # two MinIOs on :9200 and :9300 with a dbox bucket each
-make integration      # the S3 store against both MinIOs
-make sanitize         # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
-make run              # daemon on dev.config.yml, syncing ./tmp/box
+cmake --workflow --preset debug      # configure, build and run the unit tests under ASan and UBSan
+cmake --build --preset check         # clang-tidy over src/
+tools/minio.sh                       # two MinIOs on :9200 and :9300 with a dbox bucket each
+ctest --preset integration           # the S3 store against both MinIOs
+out/debug/dbox run --config dev.config.yml   # daemon syncing ./tmp/box
 ```
+
+CI runs the same steps on linux-x86_64, linux-aarch64 and macos-aarch64, each
+built natively: the macOS target needs the FSEvents SDK, and libcurl comes from
+the system on every target, so nothing is cross-compiled.
 
 ## Compared with the Go version
 
