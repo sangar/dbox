@@ -61,37 +61,37 @@ char *queue_pop(PathQueue *q, Ctx *ctx, atomic_bool *stop) {
 }
 
 void locks_init(PathLocks *l) {
-    pthread_mutex_init(&l->mu, NULL);
+    mutex_init(&l->mu);
     strmap_init(&l->busy);
     strmap_init(&l->dirty);
 }
 
 void locks_free(PathLocks *l) {
-    pthread_mutex_destroy(&l->mu);
+    mutex_destroy(&l->mu);
     strmap_free(&l->busy);
     strmap_free(&l->dirty);
 }
 
 bool locks_acquire(PathLocks *l, const char *path) {
-    pthread_mutex_lock(&l->mu);
+    mutex_lock(&l->mu);
     bool acquired = !strmap_has(&l->busy, path);
     if (acquired) strmap_put(&l->busy, path, NULL);
     else strmap_put(&l->dirty, path, NULL);
-    pthread_mutex_unlock(&l->mu);
+    mutex_unlock(&l->mu);
     return acquired;
 }
 
 bool locks_release(PathLocks *l, const char *path) {
-    pthread_mutex_lock(&l->mu);
+    mutex_lock(&l->mu);
     strmap_remove(&l->busy, path, NULL);
     bool again = strmap_remove(&l->dirty, path, NULL);
-    pthread_mutex_unlock(&l->mu);
+    mutex_unlock(&l->mu);
     return again;
 }
 
 size_t locks_in_flight(PathLocks *l) {
-    pthread_mutex_lock(&l->mu);
+    mutex_lock(&l->mu);
     size_t n = strmap_count(&l->busy);
-    pthread_mutex_unlock(&l->mu);
+    mutex_unlock(&l->mu);
     return n;
 }

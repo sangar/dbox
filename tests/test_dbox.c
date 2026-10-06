@@ -1,15 +1,7 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <ftw.h>
-#include <glob.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
 
 #include "config.h"
 #include "ctx.h"
@@ -19,6 +11,7 @@
 #include "ignore.h"
 #include "index.h"
 #include "log.h"
+#include "platform/platform.h"
 #include "service.h"
 #include "store.h"
 
@@ -69,13 +62,26 @@ typedef struct {
 static char *temp_dir(T *t) {
     char *dir = xmalloc(strlen(t->scratch) + 16);
     snprintf(dir, strlen(t->scratch) + 16, "%s/d%d", t->scratch, t->scratch_count++);
-    mkdir(dir, 0755);
+    (void)dir_create(dir, 0755, NULL);
     return dir;
 }
 
-static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) { return remove(path); }
+static void remove_tree(const char *path) { (void)dir_remove_tree(path, NULL); }
 
-static void remove_tree(const char *path) { nftw(path, remove_entry, 16, FTW_DEPTH | FTW_PHYS); }
+/* count_matching counts the entries of dir whose name matches pattern and hands the first one's path to *first when asked. */
+static size_t count_matching(const char *dir, const char *pattern, char **first) {
+    StrList names = {0};
+    size_t n = 0;
+    if (first) *first = NULL;
+    if (dir_list(dir, &names, NULL) == ERR_OK)
+        for (size_t i = 0; i < names.len; i++) {
+            if (!glob_match(pattern, names.items[i])) continue;
+            if (first && !*first) *first = path_join(dir, names.items[i]);
+            n++;
+        }
+    strlist_free(&names);
+    return n;
+}
 
 static void write_text(T *t, const char *path, const char *content) {
     char *dir = path_dir(path);
@@ -107,8 +113,6 @@ static void expect_file(T *t, const char *path, const char *want) {
 }
 
 static char *join(const char *a, const char *b) { return path_join(a, b); }
-
-static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 
 static bool eventually(bool (*ok)(void *), void *arg) {
     for (int64_t deadline = monotonic_ns() + 5 * NS_PER_SEC; monotonic_ns() < deadline; sleep_ms(20))
@@ -267,14 +271,14 @@ static void test_config_promote_swaps_roles_and_keeps_comments(T *t) {
 }
 
 static void test_config_default_path_honours_environment(T *t) {
-    setenv("DBOX_CONFIG", "/elsewhere/dbox.yaml", 1);
+    env_set("DBOX_CONFIG", "/elsewhere/dbox.yaml");
     char *got = config_default_path();
     CHECK_STR(got, "/elsewhere/dbox.yaml");
     xfree(got);
-    unsetenv("DBOX_CONFIG");
+    env_unset("DBOX_CONFIG");
 
     char *dir = temp_dir(t);
-    setenv("XDG_CONFIG_HOME", dir, 1);
+    env_set("XDG_CONFIG_HOME", dir);
     char *yml = join(dir, "dbox/config.yml"), *yaml = join(dir, "dbox/config.yaml");
     got = config_default_path();
     CHECK_STR(got, yml);
@@ -283,7 +287,7 @@ static void test_config_default_path_honours_environment(T *t) {
     got = config_default_path();
     CHECK_STR(got, yaml);
     xfree(got);
-    unsetenv("XDG_CONFIG_HOME");
+    env_unset("XDG_CONFIG_HOME");
     xfree(yml);
     xfree(yaml);
     xfree(dir);
@@ -378,20 +382,21 @@ static void test_ignore_match(T *t) {
 /* ---- debounce ---- */
 
 typedef struct {
-    pthread_mutex_t mu;
+    Mutex mu;
     int a, b;
 } Calls;
 
 static void count_call(void *ctx, const char *key) {
     Calls *c = ctx;
-    pthread_mutex_lock(&c->mu);
+    mutex_lock(&c->mu);
     if (strcmp(key, "a") == 0) c->a++;
     if (strcmp(key, "b") == 0) c->b++;
-    pthread_mutex_unlock(&c->mu);
+    mutex_unlock(&c->mu);
 }
 
 static void test_debounce_burst_is_coalesced_per_key(T *t) {
-    Calls calls = {PTHREAD_MUTEX_INITIALIZER, 0, 0};
+    Calls calls = {0};
+    mutex_init(&calls.mu);
     Debouncer *d = debounce_new(30 * NS_PER_MS, count_call, &calls);
     for (int i = 0; i < 5; i++) {
         debounce_trigger(d, "a");
@@ -400,11 +405,12 @@ static void test_debounce_burst_is_coalesced_per_key(T *t) {
     debounce_trigger(d, "b");
     CHECK(debounce_pending(d) == 2);
     sleep_ms(100);
-    pthread_mutex_lock(&calls.mu);
+    mutex_lock(&calls.mu);
     CHECK(calls.a == 1 && calls.b == 1);
-    pthread_mutex_unlock(&calls.mu);
+    mutex_unlock(&calls.mu);
     CHECK(debounce_pending(d) == 0);
     debounce_stop(d);
+    mutex_destroy(&calls.mu);
 }
 
 /* ---- index ---- */
@@ -606,7 +612,7 @@ static void expect_in(T *t, const char *dir, const char *rel, const char *want) 
 
 static void remove_in(const char *dir, const char *rel) {
     char *p = join(dir, rel);
-    unlink(p);
+    (void)file_remove(p, NULL);
     xfree(p);
 }
 
@@ -692,8 +698,8 @@ typedef struct {
     const char *hidden;
     atomic_bool *online;
     int want_gets;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    Mutex mu;
+    Cond cv;
     int in_flight;
     bool released;
     bool *rejecting;
@@ -717,20 +723,19 @@ typedef struct {
 [[nodiscard]] static Error w_get(Store *s, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
     Wrapped *w = (Wrapped *)s;
     if (w->want_gets > 0) {
-        pthread_mutex_lock(&w->mu);
+        mutex_lock(&w->mu);
         if (++w->in_flight >= w->want_gets) {
             w->released = true;
-            pthread_cond_broadcast(&w->cv);
+            cond_broadcast(&w->cv);
         }
         int64_t deadline = monotonic_ns() + 2 * NS_PER_SEC;
         while (!w->released && monotonic_ns() < deadline) {
-            struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * NS_PER_MS};
-            pthread_mutex_unlock(&w->mu);
-            nanosleep(&ts, NULL);
-            pthread_mutex_lock(&w->mu);
+            mutex_unlock(&w->mu);
+            sleep_ms(20);
+            mutex_lock(&w->mu);
         }
         bool released = w->released;
-        pthread_mutex_unlock(&w->mu);
+        mutex_unlock(&w->mu);
         if (!released) {
             return err_set(err, ERR_REMOTE, "downloads did not overlap");
         }
@@ -759,8 +764,8 @@ typedef struct {
 static void w_close(Store *s) {
     Wrapped *w = (Wrapped *)s;
     store_close(w->inner);
-    pthread_mutex_destroy(&w->mu);
-    pthread_cond_destroy(&w->cv);
+    mutex_destroy(&w->mu);
+    cond_destroy(&w->cv);
     xfree(w);
 }
 
@@ -770,8 +775,8 @@ static Wrapped *wrap(T *t, Machine *m, const char *name) {
     Wrapped *w = xcalloc(1, sizeof *w);
     w->base.ops = &wrapped_ops;
     w->t = t;
-    pthread_mutex_init(&w->mu, NULL);
-    pthread_cond_init(&w->cv, NULL);
+    mutex_init(&w->mu);
+    cond_init(&w->cv);
     w->inner = replace_store(m, name, &w->base);
     return w;
 }
@@ -805,11 +810,7 @@ static void test_engine_identical_file_on_second_machine_is_adopted_not_conflict
     mwrite(t, b, "same.txt", "same");
     once(t, a);
     once(t, b);
-    char *pattern = join(b->root, "*conflict*");
-    glob_t g;
-    CHECK(glob(pattern, 0, NULL, &g) == GLOB_NOMATCH);
-    globfree(&g);
-    xfree(pattern);
+    CHECK(count_matching(b->root, "*conflict*", NULL) == 0);
     Stats s;
     Err err;
     CHECK(index_stats(b->idx, "home", &s, &err) == ERR_OK && s.files == 1 && s.verified == 1);
@@ -832,13 +833,10 @@ static void test_engine_edit_on_both_sides_keeps_local_and_saves_remote_beside(T
     once(t, b);
     mexpect(t, b, "notes.md", "from b, longer");
     expect_in(t, dirs[0].dir, "notes.md", "from b, longer");
-    char *pattern = join(b->root, "notes.conflict-*.md");
-    glob_t g;
-    int rc = glob(pattern, 0, NULL, &g);
-    CHECK(rc == 0 && g.gl_pathc == 1);
-    if (rc == 0 && g.gl_pathc == 1) expect_file(t, g.gl_pathv[0], "from a");
-    globfree(&g);
-    xfree(pattern);
+    char *copy = NULL;
+    CHECK(count_matching(b->root, "notes.conflict-*.md", &copy) == 1);
+    if (copy) expect_file(t, copy, "from a");
+    xfree(copy);
     free_machine(a);
     free_machine(b);
 }
@@ -883,8 +881,8 @@ static void test_engine_mirror_reconcile_adopts_copies_made_by_other_tools(T *t)
     once(t, m);
     char *copy = join(dirs[1].dir, "big.bin");
     write_text(t, copy, "pretend this is large");
-    struct stat before, after;
-    stat(copy, &before);
+    FileStat before, after;
+    CHECK(file_info_follow(copy, &before, NULL) == ERR_OK && before.exists);
     set_roles(m, dirs, 2, primary_and_mirror, 2);
     Engine *e = machine_engine(t, m);
     Err err;
@@ -892,8 +890,8 @@ static void test_engine_mirror_reconcile_adopts_copies_made_by_other_tools(T *t)
     engine_free(e);
     Stats s;
     CHECK(index_stats(m->idx, "nas", &s, &err) == ERR_OK && s.verified == 1);
-    stat(copy, &after);
-    CHECK(stat_mtime_ns(&before) == stat_mtime_ns(&after));
+    CHECK(file_info_follow(copy, &after, NULL) == ERR_OK && after.exists);
+    CHECK(before.mtime_ns == after.mtime_ns);
     xfree(copy);
     free_machine(m);
 }
@@ -949,15 +947,15 @@ static void test_engine_daemon_pushes_edits_as_they_happen(T *t) {
     Machine *m = new_machine(t, dirs, 2, primary_and_mirror, 2);
     DaemonRun run = {.e = machine_engine(t, m)};
     ctx_init(&run.ctx);
-    pthread_t thread;
-    pthread_create(&thread, NULL, daemon_main, &run);
+    Thread thread;
+    thread_start(&thread, daemon_main, &run);
     sleep_ms(300);
 
     mwrite(t, m, "new/dir/a.txt", "created in a new directory");
     /* Atomic save, the way most editors write: temp file renamed over the original. */
     mwrite(t, m, "new/dir/.a.txt.tmp", "saved by editor");
     char *tmp = join(m->root, "new/dir/.a.txt.tmp"), *target = join(m->root, "new/dir/a.txt");
-    rename(tmp, target);
+    (void)file_rename(tmp, target, NULL);
     char *nas_copy = join(dirs[1].dir, "new/dir/a.txt");
     const char *saved[] = {nas_copy, "saved by editor"};
     CHECK(eventually(file_is, saved));
@@ -975,7 +973,7 @@ static void test_engine_daemon_pushes_edits_as_they_happen(T *t) {
     CHECK(eventually(both_missing, gone));
 
     ctx_cancel(&run.ctx);
-    pthread_join(thread, NULL);
+    thread_join(&thread);
     CHECK(run.result == ERR_OK);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
@@ -1000,8 +998,8 @@ static void test_engine_daemon_retries_reconcile_instead_of_exiting(T *t) {
     mwrite(t, m, "written-while-offline.txt", "queued");
     DaemonRun run = {.e = machine_engine(t, m)};
     ctx_init(&run.ctx);
-    pthread_t thread;
-    pthread_create(&thread, NULL, daemon_main, &run);
+    Thread thread;
+    thread_start(&thread, daemon_main, &run);
     sleep_ms(150);
     expect_in(t, dirs[0].dir, "written-while-offline.txt", "<missing>");
     atomic_store(&online, true);
@@ -1009,7 +1007,7 @@ static void test_engine_daemon_retries_reconcile_instead_of_exiting(T *t) {
     const char *uploaded[] = {copy, "queued"};
     CHECK(eventually(file_is, uploaded));
     ctx_cancel(&run.ctx);
-    pthread_join(thread, NULL);
+    thread_join(&thread);
     CHECK(run.result == ERR_OK);
     engine_free(run.e);
     ctx_destroy(&run.ctx);
@@ -1100,24 +1098,19 @@ static void *serve_main(void *arg) {
 }
 
 static void test_daemon_ask_returns_what_serve_reports(T *t) {
-    int probe = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = 0, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-    CHECK(bind(probe, (struct sockaddr *)&sa, sizeof sa) == 0);
-    socklen_t len = sizeof sa;
-    getsockname(probe, (struct sockaddr *)&sa, &len);
-    close(probe);
     ServeRun run;
-    snprintf(run.addr, sizeof run.addr, "127.0.0.1:%d", ntohs(sa.sin_port));
+    Err err;
+    CHECK(net_free_port(run.addr, &err) == ERR_OK);
     long backlog;
     CHECK(!daemon_ask(run.addr, &backlog));
     ctx_init(&run.ctx);
-    pthread_t thread;
-    pthread_create(&thread, NULL, serve_main, &run);
+    Thread thread;
+    thread_start(&thread, serve_main, &run);
     bool answered = false;
     for (int64_t deadline = monotonic_ns() + 2 * NS_PER_SEC; !answered && monotonic_ns() < deadline; sleep_ms(10)) answered = daemon_ask(run.addr, &backlog);
     CHECK(answered && backlog == 7);
     ctx_cancel(&run.ctx);
-    pthread_join(thread, NULL);
+    thread_join(&thread);
     ctx_destroy(&run.ctx);
 }
 
@@ -1125,10 +1118,10 @@ static void test_daemon_pid_file(T *t) {
     char *dir = temp_dir(t);
     char *pid = join(dir, "daemon.pid");
     Err err;
-    pid_t got;
+    int got;
     CHECK(!daemon_running(pid, &got));
     CHECK(daemon_write_pid(pid, &err) == ERR_OK);
-    CHECK(daemon_running(pid, &got) && got == getpid());
+    CHECK(daemon_running(pid, &got) && got == process_id());
     CHECK(daemon_write_pid(pid, &err) != ERR_OK);
     daemon_remove_pid(pid);
     CHECK(!daemon_running(pid, &got));
@@ -1203,7 +1196,8 @@ static void test_service_enable_on_linux_writes_unit_and_enables_it(T *t) {
     xfree(got);
     strlist_clear(&t->commands);
     CHECK(service_manager_disable(&m, &err) == ERR_OK);
-    CHECK(access(unit, F_OK) != 0);
+    FileStat unit_info;
+    CHECK(file_info_follow(unit, &unit_info, NULL) == ERR_OK && !unit_info.exists);
     got = joined_calls(t);
     CHECK_STR(got, "systemctl --user disable --now dbox.service\nsystemctl --user daemon-reload");
     xfree(got);
@@ -1222,12 +1216,12 @@ static void test_service_plist_escapes_paths(T *t) {
 
 int main(void) {
     T t = {.scratch = "/tmp/dbox-test-XXXXXX"};
-    if (!mkdtemp(t.scratch)) return 1;
+    if (dir_make_temp(t.scratch, NULL) != ERR_OK) return 1;
     ctx_init(&t.background);
     logger_init(&t.discard, "error", "text", NULL);
     logger_init(&t.verbose, "debug", "text", stderr);
     s3_global_init();
-    unsetenv("DBOX_CONFIG");
+    env_unset("DBOX_CONFIG");
 
     test_config_loads_stores_with_defaults_and_expanded_secrets(&t);
     test_config_references_expand_in_values_but_not_comments(&t);

@@ -1,10 +1,10 @@
 #ifndef DBOX_LOG_H
 #define DBOX_LOG_H
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "platform/platform.h"
 #include "util.h"
 
 /*
@@ -17,7 +17,7 @@ typedef struct {
     LogLevel level;
     bool json;
     FILE *out;
-    pthread_mutex_t mu;
+    Mutex mu;
 } Logger;
 
 typedef enum { ATTR_END, ATTR_STR, ATTR_INT, ATTR_DURATION } AttrKind;

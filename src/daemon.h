@@ -2,7 +2,6 @@
 #define DBOX_DAEMON_H
 
 #include <stdbool.h>
-#include <sys/types.h>
 
 #include "ctx.h"
 #include "util.h"
@@ -17,7 +16,7 @@
 [[nodiscard]] Error daemon_write_pid(const char *path, Err *err);
 void daemon_remove_pid(const char *path);
 /* daemon_running returns the pid in path when that process is alive. */
-bool daemon_running(const char *path, pid_t *pid);
+bool daemon_running(const char *path, int *pid);
 /* daemon_reload asks the daemon recorded in path to re-read its config; *reloaded is false when none is running. */
 [[nodiscard]] Error daemon_reload(const char *path, bool *reloaded, Err *err);
 
@@ -28,8 +27,5 @@ typedef long (*BacklogFn)(void *arg);
 [[nodiscard]] Error daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backlog, void *arg, Err *err);
 /* daemon_ask fetches the running daemon's backlog from addr; it reports false when no daemon answers there. */
 bool daemon_ask(const char *addr, long *backlog);
-
-/* daemon_raise_file_limit lifts the soft open-file limit to the hard limit. */
-[[nodiscard]] Error daemon_raise_file_limit(Err *err);
 
 #endif

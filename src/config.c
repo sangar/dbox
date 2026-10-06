@@ -1,13 +1,11 @@
 #include "config.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
+#include "platform/platform.h"
 #include "yml.h"
 
 static const char starter_yml[] =
@@ -192,12 +190,13 @@ char *config_default_path(void) {
     const char *env = getenv("DBOX_CONFIG");
     if (env && *env) return xstrdup(env);
     const char *xdg = getenv("XDG_CONFIG_HOME");
-    char *dir = xdg && *xdg ? xstrdup(xdg) : path_join(home_dir(), ".config");
+    char *dir = xdg && *xdg ? xstrdup(xdg) : path_join(env_home(), ".config");
     char *yml = path_join(dir, "dbox/config.yml");
     char *yaml = path_join(dir, "dbox/config.yaml");
     xfree(dir);
-    struct stat st;
-    if (stat(yml, &st) != 0 && errno == ENOENT && stat(yaml, &st) == 0) {
+    FileStat yml_info, yaml_info;
+    bool yml_missing = file_info_follow(yml, &yml_info, NULL) == ERR_OK && !yml_info.exists;
+    if (yml_missing && file_info_follow(yaml, &yaml_info, NULL) == ERR_OK && yaml_info.exists) {
         xfree(yml);
         return yaml;
     }
@@ -206,9 +205,9 @@ char *config_default_path(void) {
 }
 
 Error config_write_starter(const char *path, bool *created, Err *err) {
-    struct stat st;
+    FileStat info;
     *created = false;
-    if (stat(path, &st) == 0) return ERR_OK;
+    if (file_info_follow(path, &info, NULL) == ERR_OK && info.exists) return ERR_OK;
     char *dir = path_dir(path);
     Error e = mkdir_p(dir, 0755, err);
     xfree(dir);
@@ -564,12 +563,10 @@ out:
     return e;
 }
 
-extern char **environ;
-
 Error config_load(const char *path, Config *c, Err *err) {
     StrBuf raw = {0};
     Error e = read_file(path, &raw, err);
-    if (e == ERR_OK) e = config_parse(path, raw.data ? raw.data : "", raw.len, environ, c, err);
+    if (e == ERR_OK) e = config_parse(path, raw.data ? raw.data : "", raw.len, env_all(), c, err);
     sb_free(&raw);
     return e;
 }
@@ -699,9 +696,10 @@ Error config_promote(const char *path, const char *store, Err *err) {
         sb_free(&out);
         out = edited;
     }
-    struct stat st;
-    if (stat(path, &st) != 0) e = err_sys(err, "%s", path);
-    else e = write_file_atomic(path, out.data, out.len, st.st_mode & 0777, err);
+    FileStat info;
+    e = file_info_follow(path, &info, err);
+    if (e == ERR_OK && !info.exists) e = err_set(err, ERR_NOT_FOUND, "%s: no such file", path);
+    if (e == ERR_OK) e = write_file_atomic(path, out.data, out.len, info.mode, err);
     sb_free(&out);
 out:
     arena_free(&a);

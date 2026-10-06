@@ -1,7 +1,6 @@
 #ifndef DBOX_QUEUE_H
 #define DBOX_QUEUE_H
 
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,7 +32,7 @@ char *queue_pop(PathQueue *q, Ctx *ctx, atomic_bool *stop);
  * marked dirty, and the holder is told to run it again when it releases.
  */
 typedef struct {
-    pthread_mutex_t mu;
+    Mutex mu;
     StrMap busy, dirty;
 } PathLocks;
 

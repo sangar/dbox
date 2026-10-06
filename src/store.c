@@ -1,10 +1,10 @@
 #include "store.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+#include "platform/platform.h"
 
 Error store_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Store **out, Err *err) {
     *out = NULL;
@@ -53,9 +53,8 @@ Error temp_file(const char *dir, int *fd, Err *err) {
     Error e = mkdir_p(dir, 0755, err);
     if (e != ERR_OK) return e;
     char *tmpl = path_join(dir, ".dbox-tmp-XXXXXX");
-    *fd = mkstemp(tmpl);
-    if (*fd < 0) e = err_sys(err, "%s", tmpl);
-    else unlink(tmpl);
+    e = file_mkstemp(tmpl, fd, err);
+    if (e == ERR_OK) (void)file_remove(tmpl, NULL);
     xfree(tmpl);
     return e;
 }
@@ -72,8 +71,8 @@ Error store_check(Ctx *ctx, Store *s, Err *err) {
     if (e != ERR_OK) return e;
     Err inner;
     char etag[ETAG_MAX];
-    if (!write_all(fd, content, sizeof content - 1)) {
-        e = err_sys(err, "write probe");
+    if (!file_write_all(fd, content, sizeof content - 1)) {
+        e = err_set(err, ERR_IO, "write probe failed");
     } else if ((e = store_put(s, ctx, key, fd, (int64_t)sizeof content - 1, &meta, etag, &inner)) != ERR_OK) {
         e = err_set(err, e, "write: %s", inner.msg);
     } else {
@@ -83,13 +82,14 @@ Error store_check(Ctx *ctx, Store *s, Err *err) {
             e = err_set(err, e, "read back: %s", inner.msg);
         } else {
             char got[64] = {0};
-            ssize_t n = read(body, got, sizeof got - 1);
-            close(body);
-            if (n < 0) e = err_sys(err, "read back");
+            size_t n;
+            e = file_read(body, got, sizeof got - 1, &n, err);
+            file_close(body);
+            if (e != ERR_OK) e = err_set(err, e, "read back failed");
             else if (strcmp(got, content) != 0) e = err_set(err, ERR_REMOTE, "read back different content than was written");
             else if ((e = store_delete(s, ctx, key, &inner)) != ERR_OK) e = err_set(err, e, "delete: %s", inner.msg);
         }
     }
-    close(fd);
+    file_close(fd);
     return e;
 }

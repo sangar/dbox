@@ -1,11 +1,8 @@
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
+#include "platform/platform.h"
 #include "store.h"
 
 #define DISK_TEMP_PREFIX ".dbox-upload-"
@@ -18,12 +15,12 @@ typedef struct {
 
 static char *object_path(Disk *d, const char *key) { return path_join(d->dir, key); }
 
-static void describe(Object *obj, const char *key, const struct stat *st) {
+static void describe(Object *obj, const char *key, const FileStat *st) {
     memset(obj, 0, sizeof *obj);
     obj->key = key;
-    obj->size = st->st_size;
-    obj->mtime_ns = stat_mtime_ns(st);
-    snprintf(obj->etag, sizeof obj->etag, "%lld-%lld", (long long)st->st_size, (long long)obj->mtime_ns);
+    obj->size = st->size;
+    obj->mtime_ns = st->mtime_ns;
+    snprintf(obj->etag, sizeof obj->etag, "%lld-%lld", (long long)st->size, (long long)obj->mtime_ns);
 }
 
 [[nodiscard]] static Error disk_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
@@ -36,37 +33,25 @@ static void describe(Object *obj, const char *key, const struct stat *st) {
     Error e = mkdir_p(dir, 0755, err);
     if (e != ERR_OK) goto out;
     tmp = path_join(dir, DISK_TEMP_PREFIX "XXXXXX");
-    out = mkstemp(tmp);
-    if (out < 0) {
-        e = err_sys(err, "%s", tmp);
-        goto out;
-    }
-    if (lseek(fd, 0, SEEK_SET) < 0) {
-        e = err_sys(err, "seek");
-        goto out;
-    }
+    if ((e = file_mkstemp(tmp, &out, err)) != ERR_OK) goto out;
+    if ((e = file_seek_start(fd, err)) != ERR_OK) goto out;
     if ((e = copy_fd(fd, out, NULL, &copied, err)) != ERR_OK) goto out;
-    close(out);
+    file_close(out);
     out = -1;
-    if (meta->mtime_ns != 0 && !set_mtime_ns(tmp, meta->mtime_ns)) {
-        e = err_sys(err, "set mtime %s", tmp);
-        goto out;
-    }
-    if (rename(tmp, target) != 0) {
-        e = err_sys(err, "rename %s", target);
-        goto out;
-    }
-    struct stat st;
-    if (stat(target, &st) != 0) {
-        e = err_sys(err, "%s", target);
+    if (meta->mtime_ns != 0 && (e = file_set_mtime(tmp, meta->mtime_ns, err)) != ERR_OK) goto out;
+    if ((e = file_rename(tmp, target, err)) != ERR_OK) goto out;
+    FileStat st;
+    if ((e = file_info_follow(target, &st, err)) != ERR_OK) goto out;
+    if (!st.exists) {
+        e = err_set(err, ERR_IO, "%s: vanished after rename", target);
         goto out;
     }
     Object obj;
     describe(&obj, key, &st);
     memcpy(etag, obj.etag, ETAG_MAX);
 out:
-    if (out >= 0) close(out);
-    if (e != ERR_OK && tmp) unlink(tmp);
+    if (out >= 0) file_close(out);
+    if (e != ERR_OK && tmp) (void)file_remove(tmp, NULL);
     xfree(tmp);
     xfree(dir);
     xfree(target);
@@ -75,21 +60,14 @@ out:
 
 [[nodiscard]] static Error open_object(Disk *d, const char *key, Object *obj, int *fd, Err *err) {
     char *path = object_path(d, key);
-    int f = open(path, O_RDONLY | O_CLOEXEC);
-    Error e = ERR_OK;
-    if (f < 0) {
-        e = errno == ENOENT || errno == ENOTDIR ? ERR_NOT_FOUND : err_sys(err, "%s", path);
-        goto out;
-    }
-    struct stat st;
-    if (fstat(f, &st) != 0) {
-        e = err_sys(err, "%s", path);
-        close(f);
-        goto out;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        close(f);
-        e = ERR_NOT_FOUND;
+    int f;
+    Error e = file_open_read(path, &f, err);
+    if (e != ERR_OK) goto out;
+    FileStat st;
+    e = file_info_fd(f, &st, err);
+    if (e == ERR_OK && !st.is_regular) e = ERR_NOT_FOUND;
+    if (e != ERR_OK) {
+        file_close(f);
         goto out;
     }
     describe(obj, key, &st);
@@ -109,15 +87,15 @@ out:
     sha256_init(&h);
     int64_t copied;
     e = copy_fd(fd, -1, &h, &copied, err);
-    close(fd);
+    file_close(fd);
     if (e == ERR_OK) sha256_hex(&h, obj->sha256);
     return e;
 }
 
 [[nodiscard]] static Error disk_delete(Store *s, Ctx *ctx, const char *key, Err *err) {
     char *path = object_path((Disk *)s, key);
-    Error e = ERR_OK;
-    if (unlink(path) != 0 && errno != ENOENT && errno != ENOTDIR) e = err_sys(err, "%s", path);
+    Error e = file_remove(path, err);
+    if (e == ERR_NOT_FOUND) e = ERR_OK;
     xfree(path);
     return e;
 }
@@ -129,20 +107,18 @@ typedef struct {
 } Listing;
 
 [[nodiscard]] static Error walk(Disk *d, Listing *l, const char *dir, const char *rel, Err *err) {
-    struct dirent **entries;
-    int n = scandir(dir, &entries, NULL, alphasort);
-    if (n < 0) return err_sys(err, "%s", dir);
-    Error e = ERR_OK;
-    for (int i = 0; i < n; i++) {
-        const char *name = entries[i]->d_name;
-        if (e != ERR_OK || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+    StrList names = {0};
+    Error e = dir_list(dir, &names, err);
+    if (e == ERR_NOT_FOUND) e = err_set(err, e, "%s: no such directory", dir);
+    for (size_t i = 0; e == ERR_OK && i < names.len; i++) {
+        const char *name = names.items[i];
         char *path = path_join(dir, name);
         char *key = *rel ? path_join(rel, name) : xstrdup(name);
-        struct stat st;
-        if (lstat(path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
+        FileStat st;
+        if (file_info(path, &st, NULL) == ERR_OK && st.exists) {
+            if (st.is_dir) {
                 e = walk(d, l, path, key, err);
-            } else if (S_ISREG(st.st_mode) && !has_prefix(name, DISK_TEMP_PREFIX)) {
+            } else if (st.is_regular && !has_prefix(name, DISK_TEMP_PREFIX)) {
                 if (l->count == l->cap) l->objects = xrealloc(l->objects, (l->cap = l->cap ? l->cap * 2 : 64) * sizeof *l->objects);
                 describe(&l->objects[l->count++], arena_strdup(l->arena, key), &st);
             }
@@ -150,18 +126,16 @@ typedef struct {
         xfree(key);
         xfree(path);
     }
-    for (int i = 0; i < n; i++) xfree(entries[i]);
-    xfree(entries);
+    strlist_free(&names);
     return e;
 }
 
 [[nodiscard]] static Error disk_list(Store *s, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
     Disk *d = (Disk *)s;
     Listing l = {.arena = a};
-    struct stat st;
-    Error e = ERR_OK;
-    if (stat(d->dir, &st) == 0) e = walk(d, &l, d->dir, "", err);
-    else if (errno != ENOENT) e = err_sys(err, "%s", d->dir);
+    FileStat st;
+    Error e = file_info_follow(d->dir, &st, err);
+    if (e == ERR_OK && st.exists) e = walk(d, &l, d->dir, "", err);
     Object *out = arena_alloc(a, (l.count + 1) * sizeof *out);
     memcpy(out, l.objects, l.count * sizeof *out);
     xfree(l.objects);

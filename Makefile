@@ -3,7 +3,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -g
 override CFLAGS += -std=c23 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE \
            -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter \
-           -pthread -DDBOX_VERSION='"$(VERSION)"'
+           -pthread -Isrc -DDBOX_VERSION='"$(VERSION)"'
 PKG_CONFIG ?= pkg-config
 DEPS     = yaml-0.1 libcurl sqlite3
 override CFLAGS += $(shell $(PKG_CONFIG) --cflags $(DEPS) 2>/dev/null)
@@ -18,9 +18,9 @@ endif
 LDLIBS  += -framework CoreServices
 endif
 
-LIB_SRC = $(filter-out src/main.c,$(wildcard src/*.c))
+LIB_SRC = $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/platform/*.c)
 LIB_OBJ = $(LIB_SRC:src/%.c=build/%.o)
-HEADERS = $(wildcard src/*.h)
+HEADERS = $(wildcard src/*.h) $(wildcard src/platform/*.h)
 
 .PHONY: all test integration sanitize minio run clean
 

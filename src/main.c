@@ -1,13 +1,7 @@
 /* dbox keeps a local folder in sync with S3-compatible stores. */
-#include <errno.h>
-#include <pthread.h>
-#include <signal.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include "config.h"
 #include "ctx.h"
@@ -15,14 +9,13 @@
 #include "engine.h"
 #include "index.h"
 #include "log.h"
+#include "platform/platform.h"
 #include "service.h"
 #include "store.h"
 
 #ifndef DBOX_VERSION
 #define DBOX_VERSION "dev"
 #endif
-
-extern char **environ;
 
 static const char usage_text[] =
     "dbox - keep a folder in sync with S3-compatible stores\n"
@@ -46,10 +39,10 @@ enum { EXIT_USAGE = 2 };
 
 /* Signals is what the signal thread shares with the run it may cancel. */
 typedef struct {
-    pthread_mutex_t mu;
-    sigset_t set;
+    Mutex mu;
     Ctx *current;
-    int pending;
+    bool has_pending;
+    Signal pending;
 } Signals;
 
 /* App is the process-wide state, created in main and passed down. */
@@ -151,44 +144,41 @@ static char *index_path(const Config *cfg) {
 static void *signal_main(void *arg) {
     Signals *s = arg;
     for (;;) {
-        int sig;
-        if (sigwait(&s->set, &sig) != 0) continue;
-        pthread_mutex_lock(&s->mu);
+        Signal sig = signals_wait();
+        mutex_lock(&s->mu);
         s->pending = sig;
+        s->has_pending = true;
         if (s->current) ctx_cancel(s->current);
-        pthread_mutex_unlock(&s->mu);
+        mutex_unlock(&s->mu);
     }
     return NULL;
 }
 
 static void watch_signals(Signals *s) {
-    pthread_mutex_init(&s->mu, NULL);
-    sigemptyset(&s->set);
-    sigaddset(&s->set, SIGINT);
-    sigaddset(&s->set, SIGTERM);
-    sigaddset(&s->set, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &s->set, NULL);
-    pthread_t t;
-    pthread_create(&t, NULL, signal_main, s);
-    pthread_detach(t);
+    mutex_init(&s->mu);
+    signals_block();
+    Thread t;
+    thread_start(&t, signal_main, s);
+    thread_detach(&t);
 }
 
 /* begin_run makes ctx the one signals cancel; it reports false when a stop signal already arrived. */
 static bool begin_run(Signals *s, Ctx *ctx) {
-    pthread_mutex_lock(&s->mu);
-    bool stopped = s->pending == SIGINT || s->pending == SIGTERM;
+    mutex_lock(&s->mu);
+    bool stopped = s->has_pending && s->pending == SIGNAL_STOP;
     if (!stopped) s->current = ctx;
-    pthread_mutex_unlock(&s->mu);
+    mutex_unlock(&s->mu);
     return !stopped;
 }
 
-static int end_run(Signals *s) {
-    pthread_mutex_lock(&s->mu);
+/* end_run forgets the current run and reports whether a reload was asked for, consuming that request. */
+static bool end_run(Signals *s) {
+    mutex_lock(&s->mu);
     s->current = NULL;
-    int sig = s->pending;
-    if (sig == SIGHUP) s->pending = 0;
-    pthread_mutex_unlock(&s->mu);
-    return sig;
+    bool reload = s->has_pending && s->pending == SIGNAL_RELOAD;
+    if (reload) s->has_pending = false;
+    mutex_unlock(&s->mu);
+    return reload;
 }
 
 /* ---- run ---- */
@@ -265,11 +255,11 @@ static void *serve_http(void *arg) {
 
 [[nodiscard]] static Error run_daemon(Engine *e, Index *idx, Ctx *ctx, const Config *cfg, Logger *log, Err *err) {
     ServeArg arg = {.ctx = ctx, .cfg = cfg, .log = log, .running = {cfg, idx, e}};
-    pthread_t http;
-    pthread_create(&http, NULL, serve_http, &arg);
+    Thread http;
+    thread_start(&http, serve_http, &arg);
     Error result = engine_run(e, ctx, err);
     ctx_cancel(ctx);
-    pthread_join(http, NULL);
+    thread_join(&http);
     return result;
 }
 
@@ -312,15 +302,15 @@ static int cmd_run(App *app, int argc, char **argv) {
         rc = EXIT_FAILURE;
         if (config_load(f.config, &cfg, &err) == ERR_OK) {
             char *pid = pid_path(&cfg);
-            pid_t other;
+            int other;
             if (daemon_running(pid, &other) && !f.dry_run) {
-                (void)err_set(&err, ERR_PLATFORM, "the daemon is already syncing this folder (pid %d); stop it before running --once", (int)other);
+                (void)err_set(&err, ERR_PLATFORM, "the daemon is already syncing this folder (pid %d); stop it before running --once", other);
             } else {
                 Ctx ctx;
                 ctx_init(&ctx);
                 begin_run(&app->signals, &ctx);
                 if (with_engine(app, &ctx, &cfg, f.dry_run, run_once, &err) == ERR_OK) rc = EXIT_SUCCESS;
-                end_run(&app->signals);
+                (void)end_run(&app->signals);
                 ctx_destroy(&ctx);
             }
             xfree(pid);
@@ -331,7 +321,7 @@ static int cmd_run(App *app, int argc, char **argv) {
     }
 
     logger_init(&app->log, "info", "text", stderr);
-    if (daemon_raise_file_limit(&err) != ERR_OK) log_warn(&app->log, "raise open file limit", log_err(&err), log_end());
+    if (process_raise_file_limit(&err) != ERR_OK) log_warn(&app->log, "raise open file limit", log_err(&err), log_end());
     for (;;) {
         if (config_load(f.config, &cfg, &err) != ERR_OK) {
             flags_free(&f);
@@ -341,9 +331,9 @@ static int cmd_run(App *app, int argc, char **argv) {
         ctx_init(&ctx);
         Error served = ERR_OK;
         if (begin_run(&app->signals, &ctx)) served = serve(app, &ctx, &cfg, &err);
-        int sig = end_run(&app->signals);
+        bool reload = end_run(&app->signals);
         ctx_destroy(&ctx);
-        if (sig == SIGHUP) {
+        if (reload) {
             log_info(&app->log, "reloading config", log_str("path", cfg.path), log_end());
             if (served != ERR_OK) log_warn(&app->log, "stopped for reload", log_err(&err), log_end());
             config_free(&cfg);
@@ -376,8 +366,8 @@ static int cmd_status(int argc, char **argv) {
     if (loaded != ERR_OK) return fail(&err);
     printf("config:  %s\nroot:    %s\n", cfg.path, cfg.sync.root);
     char *pid = pid_path(&cfg);
-    pid_t running;
-    if (daemon_running(pid, &running)) printf("daemon:  running, pid %d\n", (int)running);
+    int running;
+    if (daemon_running(pid, &running)) printf("daemon:  running, pid %d\n", running);
     else printf("daemon:  not running\n");
     xfree(pid);
     char *unit;
@@ -611,12 +601,9 @@ static int cmd_service(int argc, char **argv) {
     char *script = xmalloc(strlen(editor) + 8);
     sprintf(script, "%s \"$1\"", editor);
     char *argv[] = {"sh", "-c", script, "sh", (char *)path, NULL};
-    pid_t pid;
-    int rc = posix_spawnp(&pid, "sh", NULL, NULL, argv, environ);
-    int status = 0;
-    Error e = ERR_OK;
-    if (!(rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0))
-        e = err_set(err, ERR_PLATFORM, "editor \"%s\": exit status %d", editor, WIFEXITED(status) ? WEXITSTATUS(status) : rc);
+    Err inner;
+    Error e = process_run_interactive(argv, &inner);
+    if (e != ERR_OK) e = err_set(err, e, "editor \"%s\": %s", editor, inner.msg);
     xfree(script);
     return e;
 }

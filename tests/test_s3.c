@@ -1,12 +1,11 @@
 /* The S3 store against the two docker-compose MinIOs; run `make minio` first. */
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "config.h"
 #include "ctx.h"
+#include "platform/platform.h"
 #include "store.h"
 
 /* T is one test run: its counters, the shared context and the staging directory. */
@@ -68,15 +67,15 @@ static int file_with(T *t, const char *content, size_t len) {
     Err err;
     int fd;
     CHECK(temp_file(t->tmp_dir, &fd, &err) == ERR_OK);
-    CHECK(write_all(fd, content, len));
+    CHECK(file_write_all(fd, content, len));
     return fd;
 }
 
 static char *read_fd(int fd) {
     StrBuf sb = {0};
     char buf[4096];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof buf)) > 0) sb_append(&sb, buf, (size_t)n);
+    size_t n;
+    while (file_read(fd, buf, sizeof buf, &n, NULL) == ERR_OK && n > 0) sb_append(&sb, buf, n);
     sb_cstr(&sb);
     return sb.data;
 }
@@ -94,7 +93,7 @@ static void test_round_trip_keeps_metadata(T *t) {
     bool ok = store_put(s, &t->ctx, "dir/a.txt", fd, 5, &meta, etag, &err) == ERR_OK;
     CHECK(ok);
     if (!ok) fprintf(stderr, "put: %s\n", err.msg);
-    close(fd);
+    file_close(fd);
 
     Object head;
     CHECK(store_head(s, &t->ctx, "dir/a.txt", &head, &err) == ERR_OK);
@@ -110,7 +109,7 @@ static void test_round_trip_keeps_metadata(T *t) {
     CHECK_STR(content, "hello");
     CHECK_STR(got.sha256, "abc");
     xfree(content);
-    close(body);
+    file_close(body);
 
     Arena a;
     arena_init(&a, 4096);
@@ -140,14 +139,14 @@ static void test_multipart_copy_between_stores(T *t) {
     CHECK(temp_file(t->tmp_dir, &fd, &err) == ERR_OK);
     static const char chunk[] = "0123456789abcdef";
     bool written = true;
-    for (int64_t i = 0; written && i < size / 16; i++) written = write_all(fd, chunk, 16);
+    for (int64_t i = 0; written && i < size / 16; i++) written = file_write_all(fd, chunk, 16);
     CHECK(written);
     Meta meta = {.sha256 = "big"};
     char etag[ETAG_MAX];
     bool ok = store_put(a, &t->ctx, "big.bin", fd, size, &meta, etag, &err) == ERR_OK;
     CHECK(ok);
     if (!ok) fprintf(stderr, "multipart put: %s\n", err.msg);
-    close(fd);
+    file_close(fd);
     CHECK(strchr(etag, '-') != NULL);
 
     /* A mirror copy takes one store's Get descriptor straight into another's Put. */
@@ -158,7 +157,7 @@ static void test_multipart_copy_between_stores(T *t) {
     ok = store_put(b, &t->ctx, "big.bin", body, size, &meta, etag, &err) == ERR_OK;
     CHECK(ok);
     if (!ok) fprintf(stderr, "copy put: %s\n", err.msg);
-    close(body);
+    file_close(body);
     Object head;
     CHECK(store_head(b, &t->ctx, "big.bin", &head, &err) == ERR_OK);
     CHECK(head.size == size);
@@ -179,7 +178,7 @@ static void test_keys_with_special_characters(T *t) {
     bool ok = store_put(s, &t->ctx, key, fd, 1, &meta, etag, &err) == ERR_OK;
     CHECK(ok);
     if (!ok) fprintf(stderr, "put: %s\n", err.msg);
-    close(fd);
+    file_close(fd);
     Arena a;
     arena_init(&a, 4096);
     Object *list;
@@ -196,11 +195,11 @@ int main(void) {
     T t = {.tmp_dir = "/tmp/dbox-s3-test-XXXXXX"};
     s3_global_init();
     ctx_init(&t.ctx);
-    if (!mkdtemp(t.tmp_dir)) return 1;
+    if (dir_make_temp(t.tmp_dir, NULL) != ERR_OK) return 1;
     test_round_trip_keeps_metadata(&t);
     test_multipart_copy_between_stores(&t);
     test_keys_with_special_characters(&t);
-    rmdir(t.tmp_dir);
+    (void)dir_remove(t.tmp_dir, NULL);
     fprintf(stderr, "%d checks, %d failures\n", t.checks, t.failures);
     return t.failures ? 1 : 0;
 }

@@ -1,7 +1,8 @@
 #include "ignore.h"
 
-#include <fnmatch.h>
 #include <string.h>
+
+#include "platform/platform.h"
 
 void ignore_init(Ignore *m, const char **patterns, size_t count) {
     memset(m, 0, sizeof *m);
@@ -27,7 +28,7 @@ void ignore_free(Ignore *m) {
 
 static bool match_any(const StrList *patterns, const char *name) {
     for (size_t i = 0; i < patterns->len; i++)
-        if (fnmatch(patterns->items[i], name, FNM_PATHNAME) == 0) return true;
+        if (glob_match(patterns->items[i], name)) return true;
     return false;
 }
 

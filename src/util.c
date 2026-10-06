@@ -1,122 +1,11 @@
 #include "util.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
-void sb_grow(StrBuf *sb, size_t extra) {
-    if (sb->len + extra + 1 <= sb->cap) return;
-    size_t cap = sb->cap ? sb->cap : 64;
-    while (cap < sb->len + extra + 1) cap *= 2;
-    sb->data = xrealloc(sb->data, cap);
-    sb->cap = cap;
-}
-
-void sb_append(StrBuf *sb, const char *s, size_t n) {
-    sb_grow(sb, n);
-    memcpy(sb->data + sb->len, s, n);
-    sb->len += n;
-    sb->data[sb->len] = '\0';
-}
-
-void sb_puts(StrBuf *sb, const char *s) { sb_append(sb, s, strlen(s)); }
-
-void sb_putc(StrBuf *sb, char c) { sb_append(sb, &c, 1); }
-
-void sb_printf(StrBuf *sb, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    va_list copy;
-    va_copy(copy, ap);
-    int n = vsnprintf(NULL, 0, fmt, copy);
-    va_end(copy);
-    if (n > 0) {
-        sb_grow(sb, (size_t)n);
-        vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap);
-        sb->len += (size_t)n;
-    }
-    va_end(ap);
-}
-
-void sb_clear(StrBuf *sb) {
-    sb->len = 0;
-    if (sb->data) sb->data[0] = '\0';
-}
-
-const char *sb_cstr(StrBuf *sb) {
-    sb_grow(sb, 0);
-    sb->data[sb->len] = '\0';
-    return sb->data;
-}
-
-void sb_free(StrBuf *sb) {
-    xfree(sb->data);
-    *sb = (StrBuf){0};
-}
-
-void strlist_push_owned(StrList *l, char *s) {
-    if (l->len == l->cap) {
-        l->cap = l->cap ? l->cap * 2 : 8;
-        l->items = xrealloc(l->items, l->cap * sizeof *l->items);
-    }
-    l->items[l->len++] = s;
-}
-
-void strlist_push(StrList *l, const char *s) { strlist_push_owned(l, xstrdup(s)); }
-
-void strlist_clear(StrList *l) {
-    for (size_t i = 0; i < l->len; i++) xfree(l->items[i]);
-    l->len = 0;
-}
-
-void strlist_free(StrList *l) {
-    strlist_clear(l);
-    xfree(l->items);
-    *l = (StrList){0};
-}
-
-bool strlist_contains(const StrList *l, const char *s) {
-    for (size_t i = 0; i < l->len; i++)
-        if (strcmp(l->items[i], s) == 0) return true;
-    return false;
-}
-
-int compare_strings(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
-
-void strlist_sort(StrList *l) { qsort(l->items, l->len, sizeof *l->items, compare_strings); }
-
-int64_t monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
-}
-
-int64_t wall_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
-}
-
-int64_t stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return (int64_t)st->st_mtimespec.tv_sec * NS_PER_SEC + st->st_mtimespec.tv_nsec;
-#else
-    return (int64_t)st->st_mtim.tv_sec * NS_PER_SEC + st->st_mtim.tv_nsec;
-#endif
-}
-
-bool set_mtime_ns(const char *path, int64_t ns) {
-    struct timespec times[2];
-    times[0].tv_sec = times[1].tv_sec = (time_t)(ns / NS_PER_SEC);
-    times[0].tv_nsec = times[1].tv_nsec = (long)(ns % NS_PER_SEC);
-    return utimensat(AT_FDCWD, path, times, 0) == 0;
-}
+#include "platform/platform.h"
 
 /* fraction writes v / 10^digits with trailing zeros removed, like Go's Duration.String. */
 static void fraction(StrBuf *sb, int64_t whole, int64_t frac, int digits) {
@@ -219,33 +108,33 @@ bool has_suffix(const char *s, const char *suffix) {
 
 bool parse_int64(const char *s, int64_t *out) {
     while (*s == ' ') s++;
-    if (!*s) return false;
-    char *end;
-    errno = 0;
-    long long v = strtoll(s, &end, 10);
-    while (*end == ' ') end++;
-    if (errno || *end) return false;
-    *out = v;
+    bool negative = *s == '-';
+    if (*s == '-' || *s == '+') s++;
+    if (*s < '0' || *s > '9') return false;
+    uint64_t magnitude = 0;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        uint64_t digit = (uint64_t)(*s - '0');
+        if (magnitude > (UINT64_MAX - digit) / 10) return false;
+        magnitude = magnitude * 10 + digit;
+    }
+    while (*s == ' ') s++;
+    if (*s) return false;
+    uint64_t limit = negative ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
+    if (magnitude > limit) return false;
+    *out = negative ? (int64_t)(0 - magnitude) : (int64_t)magnitude;
     return true;
 }
 
-const char *home_dir(void) {
-    const char *home = getenv("HOME");
-    if (home && *home) return home;
-    struct passwd *pw = getpwuid(getuid());
-    return pw && pw->pw_dir ? pw->pw_dir : ".";
-}
-
-Error mkdir_p(const char *path, mode_t mode, Err *err) {
+Error mkdir_p(const char *path, unsigned mode, Err *err) {
     char *p = xstrdup(path);
     Error e = ERR_OK;
     for (char *s = p + 1; e == ERR_OK && *s; s++) {
         if (*s != '/') continue;
         *s = '\0';
-        if (mkdir(p, mode) != 0 && errno != EEXIST) e = err_sys(err, "mkdir %s", p);
+        e = dir_create(p, mode, err);
         *s = '/';
     }
-    if (e == ERR_OK && mkdir(p, mode) != 0 && errno != EEXIST) e = err_sys(err, "mkdir %s", p);
+    if (e == ERR_OK) e = dir_create(p, mode, err);
     xfree(p);
     return e;
 }
@@ -278,8 +167,8 @@ const char *path_ext(const char *path) {
 }
 
 char *expand_home(const char *path) {
-    if (strcmp(path, "~") == 0) return xstrdup(home_dir());
-    if (has_prefix(path, "~/")) return path_join(home_dir(), path + 2);
+    if (strcmp(path, "~") == 0) return xstrdup(env_home());
+    if (has_prefix(path, "~/")) return path_join(env_home(), path + 2);
     return xstrdup(path);
 }
 
@@ -296,45 +185,34 @@ char *rel_path(const char *root, const char *path) {
 }
 
 bool is_dir(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    FileStat info;
+    return file_info_follow(path, &info, NULL) == ERR_OK && info.is_dir;
 }
 
 Error read_file(const char *path, StrBuf *out, Err *err) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return err_sys(err, "%s", path);
+    int fd;
+    Error e = file_open_read(path, &fd, err);
+    if (e == ERR_NOT_FOUND) return err_set(err, e, "%s: no such file", path);
+    if (e != ERR_OK) return e;
     char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) sb_append(out, buf, n);
-    Error e = ferror(f) ? err_set(err, ERR_IO, "%s: read error", path) : ERR_OK;
-    fclose(f);
+    while ((e = file_read(fd, buf, sizeof buf, &n, err)) == ERR_OK && n > 0) sb_append(out, buf, n);
+    if (e != ERR_OK) e = err_set(err, e, "%s: read error", path);
+    file_close(fd);
     sb_cstr(out);
     return e;
 }
 
-bool write_all(int fd, const void *data, size_t len) {
-    const char *p = data;
-    while (len > 0) {
-        ssize_t w = write(fd, p, len);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += w;
-        len -= (size_t)w;
-    }
-    return true;
-}
-
-Error write_file(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
-    if (fd < 0) return err_sys(err, "%s", path);
-    Error e = write_all(fd, data, len) ? ERR_OK : err_sys(err, "%s", path);
-    close(fd);
+Error write_file(const char *path, const void *data, size_t len, unsigned mode, Err *err) {
+    int fd;
+    Error e = file_create(path, mode, &fd, err);
+    if (e != ERR_OK) return e;
+    if (!file_write_all(fd, data, len)) e = err_set(err, ERR_IO, "%s: write error", path);
+    file_close(fd);
     return e;
 }
 
-Error write_file_atomic(const char *path, const void *data, size_t len, mode_t mode, Err *err) {
+Error write_file_atomic(const char *path, const void *data, size_t len, unsigned mode, Err *err) {
     char *dir = path_dir(path);
     Error e = mkdir_p(dir, 0755, err);
     xfree(dir);
@@ -345,16 +223,8 @@ Error write_file_atomic(const char *path, const void *data, size_t len, mode_t m
     tmp = xrealloc(tmp, n + 5);
     memcpy(tmp + n, ".tmp", 5);
     e = write_file(tmp, data, len, mode, err);
-    if (e == ERR_OK && rename(tmp, path) != 0) e = err_sys(err, "rename %s", path);
-    if (e != ERR_OK) unlink(tmp);
+    if (e == ERR_OK) e = file_rename(tmp, path, err);
+    if (e != ERR_OK) (void)file_remove(tmp, NULL);
     xfree(tmp);
     return e;
-}
-
-const char *short_hostname(char buf[256]) {
-    if (gethostname(buf, 256) != 0) buf[0] = '\0';
-    buf[255] = '\0';
-    char *dot = strchr(buf, '.');
-    if (dot && dot != buf) *dot = '\0';
-    return buf;
 }

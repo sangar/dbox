@@ -2,14 +2,28 @@
 
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "watch.h"
+#include "alloc.h"
+#include "platform.h"
+
+Os os_current(void) { return OS_DARWIN; }
+
+char *process_executable_path(void) {
+    char buf[PATH_MAX];
+    uint32_t size = sizeof buf;
+    if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
+    char *resolved = path_resolve(buf);
+    return resolved ? resolved : xstrdup(buf);
+}
 
 /* FSEvents watches the whole tree and reports per-file events on a dispatch queue. */
 struct WatchBackend {
-    Watcher *watcher;
+    WatchEventFn fn;
+    void *user;
     FSEventStreamRef stream;
     dispatch_queue_t dispatch;
 };
@@ -20,14 +34,15 @@ static void on_events(ConstFSEventStreamRef stream, void *info, size_t count, vo
     char **list = paths;
     for (size_t i = 0; i < count; i++) {
         bool rescan = (flags[i] & kFSEventStreamEventFlagMustScanSubDirs) != 0;
-        watcher_event(b->watcher, list[i], rescan);
+        b->fn(b->user, list[i], rescan);
     }
 }
 
-Error backend_open(Watcher *w, const char *root, WatchBackend **out, Err *err) {
+Error watch_backend_open(const char *root, WatchEventFn fn, void *user, WatchBackend **out, Err *err) {
     *out = NULL;
     WatchBackend *b = xcalloc(1, sizeof *b);
-    b->watcher = w;
+    b->fn = fn;
+    b->user = user;
     CFStringRef s = CFStringCreateWithCString(NULL, root, kCFStringEncodingUTF8);
     CFArrayRef paths = CFArrayCreate(NULL, (const void **)&s, 1, &kCFTypeArrayCallBacks);
     CFRelease(s);
@@ -52,19 +67,15 @@ Error backend_open(Watcher *w, const char *root, WatchBackend **out, Err *err) {
     return ERR_OK;
 }
 
-Error backend_add_dir(WatchBackend *b, const char *path, Err *err) { return ERR_OK; }
+Error watch_backend_add_dir(WatchBackend *b, const char *path, Err *err) { return ERR_OK; }
 
-void backend_run(WatchBackend *b, Ctx *ctx) {
-    ctx_lock(ctx);
-    while (ctx_wait(ctx, 0)) {
-    }
-    ctx_unlock(ctx);
-}
+/* Events arrive on the dispatch queue, so polling only has to pass the time. */
+void watch_backend_poll(WatchBackend *b, int timeout_ms) { sleep_ms(timeout_ms); }
 
 /* Running an empty block on the serial queue waits out a callback still in flight. */
 static void drain_nothing(void *ctx) {}
 
-void backend_close(WatchBackend *b) {
+void watch_backend_close(WatchBackend *b) {
     FSEventStreamStop(b->stream);
     FSEventStreamInvalidate(b->stream);
     FSEventStreamRelease(b->stream);

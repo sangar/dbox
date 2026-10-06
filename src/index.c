@@ -1,13 +1,14 @@
 #include "index.h"
 
-#include <pthread.h>
+#include "platform/platform.h"
+
 #include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct Index {
     sqlite3 *db;
-    pthread_mutex_t mu; /* one operation or transaction at a time */
+    Mutex mu; /* one operation or transaction at a time */
 };
 
 static const char schema[] =
@@ -61,7 +62,7 @@ Error index_open(const char *path, Index **out, Err *err) {
     xfree(dir);
     if (e != ERR_OK) return e;
     Index *x = xcalloc(1, sizeof *x);
-    pthread_mutex_init(&x->mu, NULL);
+    mutex_init(&x->mu);
     if (sqlite3_open_v2(path, &x->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         e = err_set(err, ERR_IO, "%s: %s", path, x->db ? sqlite3_errmsg(x->db) : "cannot open");
         sqlite3_close(x->db);
@@ -85,7 +86,7 @@ Error index_open(const char *path, Index **out, Err *err) {
 void index_close(Index *x) {
     if (!x) return;
     sqlite3_close(x->db);
-    pthread_mutex_destroy(&x->mu);
+    mutex_destroy(&x->mu);
     xfree(x);
 }
 
@@ -137,8 +138,8 @@ static const char *column_text(Arena *a, sqlite3_stmt *stmt, int col) {
     return arena_strdup(a, v ? (const char *)v : "");
 }
 
-static void lock(Index *x) { pthread_mutex_lock(&x->mu); }
-static void unlock(Index *x) { pthread_mutex_unlock(&x->mu); }
+static void lock(Index *x) { mutex_lock(&x->mu); }
+static void unlock(Index *x) { mutex_unlock(&x->mu); }
 
 /* ---- files ---- */
 

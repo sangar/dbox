@@ -1,17 +1,12 @@
 #include "engine.h"
 
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "engine_internal.h"
+#include "platform/platform.h"
 #include "watch.h"
 
 static void on_debounced(void *ctx, const char *key) {
@@ -32,7 +27,7 @@ Engine *engine_new(const Config *cfg, Index *idx, const StoreSet *stores, Engine
         e->log = &e->own_log;
     }
     e->dry_run = opts.dry_run;
-    short_hostname(e->host);
+    host_short_name(e->host);
     ignore_init(&e->ignore, cfg->sync.ignore, cfg->sync.ignore_count);
     e->primary_name = config_primary(cfg);
     e->primary = e->primary_name ? storeset_get(stores, e->primary_name) : NULL;
@@ -92,9 +87,9 @@ void run_workers(Engine *e, int workers, void **items, size_t count, void (*fn)(
     Work w = {.e = e, .items = items, .count = count, .fn = fn};
     atomic_init(&w.next, 0);
     size_t n = min_size((size_t)(workers > 1 ? workers : 1), count);
-    pthread_t *threads = xcalloc(n + 1, sizeof *threads);
-    for (size_t i = 0; i < n; i++) pthread_create(&threads[i], NULL, work_main, &w);
-    for (size_t i = 0; i < n; i++) pthread_join(threads[i], NULL);
+    Thread *threads = xcalloc(n + 1, sizeof *threads);
+    for (size_t i = 0; i < n; i++) thread_start(&threads[i], work_main, &w);
+    for (size_t i = 0; i < n; i++) thread_join(&threads[i]);
     xfree(threads);
 }
 
@@ -104,18 +99,17 @@ static int primary_workers(const Engine *e) { return config_store(e->cfg, e->pri
 
 Error engine_local(Engine *e, const char *rel, const IndexFile *f, LocalFile *out, Err *err) {
     char *abs = engine_abs(e, rel);
-    struct stat st;
+    FileStat st;
     memset(out, 0, sizeof *out);
-    Error result = ERR_OK;
-    if (lstat(abs, &st) != 0) {
-        if (errno != ENOENT && errno != ENOTDIR) result = err_sys(err, "%s", abs);
+    Error result = file_info(abs, &st, err);
+    if (result != ERR_OK || !st.exists) {
         xfree(abs);
         return result;
     }
     out->exists = true;
     out->changed = true;
-    out->size = st.st_size;
-    out->mtime_ns = stat_mtime_ns(&st);
+    out->size = st.size;
+    out->mtime_ns = st.mtime_ns;
     if (f && f->size == out->size && f->mtime_ns == out->mtime_ns) {
         out->changed = false;
     } else if (f) {
@@ -130,7 +124,7 @@ Error engine_local(Engine *e, const char *rel, const IndexFile *f, LocalFile *ou
 
 /* ---- pushing to the primary ---- */
 
-[[nodiscard]] static Error upload(Engine *e, const char *rel, const char *sum, const struct stat *info, Err *err);
+[[nodiscard]] static Error upload(Engine *e, const char *rel, const char *sum, const FileStat *info, Err *err);
 
 /*
  * upload sends rel, whose content hashed to sum when it looked like info, to
@@ -138,40 +132,41 @@ Error engine_local(Engine *e, const char *rel, const IndexFile *f, LocalFile *ou
  * path is queued again, so the index never describes a version other than
  * the one the primary holds.
  */
-[[nodiscard]] static Error upload(Engine *e, const char *rel, const char *sum, const struct stat *info, Err *err) {
+[[nodiscard]] static Error upload(Engine *e, const char *rel, const char *sum, const FileStat *info, Err *err) {
     if (e->dry_run) {
         log_info(e->log, "would upload", log_str("path", rel), log_str("store", e->primary_name), log_end());
         return ERR_OK;
     }
     char *abs = engine_abs(e, rel);
-    int fd = open(abs, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        Error result = err_sys(err, "%s", abs);
+    int fd;
+    Error result = file_open_read(abs, &fd, err);
+    if (result != ERR_OK) {
+        if (result == ERR_NOT_FOUND) result = err_set(err, result, "%s: no such file", abs);
         xfree(abs);
         return result;
     }
-    Meta meta = {.mtime_ns = stat_mtime_ns(info)};
+    Meta meta = {.mtime_ns = info->mtime_ns};
     snprintf(meta.sha256, sizeof meta.sha256, "%s", sum);
     char etag[ETAG_MAX];
     Err inner;
-    Error result = store_put(e->primary, e->ctx, rel, fd, info->st_size, &meta, etag, &inner);
-    close(fd);
+    result = store_put(e->primary, e->ctx, rel, fd, info->size, &meta, etag, &inner);
+    file_close(fd);
     if (result != ERR_OK) {
         xfree(abs);
         return err_set(err, result, "upload to %s: %s", e->primary_name, inner.msg);
     }
-    struct stat after;
-    bool unchanged = lstat(abs, &after) == 0 && after.st_size == info->st_size && stat_mtime_ns(&after) == stat_mtime_ns(info);
+    FileStat after;
+    bool unchanged = file_info(abs, &after, NULL) == ERR_OK && after.exists && after.size == info->size && after.mtime_ns == info->mtime_ns;
     xfree(abs);
     if (!unchanged) {
         log_info(e->log, "changed during upload; syncing again", log_str("path", rel), log_end());
         queue_push(&e->queue, e->ctx, rel);
         return ERR_OK;
     }
-    IndexFile record = {.path = rel, .size = info->st_size, .mtime_ns = stat_mtime_ns(info), .sha256 = sum};
+    IndexFile record = {.path = rel, .size = info->size, .mtime_ns = info->mtime_ns, .sha256 = sum};
     result = index_record_synced(e->idx, &record, e->primary_name, etag, e->mirror_names, e->mirror_count, err);
     if (result != ERR_OK) return result;
-    log_info(e->log, "uploaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", info->st_size), log_end());
+    log_info(e->log, "uploaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", info->size), log_end());
     engine_wake_mirrors(e);
     return ERR_OK;
 }
@@ -217,14 +212,17 @@ out:
 /* push makes the primary match the local file at rel. */
 [[nodiscard]] static Error push(Engine *e, const char *rel, Err *err) {
     char *abs = engine_abs(e, rel);
-    struct stat st;
-    if (lstat(abs, &st) != 0) {
-        bool missing = errno == ENOENT || errno == ENOTDIR;
-        Error result = missing ? ERR_OK : err_sys(err, "%s", abs);
+    FileStat st;
+    Error result = file_info(abs, &st, err);
+    if (result != ERR_OK) {
         xfree(abs);
-        return missing ? push_delete(e, rel, err) : result;
+        return result;
     }
-    if (!S_ISREG(st.st_mode)) {
+    if (!st.exists) {
+        xfree(abs);
+        return push_delete(e, rel, err);
+    }
+    if (!st.is_regular) {
         xfree(abs);
         return ERR_OK;
     }
@@ -232,7 +230,7 @@ out:
     arena_init(&a, 4096);
     IndexFile f;
     bool found;
-    Error result = index_file(e->idx, &a, rel, &f, &found, err);
+    result = index_file(e->idx, &a, rel, &f, &found, err);
     bool primary_current = false;
     if (result == ERR_OK && found && !f.deleted) {
         Replica r;
@@ -240,10 +238,10 @@ out:
         result = index_replica(e->idx, &a, rel, e->primary_name, &r, &has_replica, err);
         primary_current = result == ERR_OK && has_replica && r.state == REPLICA_VERIFIED;
     }
-    if (result == ERR_OK && !(primary_current && f.size == st.st_size && f.mtime_ns == stat_mtime_ns(&st))) {
+    if (result == ERR_OK && !(primary_current && f.size == st.size && f.mtime_ns == st.mtime_ns)) {
         char sum[SHA256_HEX_LEN];
         result = sha256_file(abs, sum, err);
-        if (result == ERR_OK && primary_current && strcmp(f.sha256, sum) == 0) result = index_touch(e->idx, rel, stat_mtime_ns(&st), err);
+        if (result == ERR_OK && primary_current && strcmp(f.sha256, sum) == 0) result = index_touch(e->idx, rel, st.mtime_ns, err);
         else if (result == ERR_OK) result = upload(e, rel, sum, &st, err);
     }
     arena_free(&a);
@@ -304,22 +302,16 @@ static void *primary_worker(void *arg) {
 
 /* walk collects the relative paths of every regular file under dir that is not ignored. */
 [[nodiscard]] static Error walk(Engine *e, const char *dir, StrList *paths, Err *err) {
-    DIR *d = opendir(dir);
-    if (!d) return err_sys(err, "%s", dir);
     StrList names = {0};
-    struct dirent *entry;
-    while ((entry = readdir(d)))
-        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) strlist_push(&names, entry->d_name);
-    closedir(d);
-    strlist_sort(&names);
-    Error result = ERR_OK;
+    Error result = dir_list(dir, &names, err);
+    if (result == ERR_NOT_FOUND) result = err_set(err, result, "%s: no such directory", dir);
     for (size_t i = 0; result == ERR_OK && i < names.len; i++) {
         char *p = path_join(dir, names.items[i]);
         char *rel = rel_path(e->root, p);
-        struct stat st;
-        if (rel && lstat(p, &st) == 0 && !ignore_match(&e->ignore, rel, S_ISDIR(st.st_mode))) {
-            if (S_ISDIR(st.st_mode)) result = walk(e, p, paths, err);
-            else if (S_ISREG(st.st_mode)) strlist_push(paths, rel);
+        FileStat st;
+        if (rel && file_info(p, &st, NULL) == ERR_OK && st.exists && !ignore_match(&e->ignore, rel, st.is_dir)) {
+            if (st.is_dir) result = walk(e, p, paths, err);
+            else if (st.is_regular) strlist_push(paths, rel);
         }
         xfree(rel);
         xfree(p);
@@ -393,41 +385,32 @@ static void *primary_worker(void *arg) {
     int out = -1;
     int64_t copied;
     if ((result = mkdir_p(tmp_dir, 0755, err)) != ERR_OK) goto done;
-    out = mkstemp(tmp);
-    if (out < 0) {
-        result = err_sys(err, "%s", tmp);
-        goto done;
-    }
+    if ((result = file_mkstemp(tmp, &out, err)) != ERR_OK) goto done;
     Sha256 h;
     sha256_init(&h);
     if ((result = copy_fd(body, out, &h, &copied, err)) != ERR_OK) goto done;
-    close(out);
+    file_close(out);
     out = -1;
-    if (obj.mtime_ns != 0 && !set_mtime_ns(tmp, obj.mtime_ns)) {
-        result = err_sys(err, "set mtime %s", tmp);
-        goto done;
-    }
-    struct stat st;
-    if (stat(tmp, &st) != 0) {
-        result = err_sys(err, "%s", tmp);
+    if (obj.mtime_ns != 0 && (result = file_set_mtime(tmp, obj.mtime_ns, err)) != ERR_OK) goto done;
+    FileStat st;
+    if ((result = file_info_follow(tmp, &st, err)) != ERR_OK) goto done;
+    if (!st.exists) {
+        result = err_set(err, ERR_IO, "%s: vanished", tmp);
         goto done;
     }
     if (record) {
         char sum[SHA256_HEX_LEN];
         sha256_hex(&h, sum);
-        IndexFile f = {.path = rel, .size = st.st_size, .mtime_ns = stat_mtime_ns(&st), .sha256 = sum};
+        IndexFile f = {.path = rel, .size = st.size, .mtime_ns = st.mtime_ns, .sha256 = sum};
         if ((result = index_record_synced(e->idx, &f, e->primary_name, obj.etag, e->mirror_names, e->mirror_count, err)) != ERR_OK) goto done;
     }
     if ((result = mkdir_p(parent, 0755, err)) != ERR_OK) goto done;
-    if (rename(tmp, abs) != 0) {
-        result = err_sys(err, "rename %s", abs);
-        goto done;
-    }
-    log_info(e->log, "downloaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", st.st_size), log_end());
+    if ((result = file_rename(tmp, abs, err)) != ERR_OK) goto done;
+    log_info(e->log, "downloaded", log_str("path", rel), log_str("store", e->primary_name), log_int("bytes", st.size), log_end());
 done:
-    if (out >= 0) close(out);
-    if (result != ERR_OK) unlink(tmp);
-    close(body);
+    if (out >= 0) file_close(out);
+    if (result != ERR_OK) (void)file_remove(tmp, NULL);
+    file_close(body);
     xfree(parent);
     xfree(abs);
     xfree(tmp);
@@ -457,14 +440,12 @@ done:
     log_warn(e->log, "conflict: kept local version, saved remote beside it", log_str("path", rel), log_str("copy", copy_name), log_end());
     queue_push(&e->queue, e->ctx, copy_name);
     char *abs = engine_abs(e, rel);
-    struct stat st;
+    FileStat st;
     char sum[SHA256_HEX_LEN];
-    if (lstat(abs, &st) != 0) {
-        result = err_sys(err, "%s", abs);
-    } else {
-        result = sha256_file(abs, sum, err);
-        if (result == ERR_OK) result = upload(e, rel, sum, &st, err);
-    }
+    result = file_info(abs, &st, err);
+    if (result == ERR_OK && !st.exists) result = err_set(err, ERR_NOT_FOUND, "%s: no such file", abs);
+    if (result == ERR_OK) result = sha256_file(abs, sum, err);
+    if (result == ERR_OK) result = upload(e, rel, sum, &st, err);
     xfree(abs);
 out:
     sb_free(&copy);
@@ -559,7 +540,8 @@ out:
         goto out;
     }
     char *abs = engine_abs(e, f->path);
-    if (unlink(abs) != 0 && errno != ENOENT) result = err_sys(err, "%s", abs);
+    result = file_remove(abs, err);
+    if (result == ERR_NOT_FOUND) result = ERR_OK;
     xfree(abs);
     if (result != ERR_OK) goto out;
     log_info(e->log, "deleted locally, gone from primary", log_str("path", f->path), log_end());
@@ -733,17 +715,17 @@ static bool ignore_cb(void *ctx, const char *rel, bool is_dir) { return ignore_m
 static void changed_cb(void *ctx, const char *rel) { debounce_trigger(((Engine *)ctx)->debouncer, rel); }
 
 typedef struct {
-    pthread_t *threads;
+    Thread *threads;
     size_t count, cap;
 } Threads;
 
 static void start(Threads *t, void *(*fn)(void *), void *arg) {
     if (t->count == t->cap) t->threads = xrealloc(t->threads, (t->cap = t->cap ? t->cap * 2 : 8) * sizeof *t->threads);
-    pthread_create(&t->threads[t->count++], NULL, fn, arg);
+    thread_start(&t->threads[t->count++], fn, arg);
 }
 
 static void join_all(Threads *t) {
-    for (size_t i = 0; i < t->count; i++) pthread_join(t->threads[i], NULL);
+    for (size_t i = 0; i < t->count; i++) thread_join(&t->threads[i]);
     xfree(t->threads);
     memset(t, 0, sizeof *t);
 }

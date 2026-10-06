@@ -1,10 +1,11 @@
 #ifndef DBOX_CTX_H
 #define DBOX_CTX_H
 
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "platform/platform.h"
 
 /*
  * Ctx is a cancellation token shared by every thread of one run. Cancelling
@@ -14,8 +15,8 @@
  */
 typedef struct {
     atomic_bool done;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    Mutex mu;
+    Cond cv;
 } Ctx;
 
 void ctx_init(Ctx *c);

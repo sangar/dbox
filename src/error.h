@@ -24,7 +24,5 @@ const char *error_name(Error e);
 
 /* err_set records the message for err, when given, and returns code so a caller can `return err_set(...)`. */
 [[nodiscard]] Error err_set(Err *err, Error code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
-/* err_sys appends ": strerror(errno)" to the message and maps errno: ENOENT becomes ERR_NOT_FOUND, anything else ERR_IO. */
-[[nodiscard]] Error err_sys(Err *err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 #endif

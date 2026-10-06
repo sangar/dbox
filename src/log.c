@@ -10,10 +10,10 @@ void logger_init(Logger *l, const char *level, const char *format, FILE *out) {
     if (level && strcmp(level, "error") == 0) l->level = LOG_ERROR;
     l->json = format && strcmp(format, "json") == 0;
     l->out = out;
-    pthread_mutex_init(&l->mu, NULL);
+    mutex_init(&l->mu);
 }
 
-void logger_destroy(Logger *l) { pthread_mutex_destroy(&l->mu); }
+void logger_destroy(Logger *l) { mutex_destroy(&l->mu); }
 
 static const char *level_name(LogLevel level) {
     switch (level) {
@@ -100,10 +100,10 @@ static void log_vat(Logger *l, LogLevel level, const char *msg, va_list ap) {
         }
         sb_putc(&sb, '\n');
     }
-    pthread_mutex_lock(&l->mu);
+    mutex_lock(&l->mu);
     fputs(sb_cstr(&sb), l->out);
     fflush(l->out);
-    pthread_mutex_unlock(&l->mu);
+    mutex_unlock(&l->mu);
     sb_free(&sb);
 }
 

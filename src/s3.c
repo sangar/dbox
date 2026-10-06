@@ -7,16 +7,13 @@
  */
 #include <ctype.h>
 #include <curl/curl.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-#include <unistd.h>
 
+#include "platform/platform.h"
 #include "store.h"
 
 #define META_SHA256 "x-amz-meta-sha256"
@@ -219,10 +216,10 @@ static size_t read_body(char *buf, size_t size, size_t nitems, void *userdata) {
     }
     int64_t remaining = src->len - src->pos;
     if (remaining <= 0) return 0;
-    ssize_t n = pread(src->fd, buf, min_size(want, (size_t)remaining), src->off + src->pos);
-    if (n < 0) return CURL_READFUNC_ABORT;
-    src->pos += n;
-    return (size_t)n;
+    size_t n;
+    if (file_pread(src->fd, buf, min_size(want, (size_t)remaining), src->off + src->pos, &n, NULL) != ERR_OK) return CURL_READFUNC_ABORT;
+    src->pos += (int64_t)n;
+    return n;
 }
 
 static int seek_body(void *userdata, curl_off_t offset, int origin) {
@@ -245,7 +242,7 @@ static size_t write_body(char *data, size_t size, size_t nmemb, void *userdata) 
     long status = 0;
     curl_easy_getinfo(sink->curl, CURLINFO_RESPONSE_CODE, &status);
     if (status >= 200 && status < 300 && sink->sink_fd >= 0) {
-        if (!write_all(sink->sink_fd, data, n)) {
+        if (!file_write_all(sink->sink_fd, data, n)) {
             sink->failed = true;
             return 0;
         }
@@ -446,7 +443,7 @@ static bool retryable(CURLcode code, long status) {
     *code = curl_easy_perform(curl);
     Error e = ERR_OK;
     if (*code == CURLE_OK && !sink.failed) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
-    else if (sink.failed) e = err_sys(err, "write download");
+    else if (sink.failed) e = err_set(err, ERR_IO, "write download failed");
     else if (*code == CURLE_ABORTED_BY_CALLBACK) e = err_set(err, ERR_CANCELLED, "cancelled");
     else e = err_set(err, ERR_REMOTE, "%s %s: %s", req->method, sb_cstr(&url), curl_easy_strerror(*code));
     curl_easy_cleanup(curl);
@@ -471,8 +468,8 @@ static void response_free(Response *r) { sb_free(&r->body); }
         if (attempt > 0) {
             if (!ctx_sleep(ctx, backoff_ms[attempt])) return err_set(err, ERR_CANCELLED, "cancelled");
             if (req->sink_fd >= 0) {
-                lseek(req->sink_fd, 0, SEEK_SET);
-                if (ftruncate(req->sink_fd, 0) != 0) return err_sys(err, "truncate download");
+                Error truncated = file_truncate(req->sink_fd, err);
+                if (truncated != ERR_OK) return truncated;
             }
         }
         CURLcode code;
@@ -619,14 +616,14 @@ static void describe(Object *obj, const char *key, const Response *resp) {
     if (e == ERR_OK) {
         if (ok_status(resp.status)) {
             describe(obj, key, &resp);
-            if (resp.content_length < 0) obj->size = lseek(tmp, 0, SEEK_CUR);
-            lseek(tmp, 0, SEEK_SET);
+            if (resp.content_length < 0) obj->size = file_position(tmp);
+            (void)file_seek_start(tmp, NULL);
             *fd = tmp;
         } else {
             e = fail_status(&req, &resp, err);
         }
     }
-    if (e != ERR_OK) close(tmp);
+    if (e != ERR_OK) file_close(tmp);
     response_free(&resp);
     return e;
 }
@@ -750,7 +747,7 @@ static const StoreOps s3_ops = {s3_put, s3_get, s3_head, s3_delete, s3_list, s3_
 /* credentials_file reads ~/.aws/credentials for the profile and returns whether it had keys. */
 static bool credentials_file(const char *profile, char **access, char **secret, char **token) {
     const char *custom = getenv("AWS_SHARED_CREDENTIALS_FILE");
-    char *path = custom && *custom ? xstrdup(custom) : path_join(home_dir(), ".aws/credentials");
+    char *path = custom && *custom ? xstrdup(custom) : path_join(env_home(), ".aws/credentials");
     StrBuf raw = {0};
     Err ignored;
     Error e = read_file(path, &raw, &ignored);

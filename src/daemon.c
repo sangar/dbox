@@ -1,30 +1,23 @@
 #include "daemon.h"
 
 #include <curl/curl.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+
+#include "platform/platform.h"
 
 Error daemon_write_pid(const char *path, Err *err) {
-    pid_t pid;
-    if (daemon_running(path, &pid)) return err_set(err, ERR_PLATFORM, "dbox is already running as pid %d", (int)pid);
+    int pid;
+    if (daemon_running(path, &pid)) return err_set(err, ERR_PLATFORM, "dbox is already running as pid %d", pid);
     char line[32];
-    snprintf(line, sizeof line, "%d\n", (int)getpid());
+    snprintf(line, sizeof line, "%d\n", process_id());
     return write_file(path, line, strlen(line), 0644, err);
 }
 
-void daemon_remove_pid(const char *path) { unlink(path); }
+void daemon_remove_pid(const char *path) { (void)file_remove(path, NULL); }
 
-bool daemon_running(const char *path, pid_t *pid) {
+bool daemon_running(const char *path, int *pid) {
     StrBuf raw = {0};
     Err ignored;
     if (read_file(path, &raw, &ignored) != ERR_OK) return false;
@@ -33,69 +26,36 @@ bool daemon_running(const char *path, pid_t *pid) {
     bool ok = end != raw.data && n > 0;
     sb_free(&raw);
     if (!ok) return false;
-    if (kill((pid_t)n, 0) != 0 && errno != EPERM) return false;
-    *pid = (pid_t)n;
+    if (!process_alive((int)n)) return false;
+    *pid = (int)n;
     return true;
 }
 
 Error daemon_reload(const char *path, bool *reloaded, Err *err) {
-    pid_t pid;
+    int pid;
     *reloaded = daemon_running(path, &pid);
     if (!*reloaded) return ERR_OK;
-    if (kill(pid, SIGHUP) != 0) return err_set(err, ERR_PLATFORM, "signal pid %d: %s", (int)pid, strerror(errno));
-    return ERR_OK;
+    return process_signal_reload(pid, err);
 }
 
 /* ---- the listener ---- */
 
-[[nodiscard]] static Error listen_on(const char *addr, int *out, Err *err) {
-    *out = -1;
-    const char *colon = strrchr(addr, ':');
-    if (!colon) return err_set(err, ERR_INVALID_ARGUMENT, "listen %s: want host:port", addr);
-    char *host = xstrndup(addr, (size_t)(colon - addr));
-    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE | AI_NUMERICSERV};
-    struct addrinfo *res;
-    int rc = getaddrinfo(*host ? host : NULL, colon + 1, &hints, &res);
-    xfree(host);
-    if (rc != 0) return err_set(err, ERR_PLATFORM, "listen %s: %s", addr, gai_strerror(rc));
-    int fd = -1;
-    Error e = ERR_OK;
-    for (struct addrinfo *ai = res; ai && fd < 0; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        fcntl(fd, F_SETFD, FD_CLOEXEC);
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0 || listen(fd, 16) != 0) {
-            e = err_set(err, ERR_PLATFORM, "listen %s: %s", addr, strerror(errno));
-            close(fd);
-            fd = -1;
-        }
-    }
-    freeaddrinfo(res);
-    if (fd < 0) return e != ERR_OK ? e : err_set(err, ERR_PLATFORM, "listen %s: no usable address", addr);
-    *out = fd;
-    return ERR_OK;
-}
-
 static void respond(int client, int status, const char *reason, const char *content_type, const char *body, size_t len) {
     StrBuf head = {0};
     sb_printf(&head, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", status, reason, content_type, len);
-    write_all(client, head.data, head.len);
-    write_all(client, body, len);
+    file_write_all(client, head.data, head.len);
+    file_write_all(client, body, len);
     sb_free(&head);
 }
 
 static void handle(int client, MetricsFn metrics, BacklogFn backlog, void *arg) {
-    struct timeval timeout = {.tv_sec = 5};
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+    net_set_timeouts(client, 5);
     char req[8192];
     size_t n = 0;
     while (n < sizeof req - 1) {
-        ssize_t r = read(client, req + n, sizeof req - 1 - n);
-        if (r <= 0) break;
-        n += (size_t)r;
+        size_t r;
+        if (file_read(client, req + n, sizeof req - 1 - n, &r, NULL) != ERR_OK || r == 0) break;
+        n += r;
         req[n] = '\0';
         if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n")) break;
     }
@@ -126,21 +86,20 @@ static void handle(int client, MetricsFn metrics, BacklogFn backlog, void *arg) 
     } else {
         respond(client, 404, "Not Found", "text/plain; charset=utf-8", "404 page not found\n", 19);
     }
-    close(client);
+    file_close(client);
 }
 
 Error daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backlog, void *arg, Err *err) {
     if (!*addr) return ERR_OK;
     int fd;
-    Error e = listen_on(addr, &fd, err);
+    Error e = net_listen(addr, &fd, err);
     if (e != ERR_OK) return e;
     while (!ctx_done(ctx)) {
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        if (poll(&pfd, 1, 200) <= 0) continue;
-        int client = accept(fd, NULL, NULL);
+        int client;
+        net_accept(fd, 200, &client);
         if (client >= 0) handle(client, metrics, backlog, arg);
     }
-    close(fd);
+    file_close(fd);
     return ERR_OK;
 }
 
@@ -172,16 +131,4 @@ bool daemon_ask(const char *addr, long *backlog) {
     sb_free(&url);
     sb_free(&body);
     return ok;
-}
-
-Error daemon_raise_file_limit(Err *err) {
-    struct rlimit limit;
-    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return err_set(err, ERR_PLATFORM, "getrlimit: %s", strerror(errno));
-    if (limit.rlim_cur >= limit.rlim_max) return ERR_OK;
-    limit.rlim_cur = limit.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return ERR_OK;
-    /* macOS rejects RLIM_INFINITY for the soft limit; OPEN_MAX-sized values work. */
-    limit.rlim_cur = 1 << 20;
-    if (setrlimit(RLIMIT_NOFILE, &limit) == 0) return ERR_OK;
-    return err_set(err, ERR_PLATFORM, "setrlimit: %s", strerror(errno));
 }

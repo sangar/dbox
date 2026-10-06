@@ -1,70 +1,23 @@
 #include "service.h"
 
-#include <errno.h>
-#include <limits.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
-
-extern char **environ;
 
 #define LABEL "dbox"
 
-Error service_run_command(void *user, char *const argv[], Err *err) {
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return err_set(err, ERR_PLATFORM, "pipe: %s", strerror(errno));
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-    pid_t pid;
-    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(pipefd[1]);
-    StrBuf out = {0};
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof buf)) > 0) sb_append(&out, buf, (size_t)n);
-    close(pipefd[0]);
-    int status = 0;
-    Error e = ERR_OK;
-    if (!(rc == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
-        StrBuf cmd = {0};
-        for (size_t i = 0; argv[i]; i++) sb_printf(&cmd, "%s%s", i ? " " : "", argv[i]);
-        while (out.len > 0 && (out.data[out.len - 1] == '\n' || out.data[out.len - 1] == ' ')) out.len--;
-        if (rc) e = err_set(err, ERR_PLATFORM, "%s: %s", sb_cstr(&cmd), strerror(rc));
-        else e = err_set(err, ERR_PLATFORM, "%s: exit status %d: %s", sb_cstr(&cmd), WIFEXITED(status) ? WEXITSTATUS(status) : -1, sb_cstr(&out));
-        sb_free(&cmd);
-    }
-    sb_free(&out);
-    return e;
-}
+Error service_run_command(void *user, char *const argv[], Err *err) { return process_run(argv, err); }
 
 Error service_manager(ServiceManager *m, Err *err) {
     memset(m, 0, sizeof *m);
-    m->home = home_dir();
+    m->home = env_home();
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && *xdg) snprintf(m->config_home_storage, sizeof m->config_home_storage, "%s", xdg);
     else snprintf(m->config_home_storage, sizeof m->config_home_storage, "%s/.config", m->home);
     m->config_home = m->config_home_storage;
-    m->uid = (int)getuid();
+    m->uid = process_uid();
     m->run = service_run_command;
-#if defined(__APPLE__)
-    m->os = OS_DARWIN;
-#elif defined(__linux__)
-    m->os = OS_LINUX;
-#else
-    m->os = OS_OTHER;
-#endif
+    m->os = os_current();
     if (m->os == OS_OTHER) return err_set(err, ERR_PLATFORM, "no user service manager known for this system; start `dbox run` from your session startup instead");
     return ERR_OK;
 }
@@ -150,7 +103,7 @@ static void launchd_target(const ServiceManager *m, char buf[64]) { snprintf(buf
     for (int i = 0; i < 150; i++) {
         Err ignored;
         if (m->run(m->run_user, print, &ignored) != ERR_OK) return ERR_OK;
-        usleep(100 * 1000);
+        sleep_ms(100);
     }
     return err_set(err, ERR_PLATFORM, "launchctl bootout: the dbox agent did not stop within 15 seconds");
 }
@@ -181,14 +134,14 @@ Error service_manager_enable(const ServiceManager *m, const char *executable, Er
 
 Error service_manager_disable(const ServiceManager *m, Err *err) {
     char *unit = service_unit_path(m);
-    struct stat st;
+    FileStat info;
     Error e;
-    if (stat(unit, &st) != 0) {
+    if (file_info_follow(unit, &info, NULL) != ERR_OK || !info.exists) {
         e = err_set(err, ERR_NOT_FOUND, "no service installed at %s", unit);
     } else {
         char *stop[] = {"systemctl", "--user", "disable", "--now", LABEL ".service", NULL};
         e = m->os == OS_DARWIN ? bootout(m, err) : m->run(m->run_user, stop, err);
-        if (e == ERR_OK && unlink(unit) != 0) e = err_sys(err, "%s", unit);
+        if (e == ERR_OK) e = file_remove(unit, err);
         if (e == ERR_OK && m->os != OS_DARWIN) {
             char *reload[] = {"systemctl", "--user", "daemon-reload", NULL};
             e = m->run(m->run_user, reload, err);
@@ -220,22 +173,8 @@ bool service_installed(char **unit) {
     *unit = NULL;
     if (service_manager(&m, &err) != ERR_OK) return false;
     *unit = service_unit_path(&m);
-    struct stat st;
-    return stat(*unit, &st) == 0;
-}
-
-static char *running_executable(void) {
-    char buf[PATH_MAX];
-#ifdef __APPLE__
-    uint32_t size = sizeof buf;
-    if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
-#else
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n < 0) return NULL;
-    buf[n] = '\0';
-#endif
-    char resolved[PATH_MAX];
-    return xstrdup(realpath(buf, resolved) ? resolved : buf);
+    FileStat info;
+    return file_info_follow(*unit, &info, NULL) == ERR_OK && info.exists;
 }
 
 static char *find_on_path(const char *name) {
@@ -245,7 +184,7 @@ static char *find_on_path(const char *name) {
     char *found = NULL;
     for (char *dir = strtok_r(copy, ":", &save); dir && !found; dir = strtok_r(NULL, ":", &save)) {
         char *candidate = path_join(*dir ? dir : ".", name);
-        if (access(candidate, X_OK) == 0) found = candidate;
+        if (path_is_executable(candidate)) found = candidate;
         else xfree(candidate);
     }
     xfree(copy);
@@ -254,11 +193,10 @@ static char *find_on_path(const char *name) {
 
 Error service_executable_path(char **out, Err *err) {
     *out = NULL;
-    char *exe = running_executable();
+    char *exe = process_executable_path();
     if (!exe) return err_set(err, ERR_PLATFORM, "cannot find the running executable");
     char *on_path = find_on_path(LABEL);
-    struct stat a, b;
-    if (on_path && stat(on_path, &a) == 0 && stat(exe, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
+    if (on_path && paths_are_same_file(on_path, exe)) {
         xfree(exe);
         *out = on_path;
         return ERR_OK;

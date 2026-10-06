@@ -1,10 +1,8 @@
-#include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "engine_internal.h"
+#include "platform/platform.h"
 
 #define MIRROR_BATCH 256
 #define IDLE_NS (5 * NS_PER_SEC)
@@ -96,8 +94,8 @@ Error mirror_drain(Engine *e, size_t mirror, Err *err) {
         return err_set(err, ERR_NOT_FOUND, "source missing on primary and locally");
     }
     char *abs = engine_abs(e, f->path);
-    *fd = open(abs, O_RDONLY | O_CLOEXEC);
-    result = *fd < 0 ? err_sys(err, "%s", abs) : ERR_OK;
+    result = file_open_read(abs, fd, err);
+    if (result == ERR_NOT_FOUND) result = err_set(err, result, "%s: no such file", abs);
     xfree(abs);
     snprintf(meta->sha256, sizeof meta->sha256, "%s", f->sha256);
     return result;
@@ -153,7 +151,7 @@ Error mirror_drain(Engine *e, size_t mirror, Err *err) {
     if (result != ERR_OK) goto out;
     char etag[ETAG_MAX];
     result = store_put(store, e->ctx, r->path, body, f.size, &meta, etag, &inner);
-    close(body);
+    file_close(body);
     if (result != ERR_OK) {
         result = err_set(err, result, "%s", inner.msg);
         goto out;

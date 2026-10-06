@@ -1,13 +1,9 @@
 #include "watch.h"
 
-#include <dirent.h>
-#include <errno.h>
-#include <limits.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
+#include "platform/platform.h"
 #include "strmap.h"
 
 struct Watcher {
@@ -18,7 +14,7 @@ struct Watcher {
     void *ctx;
     Logger *log;
     WatchBackend *backend;
-    pthread_mutex_t mu;
+    Mutex mu;
     StrMap dirs; /* relative paths of the directories known to be watched */
 };
 
@@ -28,41 +24,31 @@ static char *relative(Watcher *w, const char *p) {
     return rel;
 }
 
-[[nodiscard]] static Error watch_limit_hint(const char *p, Err *err) {
-    if (errno == ENOSPC) return err_set(err, ERR_PLATFORM, "watch %s: inotify watch limit reached; raise it with `sudo sysctl fs.inotify.max_user_watches=1048576`", p);
-    if (errno == EMFILE) return err_set(err, ERR_PLATFORM, "watch %s: out of file descriptors; raise `ulimit -n`", p);
-    return err_sys(err, "watch %s", p);
-}
-
-static int compare_names(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
-
-/* add_tree watches dir and everything below it; with report, every file found is reported as changed. */
+[[nodiscard]] /* add_tree watches dir and everything below it; with report, every file found is reported as changed. */
 [[nodiscard]] static Error add_tree(Watcher *w, const char *dir, bool report, Err *err) {
     char *rel = relative(w, dir);
     if (rel && w->ignored(w->ctx, rel, true)) {
         xfree(rel);
         return ERR_OK;
     }
-    pthread_mutex_lock(&w->mu);
+    mutex_lock(&w->mu);
     strmap_put(&w->dirs, rel ? rel : ".", NULL);
-    pthread_mutex_unlock(&w->mu);
+    mutex_unlock(&w->mu);
     xfree(rel);
-    if (backend_add_dir(w->backend, dir, err) != ERR_OK) return watch_limit_hint(dir, err);
-    DIR *d = opendir(dir);
-    if (!d) return errno == ENOENT ? ERR_OK : watch_limit_hint(dir, err);
+    Error e = watch_backend_add_dir(w->backend, dir, err);
+    if (e != ERR_OK) return e;
     StrList names = {0};
-    struct dirent *ent;
-    while ((ent = readdir(d)))
-        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) strlist_push(&names, ent->d_name);
-    closedir(d);
-    qsort(names.items, names.len, sizeof *names.items, compare_names);
-    Error e = ERR_OK;
+    e = dir_list(dir, &names, err);
+    if (e != ERR_OK) {
+        strlist_free(&names);
+        return e == ERR_NOT_FOUND ? ERR_OK : e;
+    }
     for (size_t i = 0; e == ERR_OK && i < names.len; i++) {
         char *p = path_join(dir, names.items[i]);
-        struct stat st;
-        if (lstat(p, &st) == 0) {
+        FileStat st;
+        if (file_info(p, &st, NULL) == ERR_OK && st.exists) {
             char *child = relative(w, p);
-            if (S_ISDIR(st.st_mode)) {
+            if (st.is_dir) {
                 e = add_tree(w, p, report, err);
             } else if (child && report && !w->ignored(w->ctx, child, false)) {
                 w->changed(w->ctx, child);
@@ -76,7 +62,7 @@ static int compare_names(const void *a, const void *b) { return strcmp(*(const c
 }
 
 static void forget_dir(Watcher *w, const char *rel) {
-    pthread_mutex_lock(&w->mu);
+    mutex_lock(&w->mu);
     strmap_remove(&w->dirs, rel, NULL);
     char *prefix = path_join(rel, "");
     StrList below = {0};
@@ -87,10 +73,11 @@ static void forget_dir(Watcher *w, const char *rel) {
     for (size_t i = 0; i < below.len; i++) strmap_remove(&w->dirs, below.items[i], NULL);
     strlist_free(&below);
     xfree(prefix);
-    pthread_mutex_unlock(&w->mu);
+    mutex_unlock(&w->mu);
 }
 
-void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
+/* watcher_event handles every absolute path the backend hears about. */
+static void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
     char *rel = relative(w, abs_path);
     if (!rel) {
         if (rescan_subdirs) {
@@ -99,17 +86,17 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
         }
         return;
     }
-    struct stat st;
-    bool exists = lstat(abs_path, &st) == 0;
-    bool is_directory = exists && S_ISDIR(st.st_mode);
+    FileStat st;
+    bool exists = file_info(abs_path, &st, NULL) == ERR_OK && st.exists;
+    bool is_directory = exists && st.is_dir;
     if (w->ignored(w->ctx, rel, is_directory)) {
         xfree(rel);
         return;
     }
     if (is_directory) {
-        pthread_mutex_lock(&w->mu);
+        mutex_lock(&w->mu);
         bool known = strmap_has(&w->dirs, rel);
-        pthread_mutex_unlock(&w->mu);
+        mutex_unlock(&w->mu);
         /* Files can land in a new directory before its watch is added, so everything already inside is reported too. */
         if (!known || rescan_subdirs) {
             Err err;
@@ -123,19 +110,22 @@ void watcher_event(Watcher *w, const char *abs_path, bool rescan_subdirs) {
     xfree(rel);
 }
 
+static void on_backend_event(void *user, const char *abs_path, bool rescan_subdirs) { watcher_event(user, abs_path, rescan_subdirs); }
+
 Error watcher_new(const char *root, IgnoreFn ignored, ChangedFn changed, void *ctx, Logger *log, Watcher **out, Err *err) {
     *out = NULL;
     Watcher *w = xcalloc(1, sizeof *w);
     w->root = xstrdup(root);
-    char resolved[PATH_MAX];
-    if (realpath(root, resolved) && strcmp(resolved, root) != 0) w->real_root = xstrdup(resolved);
+    char *resolved = path_resolve(root);
+    if (resolved && strcmp(resolved, root) != 0) w->real_root = resolved;
+    else xfree(resolved);
     w->ignored = ignored;
     w->changed = changed;
     w->ctx = ctx;
     w->log = log;
-    pthread_mutex_init(&w->mu, NULL);
+    mutex_init(&w->mu);
     strmap_init(&w->dirs);
-    Error e = backend_open(w, w->real_root ? w->real_root : w->root, &w->backend, err);
+    Error e = watch_backend_open(w->real_root ? w->real_root : w->root, on_backend_event, w, &w->backend, err);
     if (e == ERR_OK) e = add_tree(w, w->root, false, err);
     if (e != ERR_OK) {
         watcher_free(w);
@@ -145,13 +135,15 @@ Error watcher_new(const char *root, IgnoreFn ignored, ChangedFn changed, void *c
     return ERR_OK;
 }
 
-void watcher_run(Watcher *w, Ctx *ctx) { backend_run(w->backend, ctx); }
+void watcher_run(Watcher *w, Ctx *ctx) {
+    while (!ctx_done(ctx)) watch_backend_poll(w->backend, 200);
+}
 
 void watcher_free(Watcher *w) {
     if (!w) return;
-    if (w->backend) backend_close(w->backend);
+    if (w->backend) watch_backend_close(w->backend);
     strmap_free(&w->dirs);
-    pthread_mutex_destroy(&w->mu);
+    mutex_destroy(&w->mu);
     xfree(w->root);
     xfree(w->real_root);
     xfree(w);

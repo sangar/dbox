@@ -3,17 +3,16 @@
 
 #include <stdbool.h>
 
+#include "platform/platform.h"
 #include "util.h"
 
 /* `dbox run` as a per-user login service: a launchd agent on macOS, a systemd user unit on Linux. */
-
-typedef enum { OS_DARWIN, OS_LINUX, OS_OTHER } ServiceOs;
 
 /* ServiceRunner executes a service manager command such as launchctl or systemctl; tests record them instead. */
 typedef Error (*ServiceRunner)(void *user, char *const argv[], Err *err);
 
 typedef struct {
-    ServiceOs os;
+    Os os;
     const char *home;
     const char *config_home;
     int uid;

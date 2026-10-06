@@ -143,8 +143,8 @@ Rollback at any step is the reverse edit.
 
 ### Components
 
-**watcher** — `src/watch.c` with one backend per platform: inotify on Linux
-(`watch_linux.c`) and FSEvents on macOS (`watch_macos.c`). inotify is not
+**watcher** — `src/watch.c` over one backend per platform in `src/platform/`:
+inotify on Linux (`linux.c`) and FSEvents on macOS (`macos.c`). inotify is not
 recursive, so the tree is walked at start and every directory added; new
 directories are added as they appear in create events. FSEvents watches the
 root recursively and costs no descriptor per directory. Ignore patterns
@@ -310,13 +310,16 @@ dbox/
   src/index.c               SQLite: files, replicas, upload failures
   src/store.h               the Store interface; disk.c and s3.c implement it
   src/s3.c                  S3 over libcurl: Signature V4, metadata, multipart above part_size, paginated listing
-  src/watch.c               recursive watcher; watch_macos.c (FSEvents) and watch_linux.c (inotify)
+  src/watch.c               recursive watcher over the platform's file system events
   src/queue.c               the de-duplicating path queue and per-path locks
   src/engine.c              reconcile, the primary workers, poll, conflicts, downloads
   src/mirror.c              mirror workers, backfill adoption, verification
-  src/daemon.c              pid file, /healthz /metrics /status listener, status client, file limit
+  src/daemon.c              pid file, /healthz /metrics /status listener, status client
   src/service.c             `service enable|disable`: launchd agent / systemd user unit
-  src/util.c, arena.c, strmap.c, sha256.c, ctx.c, log.c   building blocks
+  src/error.h               the Error enum every fallible function returns
+  src/alloc.c               the heap allocator; arena.c for objects that die together
+  src/platform/             every OS call: posix.c, plus macos.c (FSEvents) and linux.c (inotify)
+  src/util.c, strbuf.c, strmap.c, sha256.c, ctx.c, log.c   building blocks
   tests/test_dbox.c         config, index, ignore, debounce, engine scenarios, daemon, service
   tests/test_s3.c           the S3 store against the compose MinIOs
   docker-compose.yml        two MinIO instances for local dev and tests
