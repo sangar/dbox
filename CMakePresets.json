@@ -14,13 +14,16 @@
       "displayName": "Release",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/out/release",
+      "installDir": "$env{HOME}/.local",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     }
   ],
   "buildPresets": [
     {"name": "debug", "configurePreset": "debug"},
     {"name": "release", "configurePreset": "release"},
-    {"name": "check", "configurePreset": "debug", "targets": ["check"]}
+    {"name": "check", "configurePreset": "debug", "targets": ["check"]},
+    {"name": "install", "configurePreset": "release", "targets": ["install"]},
+    {"name": "uninstall", "configurePreset": "release", "targets": ["uninstall"]}
   ],
   "testPresets": [
     {
@@ -43,6 +46,20 @@
         {"type": "configure", "name": "debug"},
         {"type": "build", "name": "debug"},
         {"type": "test", "name": "debug"}
+      ]
+    },
+    {
+      "name": "install",
+      "steps": [
+        {"type": "configure", "name": "release"},
+        {"type": "build", "name": "install"}
+      ]
+    },
+    {
+      "name": "uninstall",
+      "steps": [
+        {"type": "configure", "name": "release"},
+        {"type": "build", "name": "uninstall"}
       ]
     }
   ]

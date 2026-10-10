@@ -111,4 +111,11 @@ else()
         VERBATIM)
 endif()
 
+# ---- install and uninstall ----
+
 install(TARGETS dbox RUNTIME DESTINATION bin)
+
+add_custom_target(uninstall
+    COMMAND ${CMAKE_COMMAND} -DDBOX_BINARY=${CMAKE_INSTALL_PREFIX}/bin/dbox -P ${CMAKE_SOURCE_DIR}/cmake/uninstall.cmake
+    COMMENT "Disabling the login service and removing ${CMAKE_INSTALL_PREFIX}/bin/dbox"
+    VERBATIM)

@@ -69,8 +69,33 @@ cmake --preset release && cmake --build --preset release      # out/release/dbox
 cmake --preset release -DDBOX_VERSION=1.2.3                   # what `dbox version` prints (default: git describe)
 ```
 
-Copy `out/release/dbox` somewhere on your `PATH`, then run `dbox service
-enable` once your config is ready.
+## Install
+
+```sh
+cmake --preset release && cmake --build --preset release
+cmake --install out/release            # ~/.local/bin/dbox
+cmake --build --preset uninstall       # disable the login service, then remove the binary
+```
+
+`cmake --workflow --preset install` and `cmake --workflow --preset uninstall`
+do the same, configure and build included, in one command each.
+
+Run the install again to upgrade; a running daemon picks up the new binary
+at its next start. Make sure `~/.local/bin` is on your `PATH` (macOS does not
+add it by default), then run `dbox service enable` once your config is ready.
+Uninstalling leaves the config and each folder's `.dbox/` state in place.
+
+To install elsewhere, configure with another prefix first so the uninstall
+knows where to look. Under `sudo` the uninstall cannot see your login
+service, so disable it yourself beforehand:
+
+```sh
+cmake --preset release --install-prefix /usr/local && cmake --build --preset release
+sudo cmake --install out/release
+
+dbox service disable                   # if you enabled it
+sudo cmake --build --preset uninstall
+```
 
 ## Quick start
 
