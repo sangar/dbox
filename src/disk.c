@@ -1,8 +1,6 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "platform/platform.h"
+#include "content.h"
+#include "mc/platform/platform.h"
+#include "mc/text/path.h"
 #include "store.h"
 
 #define DISK_TEMP_PREFIX ".dbox-upload-"
@@ -10,153 +8,119 @@
 /* Disk stores objects as files under root/prefix. The ETag is size and modification time; the content hash is computed on Head. */
 typedef struct {
     Store base;
-    char *dir;
+    String dir;
 } Disk;
 
-static char *object_path(Disk *d, const char *key) { return path_join(d->dir, key); }
+static String object_path(Arena *arena, const Disk *disk, String key) { return path_join(arena, disk->dir, key); }
 
-static void describe(Object *obj, const char *key, const FileStat *st) {
-    memset(obj, 0, sizeof *obj);
-    obj->key = key;
-    obj->size = st->size;
-    obj->mtime_ns = st->mtime_ns;
-    snprintf(obj->etag, sizeof obj->etag, "%lld-%lld", (long long)st->size, (long long)obj->mtime_ns);
+static Object describe(Arena *arena, String key, const FileInfo *info) {
+    return (Object){
+        .key = key,
+        .size = info->size,
+        .mtime_ns = info->mtime_ns,
+        .etag = str_format(arena, "%lld-%lld", (long long)info->size, (long long)info->mtime_ns),
+        .sha256 = S(""),
+    };
 }
 
-[[nodiscard]] static Error disk_put(Store *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
-    Disk *d = (Disk *)s;
-    char *target = object_path(d, key);
-    char *dir = path_dir(target);
-    char *tmp = NULL;
+[[nodiscard]] static Error disk_put(Store *store, Cancel *cancel, Arena *arena, String key, int fd, int64_t size, Meta meta, String *etag, Err *err) {
+    Disk *disk = (Disk *)store;
+    String target = object_path(arena, disk, key);
+    String dir = path_dir(target);
+    String tmp = S("");
     int out = -1;
     int64_t copied;
-    Error e = mkdir_p(dir, 0755, err);
+    Error e = dir_create_all(dir, 0755, err);
     if (e != ERR_OK) goto out;
-    tmp = path_join(dir, DISK_TEMP_PREFIX "XXXXXX");
-    if ((e = file_mkstemp(tmp, &out, err)) != ERR_OK) goto out;
-    if ((e = file_seek_start(fd, err)) != ERR_OK) goto out;
-    if ((e = copy_fd(fd, out, NULL, &copied, err)) != ERR_OK) goto out;
+    if ((e = file_create_unique(arena, path_join(arena, dir, S(DISK_TEMP_PREFIX "XXXXXX")), &tmp, &out, err)) != ERR_OK) goto out;
+    if ((e = file_seek(fd, 0, err)) != ERR_OK) goto out;
+    if ((e = content_copy(fd, out, nullptr, &copied, err)) != ERR_OK) goto out;
     file_close(out);
     out = -1;
-    if (meta->mtime_ns != 0 && (e = file_set_mtime(tmp, meta->mtime_ns, err)) != ERR_OK) goto out;
+    if (meta.mtime_ns != 0 && (e = file_set_mtime(tmp, meta.mtime_ns, err)) != ERR_OK) goto out;
     if ((e = file_rename(tmp, target, err)) != ERR_OK) goto out;
-    FileStat st;
-    if ((e = file_info_follow(target, &st, err)) != ERR_OK) goto out;
-    if (!st.exists) {
-        e = err_set(err, ERR_IO, "%s: vanished after rename", target);
+    FileInfo info;
+    if ((e = file_info_follow(target, &info, err)) != ERR_OK) goto out;
+    if (!info.exists) {
+        e = err_set(err, ERR_IO, "%.*s: vanished after rename", (int)target.len, target.data);
         goto out;
     }
-    Object obj;
-    describe(&obj, key, &st);
-    memcpy(etag, obj.etag, ETAG_MAX);
+    *etag = describe(arena, key, &info).etag;
 out:
     if (out >= 0) file_close(out);
-    if (e != ERR_OK && tmp) (void)file_remove(tmp, NULL);
-    xfree(tmp);
-    xfree(dir);
-    xfree(target);
+    if (e != ERR_OK && tmp.len > 0) (void)file_remove(tmp, nullptr);
     return e;
 }
 
-[[nodiscard]] static Error open_object(Disk *d, const char *key, Object *obj, int *fd, Err *err) {
-    char *path = object_path(d, key);
+[[nodiscard]] static Error open_object(Arena *arena, const Disk *disk, String key, Object *object, int *fd, Err *err) {
     int f;
-    Error e = file_open_read(path, &f, err);
-    if (e != ERR_OK) goto out;
-    FileStat st;
-    e = file_info_fd(f, &st, err);
-    if (e == ERR_OK && !st.is_regular) e = ERR_NOT_FOUND;
+    Error e = file_open_read(object_path(arena, disk, key), &f, err);
+    if (e != ERR_OK) return e;
+    FileInfo info;
+    e = file_info_fd(f, &info, err);
+    if (e == ERR_OK && !info.is_regular) e = ERR_NOT_FOUND;
     if (e != ERR_OK) {
         file_close(f);
-        goto out;
+        return e;
     }
-    describe(obj, key, &st);
+    *object = describe(arena, key, &info);
     *fd = f;
-out:
-    xfree(path);
-    return e;
+    return ERR_OK;
 }
 
-[[nodiscard]] static Error disk_get(Store *s, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) { return open_object((Disk *)s, key, obj, fd, err); }
+[[nodiscard]] static Error disk_get(Store *store, Cancel *cancel, Arena *arena, String key, Object *object, int *fd, Err *err) {
+    return open_object(arena, (Disk *)store, key, object, fd, err);
+}
 
-[[nodiscard]] static Error disk_head(Store *s, Ctx *ctx, const char *key, Object *obj, Err *err) {
+[[nodiscard]] static Error disk_head(Store *store, Cancel *cancel, Arena *arena, String key, Object *object, Err *err) {
     int fd;
-    Error e = open_object((Disk *)s, key, obj, &fd, err);
+    Error e = open_object(arena, (Disk *)store, key, object, &fd, err);
     if (e != ERR_OK) return e;
-    Sha256 h;
-    sha256_init(&h);
+    Sha256 hash;
+    sha256_init(&hash);
     int64_t copied;
-    e = copy_fd(fd, -1, &h, &copied, err);
+    e = content_copy(fd, -1, &hash, &copied, err);
     file_close(fd);
-    if (e == ERR_OK) sha256_hex(&h, obj->sha256);
+    if (e == ERR_OK) object->sha256 = content_digest(arena, &hash);
     return e;
 }
 
-[[nodiscard]] static Error disk_delete(Store *s, Ctx *ctx, const char *key, Err *err) {
-    char *path = object_path((Disk *)s, key);
-    Error e = file_remove(path, err);
-    if (e == ERR_NOT_FOUND) e = ERR_OK;
-    xfree(path);
-    return e;
+[[nodiscard]] static Error disk_remove(Store *store, Cancel *cancel, Arena *arena, String key, Err *err) {
+    Error e = file_remove(object_path(arena, (Disk *)store, key), err);
+    return e == ERR_NOT_FOUND ? ERR_OK : e;
 }
 
-typedef struct {
-    Arena *arena;
-    Object *objects;
-    size_t count, cap;
-} Listing;
-
-[[nodiscard]] static Error walk(Disk *d, Listing *l, const char *dir, const char *rel, Err *err) {
-    StrList names = {0};
-    Error e = dir_list(dir, &names, err);
-    if (e == ERR_NOT_FOUND) e = err_set(err, e, "%s: no such directory", dir);
-    for (size_t i = 0; e == ERR_OK && i < names.len; i++) {
-        const char *name = names.items[i];
-        char *path = path_join(dir, name);
-        char *key = *rel ? path_join(rel, name) : xstrdup(name);
-        FileStat st;
-        if (file_info(path, &st, NULL) == ERR_OK && st.exists) {
-            if (st.is_dir) {
-                e = walk(d, l, path, key, err);
-            } else if (st.is_regular && !has_prefix(name, DISK_TEMP_PREFIX)) {
-                if (l->count == l->cap) l->objects = xrealloc(l->objects, (l->cap = l->cap ? l->cap * 2 : 64) * sizeof *l->objects);
-                describe(&l->objects[l->count++], arena_strdup(l->arena, key), &st);
-            }
-        }
-        xfree(key);
-        xfree(path);
+[[nodiscard]] static Error walk(Arena *arena, String dir, String rel, ObjectList *objects, Err *err) {
+    StringList names = {0};
+    Error e = dir_list(arena, dir, &names, err);
+    if (e == ERR_NOT_FOUND) e = err_set(err, e, "%.*s: no such directory", (int)dir.len, dir.data);
+    for (size_t i = 0; e == ERR_OK && i < names.count; i++) {
+        String name = names.items[i];
+        String path = path_join(arena, dir, name);
+        String key = rel.len > 0 ? path_join(arena, rel, name) : name;
+        FileInfo info;
+        if (file_info(path, &info, nullptr) != ERR_OK || !info.exists) continue;
+        if (info.is_dir) e = walk(arena, path, key, objects, err);
+        else if (info.is_regular && !str_starts_with(name, S(DISK_TEMP_PREFIX))) objectlist_push(arena, objects, describe(arena, key, &info));
     }
-    strlist_free(&names);
     return e;
 }
 
-[[nodiscard]] static Error disk_list(Store *s, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
-    Disk *d = (Disk *)s;
-    Listing l = {.arena = a};
-    FileStat st;
-    Error e = file_info_follow(d->dir, &st, err);
-    if (e == ERR_OK && st.exists) e = walk(d, &l, d->dir, "", err);
-    Object *out = arena_alloc(a, (l.count + 1) * sizeof *out);
-    memcpy(out, l.objects, l.count * sizeof *out);
-    xfree(l.objects);
-    *objects = out;
-    *count = l.count;
+[[nodiscard]] static Error disk_list(Store *store, Cancel *cancel, Arena *arena, ObjectList *objects, Err *err) {
+    Disk *disk = (Disk *)store;
+    *objects = (ObjectList){0};
+    FileInfo info;
+    Error e = file_info_follow(disk->dir, &info, err);
+    if (e == ERR_OK && info.exists) e = walk(arena, disk->dir, S(""), objects, err);
     return e;
 }
 
-static void disk_close(Store *s) {
-    Disk *d = (Disk *)s;
-    xfree(d->dir);
-    xfree(d);
-}
+static const StoreOps disk_ops = {disk_put, disk_get, disk_head, disk_remove, disk_list};
 
-static const StoreOps disk_ops = {disk_put, disk_get, disk_head, disk_delete, disk_list, disk_close};
-
-Store *disk_open(const char *root, const char *prefix) {
-    Disk *d = xcalloc(1, sizeof *d);
-    d->base.ops = &disk_ops;
-    d->dir = *prefix ? path_join(root, prefix) : xstrdup(root);
-    size_t n = strlen(d->dir);
-    while (n > 1 && d->dir[n - 1] == '/') d->dir[--n] = '\0';
-    return &d->base;
+Store *disk_open(Arena *arena, String root, String prefix) {
+    Disk *disk = arena_push(arena, sizeof *disk);
+    disk->base.ops = &disk_ops;
+    String dir = prefix.len > 0 ? path_join(arena, root, prefix) : root;
+    disk->dir = path_clean(arena, dir);
+    return &disk->base;
 }

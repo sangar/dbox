@@ -29,7 +29,15 @@ endif()
 
 find_package(CURL REQUIRED)
 
-# ---- vendored dependencies, built with their own flags ----
+set(DBOX_WARNINGS -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter)
+
+if(DBOX_SANITIZE)
+    set(SANITIZE_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_compile_options(${SANITIZE_FLAGS})
+    add_link_options(${SANITIZE_FLAGS})
+endif()
+
+# ---- vendored dependencies ----
 
 add_library(sqlite STATIC deps/sqlite/sqlite3.c)
 target_include_directories(sqlite PUBLIC deps/sqlite)
@@ -37,46 +45,32 @@ target_compile_definitions(sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_THRE
 target_compile_options(sqlite PRIVATE -w)
 set_target_properties(sqlite PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 
-file(GLOB LIBYAML_SOURCES CONFIGURE_DEPENDS deps/libyaml/src/*.c)
-add_library(libyaml STATIC ${LIBYAML_SOURCES})
-target_include_directories(libyaml PUBLIC deps/libyaml/include PRIVATE deps/libyaml/src)
-target_compile_definitions(libyaml
-    PUBLIC YAML_DECLARE_STATIC
-    PRIVATE YAML_VERSION_MAJOR=0 YAML_VERSION_MINOR=2 YAML_VERSION_PATCH=5 YAML_VERSION_STRING="0.2.5")
-target_compile_options(libyaml PRIVATE -w)
-set_target_properties(libyaml PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+# libmc builds with the same flags as dbox; cyaml, its one dependency, with upstream's.
+file(GLOB CYAML_SOURCES CONFIGURE_DEPENDS deps/libmc/deps/cyaml/*.c)
+add_library(cyaml STATIC ${CYAML_SOURCES})
+target_include_directories(cyaml PUBLIC deps/libmc/deps/cyaml)
+target_compile_options(cyaml PRIVATE -w)
+set_target_properties(cyaml PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+
+file(GLOB LIBMC_SOURCES CONFIGURE_DEPENDS deps/libmc/src/*/*.c)
+add_library(mc STATIC ${LIBMC_SOURCES})
+target_include_directories(mc PUBLIC deps/libmc/include PRIVATE deps/libmc/src)
+target_compile_options(mc PRIVATE ${DBOX_WARNINGS})
+find_package(Threads REQUIRED)
+target_link_libraries(mc PRIVATE cyaml PUBLIC Threads::Threads m)
+if(APPLE)
+    target_link_libraries(mc PUBLIC "-framework CoreServices")
+endif()
 
 # ---- dbox ----
 
-set(DBOX_WARNINGS -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter)
-
 file(GLOB DBOX_SOURCES CONFIGURE_DEPENDS src/*.c)
 list(REMOVE_ITEM DBOX_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
-list(APPEND DBOX_SOURCES src/platform/posix.c)
-if(APPLE)
-    list(APPEND DBOX_SOURCES src/platform/macos.c)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND DBOX_SOURCES src/platform/linux.c)
-else()
-    message(FATAL_ERROR "dbox targets macOS and Linux; ${CMAKE_SYSTEM_NAME} has no platform implementation")
-endif()
 
 add_library(dbox_core STATIC ${DBOX_SOURCES})
 target_include_directories(dbox_core PUBLIC src)
 target_compile_options(dbox_core PUBLIC ${DBOX_WARNINGS})
-target_compile_definitions(dbox_core PUBLIC _DEFAULT_SOURCE _GNU_SOURCE _DARWIN_C_SOURCE)
-target_link_libraries(dbox_core PUBLIC sqlite libyaml CURL::libcurl m)
-find_package(Threads REQUIRED)
-target_link_libraries(dbox_core PUBLIC Threads::Threads)
-if(APPLE)
-    target_link_libraries(dbox_core PUBLIC "-framework CoreServices")
-endif()
-
-if(DBOX_SANITIZE)
-    set(SANITIZE_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_compile_options(dbox_core PUBLIC ${SANITIZE_FLAGS})
-    target_link_options(dbox_core PUBLIC ${SANITIZE_FLAGS})
-endif()
+target_link_libraries(dbox_core PUBLIC mc sqlite CURL::libcurl)
 
 add_executable(dbox src/main.c)
 target_link_libraries(dbox PRIVATE dbox_core)

@@ -1,31 +1,25 @@
-#ifndef DBOX_DAEMON_H
-#define DBOX_DAEMON_H
+#pragma once
 
-#include <stdbool.h>
-
-#include "ctx.h"
-#include "util.h"
+#include "mc/concurrency/cancel.h"
 
 /*
  * What the long-running process needs besides syncing: a pid file so other
- * commands can find it, the health and metrics listener, and a raised
- * open-file limit.
+ * commands can find it, and the health and metrics listener.
  */
 
 /* daemon_write_pid records the running process in path; it fails when another live daemon already owns the file. */
-[[nodiscard]] Error daemon_write_pid(const char *path, Err *err);
-void daemon_remove_pid(const char *path);
+[[nodiscard]] Error daemon_write_pid(Arena *scratch, String path, Err *err);
+void daemon_remove_pid(String path);
 /* daemon_running returns the pid in path when that process is alive. */
-bool daemon_running(const char *path, int *pid);
+bool daemon_running(Arena *scratch, String path, int *pid);
 /* daemon_reload asks the daemon recorded in path to re-read its config; *reloaded is false when none is running. */
-[[nodiscard]] Error daemon_reload(const char *path, bool *reloaded, Err *err);
+[[nodiscard]] Error daemon_reload(Arena *scratch, String path, bool *reloaded, Err *err);
 
-typedef Error (*MetricsFn)(void *arg, StrBuf *out, Err *err);
-typedef long (*BacklogFn)(void *arg);
+/* MetricsFn appends the Prometheus metrics to out. */
+typedef Error (*MetricsFn)(void *context, Arena *arena, StringBuilder *out, Err *err);
+typedef int64_t (*BacklogFn)(void *context);
 
-/* daemon_serve answers /healthz, /metrics and /status on addr until ctx is done. An empty addr disables the listener. */
-[[nodiscard]] Error daemon_serve(Ctx *ctx, const char *addr, MetricsFn metrics, BacklogFn backlog, void *arg, Err *err);
-/* daemon_ask fetches the running daemon's backlog from addr; it reports false when no daemon answers there. */
-bool daemon_ask(const char *addr, long *backlog);
-
-#endif
+/* daemon_serve answers /healthz, /metrics and /status on address until cancel is requested. An empty address disables the listener. */
+[[nodiscard]] Error daemon_serve(Cancel *cancel, String address, MetricsFn metrics, BacklogFn backlog, void *context, Err *err);
+/* daemon_ask fetches the running daemon's backlog from address; it reports false when no daemon answers there. */
+bool daemon_ask(Arena *scratch, String address, int64_t *backlog);

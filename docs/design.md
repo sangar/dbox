@@ -143,13 +143,16 @@ Rollback at any step is the reverse edit.
 
 ### Components
 
-**watcher** — `src/watch.c` over one backend per platform in `src/platform/`:
-inotify on Linux (`linux.c`) and FSEvents on macOS (`macos.c`). inotify is not
-recursive, so the tree is walked at start and every directory added; new
-directories are added as they appear in create events. FSEvents watches the
-root recursively and costs no descriptor per directory. Ignore patterns
-(`.git`, `.DS_Store`, `*.swp`, `~$*`, the index file itself) are applied here
-so noise never enters the pipeline.
+**watcher** — libmc's `mc/platform/watch.h`, read by a thread in
+`src/engine.c`: inotify on Linux and FSEvents on macOS. inotify is not
+recursive, so libmc walks the tree at start and adds every directory, and adds
+new directories as they appear. FSEvents watches the root recursively and
+costs no descriptor per directory. Ignored directories are not watched at all,
+and ignore patterns (`.git`, `.DS_Store`, `*.swp`, `~$*`, the index file
+itself) are applied to every event so noise never enters the pipeline. When an
+event says changes below a path may have gone unreported (a directory moved
+in, a new directory on inotify, dropped events), the engine walks that tree
+and reports every file in it.
 
 Platform caveats:
 
@@ -157,7 +160,7 @@ Platform caveats:
   daemon's error message says how to raise it with `sysctl`.
 - The daemon raises the soft `RLIMIT_NOFILE` to the hard limit at startup.
 
-**debouncer** — a per-path deadline on one timer thread. Each event resets it;
+**debouncer** — libmc's `mc/concurrency/debounce.h`: a per-path deadline on one timer thread. Each event resets it;
 when it fires (default 750ms) the path is sent to the queue. Coalesces the
 burst of Write events during a save, and the Rename+Create pair from
 atomic-save editors. On expiry the path is re-stated so the pipeline acts on
@@ -267,7 +270,7 @@ out by name. Config is re-read on `SIGHUP` (sent by `dbox config edit` and `dbox
 removed store's workers are stopped and its replica rows left in place (they
 are harmless and come back if the store is re-added under the same name).
 
-**daemon** — a `Ctx` that SIGINT/SIGTERM cancel, structured key=value logs,
+**daemon** — a `Cancel` token that SIGINT/SIGTERM request, structured key=value logs,
 a `/healthz`, `/metrics` and `/status` HTTP listener on localhost
 (optional). `dbox status` reads the upload backlog from `/status`.
 Supervised by launchd on macOS and systemd on Linux; no self-daemonising.
@@ -302,27 +305,21 @@ Mirror actions follow from replica rows rather than events:
 
 ```
 dbox/
-  src/main.c                command line: subcommands and flag parsing, the reload loop
+  src/main.c                command line: subcommands and flag parsing, the reload loop, `service enable|disable`
   src/config.c              config.yml: ${VAR} expansion, DBOX_SECTION__KEY overrides, defaults, validation, promote
-  src/yml.c                 libyaml read into a tree that remembers where each scalar sits in the file
   src/ignore.c              ignore patterns from config, always .dbox/
-  src/debounce.c            per-path quiet period on one timer thread
   src/index.c               SQLite: files, replicas, upload failures
   src/store.h               the Store interface; disk.c and s3.c implement it
+  src/content.c             copying and hashing file content
   src/http.c                the HTTP client: the one module that talks to libcurl
   src/s3.c                  S3 over http.c: Signature V4, metadata, multipart above part_size, paginated listing
-  src/watch.c               recursive watcher over the platform's file system events
-  src/queue.c               the de-duplicating path queue and per-path locks
-  src/engine.c              reconcile, the primary workers, poll, conflicts, downloads
+  src/pathqueue.c           the de-duplicating path queue and per-path locks
+  src/engine.c              reconcile, the primary workers, the watcher thread, poll, conflicts, downloads
   src/mirror.c              mirror workers, backfill adoption, verification
   src/daemon.c              pid file, /healthz /metrics /status listener, status client
-  src/service.c             `service enable|disable`: launchd agent / systemd user unit
-  src/error.h               the Error enum every fallible function returns
-  src/alloc.c               the heap allocator; arena.c for objects that die together
-  src/platform/             every OS call: posix.c, plus macos.c (FSEvents) and linux.c (inotify)
-  src/util.c, strbuf.c, strmap.c, sha256.c, ctx.c, log.c   building blocks
-  deps/sqlite, deps/libyaml vendored sources at the versions in deps.lock
-  tests/test_dbox.c         config, index, ignore, debounce, engine scenarios, daemon, service
+  deps/libmc                arenas, strings, errors, containers, YAML and JSON, logging, threads, file watching, login services and every OS call
+  deps/sqlite               vendored at the version in deps.lock
+  tests/test_dbox.c         config, index, ignore, engine scenarios, daemon
   tests/test_s3.c           the S3 store against the compose MinIOs
   docker-compose.yml        two MinIO instances for local dev and tests
   CMakeLists.txt, CMakePresets.json
@@ -330,12 +327,18 @@ dbox/
 ```
 
 Threads replace goroutines: a fixed set of primary workers reads the queue,
-one loop per mirror drains its pending replicas, and short-lived worker sets
-run the parallel parts of a reconcile. Cancellation is a `Ctx` passed through
-every call; its condition variable is also what the queue and the mirror
-loops wait on, so cancelling wakes everything at once.
+one loop per mirror drains its pending replicas, and a libmc thread pool per
+store runs the parallel parts of a reconcile and each mirror batch.
+Cancellation is a libmc `Cancel` passed through every call; its condition
+variable is also what the queue and the mirror loops wait on, so cancelling
+wakes everything at once.
 
-`src/store.h` exposes a five-method interface (`put`, `get`, `del`, `list`,
+Memory comes from libmc arenas. Objects that live for a run (the config, the
+stores, the engine, the index handle) sit in the run's arena, and each path's
+work gets a scratch arena that is destroyed when it is done, so nothing is
+freed piecemeal.
+
+`src/store.h` exposes a five-method interface (`put`, `get`, `remove`, `list`,
 `head`) with `s3` and `disk` implementations. Unit tests use `disk`
 stores in temp directories; MinIO is only needed for the integration suite. Mirror copy
 is `Get` from one store piped into `Put` on another, so adding a new backend
@@ -345,12 +348,12 @@ kind (SFTP, WebDAV) is one file and never touches the sync logic.
 
 | Purpose | Library | From |
 |---|---|---|
-| fs events | inotify (Linux), CoreServices FSEvents (macOS) | the OS, in `src/platform/` |
-| HTTP | libcurl, wrapped by `src/http.c`; `s3.c` adds the Signature V4 signer | the system, for its TLS stack and certificate store |
+| foundation | [libmc](https://github.com/sangar/libmc): arenas, `String`, `Error`, YAML (on cyaml), JSON, logging, threads, SHA-256 and Signature V4, file watching on inotify and FSEvents, login services | `deps/libmc`, pinned in `deps.lock` |
+| HTTP | libcurl, wrapped by `src/http.c` | the system, for its TLS stack and certificate store |
 | index | SQLite, wrapped by `src/index.c` | `deps/sqlite`, pinned in `deps.lock` |
-| config | libyaml, wrapped by `src/yml.c` | `deps/libyaml`, pinned in `deps.lock` |
 
-Everything else is C23 and POSIX. Each library is included from exactly one
+Everything else is C23. libmc is the project's vocabulary and is included
+wherever it is needed; every other library is included from exactly one
 wrapper module, so swapping one changes one file. Credentials come from the config,
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
 `~/.aws/credentials`; instance metadata and SSO are not supported. Requests
@@ -367,7 +370,8 @@ dbox service disable          # stop and remove it
 dbox status                   # shows whether the daemon answers and whether the service is installed
 ```
 
-`src/service.c` is a port of eind's `internal/service` package:
+`dbox service` hands a `Service` to libmc's `mc/platform/service.h`, which
+started as a port of eind's `internal/service` package:
 
 - **macOS** writes `~/Library/LaunchAgents/dbox.plist` with `RunAtLoad` and
   `KeepAlive`, logging to `~/Library/Logs/dbox.log`, then
@@ -406,10 +410,9 @@ What it writes, for reference:
 # ~/.config/systemd/user/dbox.service
 [Unit]
 Description=dbox folder sync
-After=network-online.target
 
 [Service]
-ExecStart="/usr/local/bin/dbox" run
+ExecStart="/usr/local/bin/dbox" "run"
 Restart=on-failure
 RestartSec=5
 
@@ -419,7 +422,7 @@ WantedBy=default.target
 
 ## Testing
 
-- **Unit** (`cmake --workflow --preset debug`): debouncer coalescing, index tombstones and
+- **Unit** (`cmake --workflow --preset debug`): index tombstones and
   conditional verify, ignore matching, config validation (two primaries,
   no primary, bad names, missing env vars, unknown keys) and `Promote`
   keeping comments. Engine scenarios run against `disk` stores in temp
@@ -435,8 +438,9 @@ WantedBy=default.target
   multipart copy streamed from one MinIO's `Get` into the other's `Put`.
 - **Platform:** CI builds and tests on linux-x86_64, linux-aarch64 and macos-aarch64. The watcher
   tests are the only ones that differ meaningfully between inotify and FSEvents.
-  `src/service.c` is tested with the command runner swapped for a recorder,
-  as in eind, so no real `launchctl` or `systemctl` is invoked.
+  The debouncer, the watcher backends and the login services are tested in
+  libmc, the service manager with its command runner swapped for a recorder,
+  so no real `launchctl` or `systemctl` is invoked.
 
 ## Open questions
 

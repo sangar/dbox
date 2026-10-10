@@ -1,79 +1,74 @@
-#ifndef DBOX_CONFIG_H
-#define DBOX_CONFIG_H
+#pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-
-#include "arena.h"
-#include "util.h"
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 
 /*
  * Config is ~/.config/dbox/config.yml: the stores, their roles and the sync
- * settings. See docs/configuration.md for the format.
+ * settings. See docs/configuration.md for the format. A Config and every
+ * string in it live in the arena it was loaded into.
  */
-typedef enum { KIND_NONE, KIND_S3, KIND_DISK } StoreKind;
-typedef enum { ROLE_NONE, ROLE_PRIMARY, ROLE_MIRROR, ROLE_DETACHED } StoreRole;
+typedef enum StoreKind { KIND_NONE, KIND_S3, KIND_DISK } StoreKind;
+typedef enum StoreRole { ROLE_NONE, ROLE_PRIMARY, ROLE_MIRROR, ROLE_DETACHED } StoreRole;
 
-typedef struct {
-    const char *name;
+typedef struct StoreConfig {
+    String name;
     StoreKind kind;
     StoreRole role;
-    const char *bucket, *prefix, *region, *endpoint;
+    String bucket, prefix, region, endpoint;
     bool path_style;
-    const char *access_key, *secret_key, *storage_class, *root;
+    String access_key, secret_key, storage_class, root;
     int workers;
 } StoreConfig;
 
-typedef struct {
-    const char *root;
+typedef struct SyncConfig {
+    String root;
     int64_t pull_interval_ns, backfill_interval_ns, debounce_ns;
     int64_t part_size;
     bool delete_remote, delete_local;
-    const char **ignore;
-    size_t ignore_count;
+    StringList ignore;
 } SyncConfig;
 
-typedef struct {
-    const char *log_level, *log_format, *listen;
+typedef struct DaemonConfig {
+    String log_level, log_format, listen;
 } DaemonConfig;
 
-typedef struct {
-    Arena arena; /* owns every string below */
+typedef struct Config {
     StoreConfig *stores;
-    size_t store_count, store_cap;
+    size_t store_count, store_capacity;
     SyncConfig sync;
     DaemonConfig daemon;
-    const char *path;
+    String path;
 } Config;
 
 /* config_init sets the defaults; config_add_store appends a store, for tests and loading. */
-void config_init(Config *c);
-void config_free(Config *c);
-StoreConfig *config_add_store(Config *c, const char *name);
-StoreConfig *config_store(const Config *c, const char *name);
-const char *config_primary(const Config *c);
-/* config_mirrors returns the mirror names sorted, allocated in a. */
-const char **config_mirrors(const Config *c, Arena *a, size_t *count);
+void config_init(Arena *arena, Config *config);
+StoreConfig *config_add_store(Arena *arena, Config *config, String name);
+StoreConfig *config_store(const Config *config, String name);
+/* config_primary is the primary's name, or empty when no store is configured. */
+String config_primary(const Config *config);
+/* config_mirrors returns the mirror names sorted. */
+StringList config_mirrors(Arena *arena, const Config *config);
 /* config_store_names returns every name, primary first, then mirrors, then detached, each group sorted. */
-const char **config_store_names(const Config *c, Arena *a, size_t *count);
+StringList config_store_names(Arena *arena, const Config *config);
 /* config_state_dir is <root>/.dbox, where the index, temp files and pid file live. */
-char *config_state_dir(const Config *c);
-const char *role_name(StoreRole r);
-const char *kind_name(StoreKind k);
+String config_state_dir(Arena *arena, const Config *config);
+const char *role_name(StoreRole role);
+const char *kind_name(StoreKind kind);
 
 /* config_load reads the file, expands ${VAR}, applies DBOX_ overrides and defaults, and validates. */
-[[nodiscard]] Error config_load(const char *path, Config *c, Err *err);
-[[nodiscard]] Error config_parse(const char *path, const char *text, size_t len, char *const *environ, Config *c, Err *err);
+[[nodiscard]] Error config_load(Arena *arena, String path, Config *config, Err *err);
+/* config_parse is config_load for text already read, with environment as NAME=value entries. */
+[[nodiscard]] Error config_parse(Arena *arena, String path, String text, StringList environment, Config *config, Err *err);
 /* config_render writes the effective config as YAML with secrets masked. */
-void config_render(const Config *c, StrBuf *out);
+String config_render(Arena *arena, const Config *config);
 /* config_default_path is $DBOX_CONFIG, or config.yml under $XDG_CONFIG_HOME/dbox; an existing config.yaml wins over a missing config.yml. */
-char *config_default_path(void);
+String config_default_path(Arena *arena);
 /* config_write_starter creates a commented config unless the file exists; *created says which. */
-[[nodiscard]] Error config_write_starter(const char *path, bool *created, Err *err);
+[[nodiscard]] Error config_write_starter(String path, bool *created, Err *err);
 /* config_promote rewrites the file so store is the primary and the old primary a mirror, keeping comments. */
-[[nodiscard]] Error config_promote(const char *path, const char *store, Err *err);
+[[nodiscard]] Error config_promote(Arena *scratch, String path, String store, Err *err);
 
-[[nodiscard]] Error parse_size(const char *s, int64_t *out, Err *err);
-const char *format_size(int64_t n, char buf[32]);
-
-#endif
+/* parse_size reads a byte count with an optional KiB, MiB or GiB suffix. */
+bool parse_size(String text, int64_t *bytes);
+String format_size(Arena *arena, int64_t bytes);

@@ -5,310 +5,248 @@
  * downloads are staged in a temp directory because callers want a readable
  * descriptor.
  */
-#include <ctype.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <time.h>
 
+#include "content.h"
 #include "http.h"
-#include "platform/platform.h"
+#include "mc/container/sort.h"
+#include "mc/crypto/sigv4.h"
+#include "mc/platform/platform.h"
+#include "mc/text/fmt.h"
+#include "mc/text/path.h"
+#include "mc/text/utf8.h"
 #include "store.h"
 
 #define META_SHA256 "x-amz-meta-sha256"
 #define META_MTIME "x-amz-meta-mtime"
-#define EMPTY_SHA256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-#define MAX_TRIES 3
+
+enum { MAX_TRIES = 3, LIST_PAGE_BLOCK = 64 * 1024 };
 
 typedef struct {
     Store base;
-    char *bucket, *prefix, *region, *storage_class;
-    char *access_key, *secret_key, *session_token;
-    char *scheme, *host; /* host as it appears in the Host header, bucket included when virtual-hosted */
+    String bucket, prefix, region, storage_class;
+    String access_key, secret_key, session_token;
+    String scheme, host; /* host as it appears in the Host header, bucket included when virtual-hosted */
     bool path_style;
     int64_t part_size;
-    char *tmp_dir;
+    String tmp_dir;
 } S3;
 
 typedef struct {
-    const char *key, *value;
-} KV;
+    String name, value;
+} Pair;
 
 typedef struct {
-    const char *method;
-    const char *key; /* NULL for the bucket itself */
-    const KV *query;
+    String method;
+    String key; /* empty for the bucket itself */
+    const Pair *query;
     size_t query_count;
-    const KV *headers; /* extra x-amz-* headers, lowercase names; they are signed */
+    const Pair *headers; /* extra x-amz-* headers, lowercase names; they are signed */
     size_t header_count;
     int body_fd; /* -1 for a memory body or none */
-    int64_t body_off, body_len;
-    const char *body;
-    size_t body_size;
+    int64_t body_offset, body_length;
+    String body;
     int sink_fd; /* where a successful body goes; -1 keeps it in memory */
 } Request;
 
 typedef struct {
+    Arena *arena;
     HttpResponse http;
-    char etag[ETAG_MAX];
+    String etag;
     int64_t content_length;
     int64_t last_modified_ns;
-    char meta_sha256[SHA256_HEX_LEN];
+    String meta_sha256;
     int64_t meta_mtime_ns;
 } Response;
 
-/* ---- encoding ---- */
+/* ---- XML ---- */
 
-static void uri_encode(StrBuf *out, const char *s, bool keep_slash) {
-    static const char hex[] = "0123456789ABCDEF";
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || (c == '/' && keep_slash)) {
-            sb_putc(out, (char)c);
-        } else {
-            sb_putc(out, '%');
-            sb_putc(out, hex[c >> 4]);
-            sb_putc(out, hex[c & 15]);
+static String strip_quotes(String s) {
+    if (s.len >= 2 && s.data[0] == '"' && s.data[s.len - 1] == '"') return str_slice(s, 1, s.len - 1);
+    return s;
+}
+
+static uint64_t parse_number(String digits, unsigned base) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < digits.len; i++) {
+        char c = digits.data[i];
+        unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') : c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) : c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10) : base;
+        if (digit >= base) break;
+        value = value * base + digit;
+    }
+    return value;
+}
+
+static void append_entity(StringBuilder *out, String entity) {
+    static const struct {
+        const char *name;
+        char c;
+    } named[] = {{"quot", '"'}, {"amp", '&'}, {"lt", '<'}, {"gt", '>'}, {"apos", '\''}};
+    for (size_t i = 0; i < countof(named); i++) {
+        if (str_equal(entity, S(named[i].name))) {
+            str_builder_append_char(out, named[i].c);
+            return;
         }
     }
-}
-
-static int compare_kv(const void *a, const void *b) {
-    const KV *x = a, *y = b;
-    int c = strcmp(x->key, y->key);
-    return c ? c : strcmp(x->value, y->value);
-}
-
-static void strip_quotes(char *s) {
-    size_t n = strlen(s);
-    if (n >= 2 && s[0] == '"' && s[n - 1] == '"') {
-        memmove(s, s + 1, n - 2);
-        s[n - 2] = '\0';
+    if (entity.len > 1 && entity.data[0] == '#') {
+        bool hex = entity.data[1] == 'x';
+        uint64_t code = parse_number(str_slice(entity, hex ? 2 : 1, entity.len), hex ? 16 : 10);
+        char encoded[UTF8_MAX_BYTES];
+        str_builder_append(out, (String){encoded, utf8_encode((uint32_t)min_size(code, UINT32_MAX), encoded)});
+        return;
     }
+    str_builder_append_format(out, "&%.*s;", (int)entity.len, entity.data);
 }
 
-static void xml_unescape(StrBuf *out, const char *s, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        if (s[i] != '&') {
-            sb_putc(out, s[i]);
+static String xml_unescape(Arena *arena, String s) {
+    StringBuilder out = str_builder_create(arena, s.len);
+    for (size_t i = 0; i < s.len; i++) {
+        size_t semicolon;
+        if (s.data[i] != '&' || !str_find_char(str_slice(s, i, s.len), ';', &semicolon)) {
+            str_builder_append_char(&out, s.data[i]);
             continue;
         }
-        const char *semi = memchr(s + i, ';', n - i);
-        if (!semi) {
-            sb_putc(out, s[i]);
-            continue;
-        }
-        size_t len = (size_t)(semi - (s + i)) - 1;
-        const char *ent = s + i + 1;
-        if (len == 4 && strncmp(ent, "quot", 4) == 0) sb_putc(out, '"');
-        else if (len == 3 && strncmp(ent, "amp", 3) == 0) sb_putc(out, '&');
-        else if (len == 2 && strncmp(ent, "lt", 2) == 0) sb_putc(out, '<');
-        else if (len == 2 && strncmp(ent, "gt", 2) == 0) sb_putc(out, '>');
-        else if (len == 4 && strncmp(ent, "apos", 4) == 0) sb_putc(out, '\'');
-        else if (len > 1 && ent[0] == '#') {
-            long code = ent[1] == 'x' ? strtol(ent + 2, NULL, 16) : strtol(ent + 1, NULL, 10);
-            if (code < 0x80) {
-                sb_putc(out, (char)code);
-            } else if (code < 0x800) {
-                sb_putc(out, (char)(0xC0 | code >> 6));
-                sb_putc(out, (char)(0x80 | (code & 0x3F)));
-            } else if (code < 0x10000) {
-                sb_putc(out, (char)(0xE0 | code >> 12));
-                sb_putc(out, (char)(0x80 | ((code >> 6) & 0x3F)));
-                sb_putc(out, (char)(0x80 | (code & 0x3F)));
-            } else {
-                sb_putc(out, (char)(0xF0 | code >> 18));
-                sb_putc(out, (char)(0x80 | ((code >> 12) & 0x3F)));
-                sb_putc(out, (char)(0x80 | ((code >> 6) & 0x3F)));
-                sb_putc(out, (char)(0x80 | (code & 0x3F)));
-            }
-        } else {
-            sb_append(out, s + i, len + 2);
-        }
-        i += len + 1;
+        append_entity(&out, str_slice(s, i + 1, i + semicolon));
+        i += semicolon;
     }
+    return str_builder_finish(&out);
 }
 
-/* xml_element finds the first <tag> inside [s, end) and returns its content range, or NULL. */
-static const char *xml_element(const char *s, const char *end, const char *tag, const char **content_end) {
+/* xml_element finds the first <tag> in s; content is what it encloses and after is what follows its closing tag. */
+static bool xml_element(String s, const char *tag, String *content, String *after) {
     char open[64], close[64];
     snprintf(open, sizeof open, "<%s>", tag);
     snprintf(close, sizeof close, "</%s>", tag);
-    size_t open_len = strlen(open), close_len = strlen(close);
-    for (const char *p = s; p + open_len <= end; p++) {
-        if (memcmp(p, open, open_len) != 0) continue;
-        const char *start = p + open_len;
-        for (const char *q = start; q + close_len <= end; q++) {
-            if (memcmp(q, close, close_len) == 0) {
-                *content_end = q;
-                return start;
-            }
-        }
-        return NULL;
-    }
-    return NULL;
+    size_t start, end;
+    if (!str_find(s, S(open), &start)) return false;
+    String rest = str_slice(s, start + strlen(open), s.len);
+    if (!str_find(rest, S(close), &end)) return false;
+    *content = str_slice(rest, 0, end);
+    if (after) *after = str_slice(rest, end + strlen(close), rest.len);
+    return true;
 }
 
-/* xml_text returns the unescaped text of the first <tag> in [s, end), or "" when absent. */
-static char *xml_text(Arena *a, const char *s, const char *end, const char *tag) {
-    const char *content_end;
-    const char *start = xml_element(s, end, tag, &content_end);
-    if (!start) return arena_strdup(a, "");
-    StrBuf sb = {0};
-    xml_unescape(&sb, start, (size_t)(content_end - start));
-    char *out = arena_strdup(a, sb_cstr(&sb));
-    sb_free(&sb);
-    return out;
+/* xml_text returns the unescaped text of the first <tag> in s, or "" when absent. */
+static String xml_text(Arena *arena, String s, const char *tag) {
+    String content;
+    return xml_element(s, tag, &content, nullptr) ? xml_unescape(arena, content) : S("");
 }
 
 /* ---- time ---- */
 
-static int64_t parse_iso8601(const char *s) {
-    struct tm tm = {0};
-    int year, mon, day, hour, min, sec;
-    if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &mon, &day, &hour, &min, &sec) != 6) return 0;
-    tm.tm_year = year - 1900;
-    tm.tm_mon = mon - 1;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = min;
-    tm.tm_sec = sec;
-    int64_t ns = (int64_t)timegm(&tm) * NS_PER_SEC;
-    const char *dot = strchr(s, '.');
-    if (dot) {
-        int64_t frac = 0, scale = NS_PER_SEC;
-        for (const char *p = dot + 1; isdigit((unsigned char)*p) && scale > 1; p++) {
+static int64_t field(String s, size_t start, size_t end) {
+    uint64_t value = 0;
+    return str_parse_u64(str_slice(s, start, end), &value) ? (int64_t)value : 0;
+}
+
+static int64_t unix_ns(int64_t year, int64_t month, int64_t day, int64_t hour, int64_t minute, int64_t second) {
+    int64_t days = civil_to_days((CivilDate){.year = year, .month = (unsigned)month, .day = (unsigned)day});
+    return ((days * 24 + hour) * 60 + minute) * 60 * NS_PER_SECOND + second * NS_PER_SECOND;
+}
+
+/* parse_iso8601 reads 2024-03-13T10:00:00.123Z, as ListObjectsV2 writes LastModified. */
+static int64_t parse_iso8601(String s) {
+    if (s.len < 19 || s.data[4] != '-' || s.data[10] != 'T') return 0;
+    int64_t ns = unix_ns(field(s, 0, 4), field(s, 5, 7), field(s, 8, 10), field(s, 11, 13), field(s, 14, 16), field(s, 17, 19));
+    if (s.len > 20 && s.data[19] == '.') {
+        int64_t scale = NS_PER_SECOND;
+        for (size_t i = 20; i < s.len && s.data[i] >= '0' && s.data[i] <= '9' && scale > 1; i++) {
             scale /= 10;
-            frac += (*p - '0') * scale;
+            ns += (s.data[i] - '0') * scale;
         }
-        ns += frac;
     }
     return ns;
 }
 
-static int64_t parse_rfc1123(const char *s) {
-    struct tm tm = {0};
-    if (!strptime(s, "%a, %d %b %Y %H:%M:%S", &tm)) return 0;
-    return (int64_t)timegm(&tm) * NS_PER_SEC;
+/* parse_rfc1123 reads Wed, 13 Mar 2024 10:00:00 GMT, as the Last-Modified header carries it. */
+static int64_t parse_rfc1123(Arena *arena, String s) {
+    static const char *const months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    StringList fields = str_fields(arena, s);
+    if (fields.count < 5 || fields.items[4].len != 8) return 0;
+    int64_t month = 0;
+    for (size_t i = 0; i < countof(months); i++)
+        if (str_equal(fields.items[2], S(months[i]))) month = (int64_t)i + 1;
+    if (month == 0) return 0;
+    String clock = fields.items[4];
+    return unix_ns(field(fields.items[3], 0, 4), month, field(fields.items[1], 0, 2), field(clock, 0, 2), field(clock, 3, 5), field(clock, 6, 8));
 }
 
 /* ---- the HTTP layer ---- */
 
 /* on_header picks the object metadata out of the response headers; a new status line resets it. */
-static void on_header(void *user, const char *line, size_t name_len, const char *value) {
-    Response *r = user;
-    if (!line) {
-        r->etag[0] = r->meta_sha256[0] = '\0';
+static void on_header(void *context, String name, String value) {
+    Response *r = context;
+    if (name.len == 0) {
+        r->etag = r->meta_sha256 = S("");
         r->content_length = -1;
         r->last_modified_ns = r->meta_mtime_ns = 0;
         return;
     }
-    if (name_len == 4 && strncasecmp(line, "etag", 4) == 0) {
-        snprintf(r->etag, sizeof r->etag, "%.*s", ETAG_MAX - 1, value);
-        strip_quotes(r->etag);
-    } else if (name_len == 14 && strncasecmp(line, "content-length", 14) == 0) {
-        r->content_length = strtoll(value, NULL, 10);
-    } else if (name_len == 13 && strncasecmp(line, "last-modified", 13) == 0) {
-        r->last_modified_ns = parse_rfc1123(value);
-    } else if (name_len == strlen(META_SHA256) && strncasecmp(line, META_SHA256, name_len) == 0) {
-        snprintf(r->meta_sha256, sizeof r->meta_sha256, "%.*s", SHA256_HEX_LEN - 1, value);
-    } else if (name_len == strlen(META_MTIME) && strncasecmp(line, META_MTIME, name_len) == 0) {
-        r->meta_mtime_ns = strtoll(value, NULL, 10);
-    }
+    int64_t number;
+    if (str_equal_ignore_case(name, S("etag"))) r->etag = str_copy(r->arena, strip_quotes(value));
+    else if (str_equal_ignore_case(name, S("content-length"))) r->content_length = str_parse_i64(value, &number) ? number : -1;
+    else if (str_equal_ignore_case(name, S("last-modified"))) r->last_modified_ns = parse_rfc1123(r->arena, value);
+    else if (str_equal_ignore_case(name, S(META_SHA256))) r->meta_sha256 = str_copy(r->arena, value);
+    else if (str_equal_ignore_case(name, S(META_MTIME))) r->meta_mtime_ns = str_parse_i64(value, &number) ? number : 0;
 }
 
-static void canonical_uri(const S3 *s, const Request *req, StrBuf *out) {
-    sb_putc(out, '/');
+static String canonical_uri(Arena *arena, const S3 *s, const Request *req) {
+    StringBuilder out = str_builder_create(arena, 128);
+    str_builder_append_char(&out, '/');
     if (s->path_style) {
-        sb_puts(out, s->bucket);
-        if (req->key) sb_putc(out, '/');
+        str_builder_append(&out, s->bucket);
+        if (req->key.len > 0) str_builder_append_char(&out, '/');
     }
-    if (req->key) {
-        StrBuf full = {0};
-        sb_printf(&full, "%s%s", s->prefix, req->key);
-        uri_encode(out, sb_cstr(&full), true);
-        sb_free(&full);
-    }
+    if (req->key.len > 0) str_builder_append(&out, str_percent_encode(arena, str_concat(arena, s->prefix, req->key), true));
+    return str_builder_finish(&out);
 }
 
-static void canonical_query(const Request *req, StrBuf *out) {
-    KV *sorted = xmalloc((req->query_count + 1) * sizeof *sorted);
-    memcpy(sorted, req->query, req->query_count * sizeof *sorted);
-    qsort(sorted, req->query_count, sizeof *sorted, compare_kv);
+static int compare_pairs(const void *context, const void *a, const void *b) {
+    const Pair *x = a, *y = b;
+    int c = str_compare(x->name, y->name);
+    return c ? c : str_compare(x->value, y->value);
+}
+
+static String canonical_query(Arena *arena, const Request *req) {
+    Pair *sorted = arena_push(arena, arena_size_mul(req->query_count + 1, sizeof *sorted));
+    if (req->query_count > 0) memcpy(sorted, req->query, req->query_count * sizeof *sorted);
+    sort_stable(arena, sorted, req->query_count, sizeof *sorted, compare_pairs, nullptr);
+    StringBuilder out = str_builder_create(arena, 128);
     for (size_t i = 0; i < req->query_count; i++) {
-        if (i) sb_putc(out, '&');
-        uri_encode(out, sorted[i].key, false);
-        sb_putc(out, '=');
-        uri_encode(out, sorted[i].value, false);
+        if (i) str_builder_append_char(&out, '&');
+        str_builder_append(&out, str_percent_encode(arena, sorted[i].name, false));
+        str_builder_append_char(&out, '=');
+        str_builder_append(&out, str_percent_encode(arena, sorted[i].value, false));
     }
-    xfree(sorted);
+    return str_builder_finish(&out);
 }
 
-static void hmac_hex_chain(const S3 *s, const char *date, const char *string_to_sign, char signature[SHA256_HEX_LEN]) {
-    uint8_t k_date[SHA256_LEN], k_region[SHA256_LEN], k_service[SHA256_LEN], k_signing[SHA256_LEN], sig[SHA256_LEN];
-    StrBuf secret = {0};
-    sb_printf(&secret, "AWS4%s", s->secret_key);
-    hmac_sha256(secret.data, secret.len, date, strlen(date), k_date);
-    sb_free(&secret);
-    hmac_sha256(k_date, SHA256_LEN, s->region, strlen(s->region), k_region);
-    hmac_sha256(k_region, SHA256_LEN, "s3", 2, k_service);
-    hmac_sha256(k_service, SHA256_LEN, "aws4_request", 12, k_signing);
-    hmac_sha256(k_signing, SHA256_LEN, string_to_sign, strlen(string_to_sign), sig);
-    hex_encode(sig, SHA256_LEN, signature);
+static String header_line(Arena *arena, String name, String value) {
+    return str_format(arena, "%.*s: %.*s", (int)name.len, name.data, (int)value.len, value.data);
 }
 
-/* sign builds the signed header lines for req; uri and query are the canonical forms also used in the URL. */
-static void sign(const S3 *s, const Request *req, const char *uri, const char *query, const char *payload_hash, StrList *lines) {
-    char amz_date[20], date[9];
-    time_t now = time(NULL);
-    struct tm tm;
-    gmtime_r(&now, &tm);
-    strftime(amz_date, sizeof amz_date, "%Y%m%dT%H%M%SZ", &tm);
-    strftime(date, sizeof date, "%Y%m%d", &tm);
-
-    size_t n = 0;
-    KV headers[32];
-    headers[n++] = (KV){"host", s->host};
-    headers[n++] = (KV){"x-amz-content-sha256", payload_hash};
-    headers[n++] = (KV){"x-amz-date", amz_date};
-    if (*s->session_token) headers[n++] = (KV){"x-amz-security-token", s->session_token};
-    for (size_t i = 0; i < req->header_count && n < countof(headers); i++) headers[n++] = req->headers[i];
-    qsort(headers, n, sizeof *headers, compare_kv);
-
-    StrBuf canonical = {0}, signed_names = {0};
-    sb_printf(&canonical, "%s\n%s\n%s\n", req->method, uri, query);
-    for (size_t i = 0; i < n; i++) {
-        sb_printf(&canonical, "%s:%s\n", headers[i].key, headers[i].value);
-        sb_printf(&signed_names, "%s%s", i ? ";" : "", headers[i].key);
-    }
-    sb_printf(&canonical, "\n%s\n%s", sb_cstr(&signed_names), payload_hash);
-    char request_hash[SHA256_HEX_LEN];
-    sha256_of(canonical.data, canonical.len, request_hash);
-
-    StrBuf scope = {0}, to_sign = {0};
-    sb_printf(&scope, "%s/%s/s3/aws4_request", date, s->region);
-    sb_printf(&to_sign, "AWS4-HMAC-SHA256\n%s\n%s\n%s", amz_date, sb_cstr(&scope), request_hash);
-    char signature[SHA256_HEX_LEN];
-    hmac_hex_chain(s, date, sb_cstr(&to_sign), signature);
-
-    StrBuf line = {0};
-    for (size_t i = 0; i < n; i++) {
-        if (strcmp(headers[i].key, "host") == 0) continue;
-        sb_clear(&line);
-        sb_printf(&line, "%s: %s", headers[i].key, headers[i].value);
-        strlist_push(lines, sb_cstr(&line));
-    }
-    sb_clear(&line);
-    sb_printf(&line, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s", s->access_key, sb_cstr(&scope),
-              sb_cstr(&signed_names), signature);
-    strlist_push(lines, sb_cstr(&line));
-    strlist_push(lines, "Expect:");
-    sb_free(&line);
-    sb_free(&canonical);
-    sb_free(&signed_names);
-    sb_free(&scope);
-    sb_free(&to_sign);
+/* signed_headers returns the header lines for req, the Authorization header last; uri and query are the canonical forms also used in the URL. */
+static StringList signed_headers(Arena *arena, const S3 *s, const Request *req, String uri, String query, String payload_hash) {
+    StringList amz = {0};
+    strlist_push(arena, &amz, header_line(arena, S("x-amz-content-sha256"), payload_hash));
+    if (s->session_token.len > 0) strlist_push(arena, &amz, header_line(arena, S("x-amz-security-token"), s->session_token));
+    for (size_t i = 0; i < req->header_count; i++) strlist_push(arena, &amz, header_line(arena, req->headers[i].name, req->headers[i].value));
+    SigV4Request signing = {
+        .method = req->method,
+        .path = uri,
+        .query = query,
+        .host = s->host,
+        .amz_date = sigv4_date(arena, clock_wall_ns() / NS_PER_SECOND),
+        .headers = amz,
+        .payload_hash = payload_hash,
+    };
+    SigV4Credentials credentials = {.access_key = s->access_key, .secret_key = s->secret_key, .region = s->region, .service = S("s3")};
+    StringList lines = strlist_copy(arena, amz);
+    strlist_push(arena, &lines, header_line(arena, S("x-amz-date"), signing.amz_date));
+    strlist_push(arena, &lines, header_line(arena, S("Authorization"), sigv4_authorization(arena, signing, credentials)));
+    strlist_push(arena, &lines, S("Expect:"));
+    return lines;
 }
 
 /* retryable says whether a failed attempt is worth another: any transport failure except cancellation, or a throttling or server error status. */
@@ -318,447 +256,327 @@ static bool retryable(Error e, long status) {
 }
 
 /* perform sends req once and fills resp; transport failures are the error, HTTP statuses are left in resp. */
-[[nodiscard]] static Error perform(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
-    StrBuf uri = {0}, query = {0}, url = {0};
-    canonical_uri(s, req, &uri);
-    canonical_query(req, &query);
-    sb_printf(&url, "%s://%s%s", s->scheme, s->host, sb_cstr(&uri));
-    if (query.len) sb_printf(&url, "?%s", query.data);
-
-    char payload_hash[SHA256_HEX_LEN];
-    if (req->body_fd >= 0) snprintf(payload_hash, sizeof payload_hash, "UNSIGNED-PAYLOAD");
-    else if (req->body) sha256_of(req->body, req->body_size, payload_hash);
-    else snprintf(payload_hash, sizeof payload_hash, EMPTY_SHA256);
-    StrList headers = {0};
-    sign(s, req, sb_cstr(&uri), sb_cstr(&query), payload_hash, &headers);
-
-    HttpRequest http = {.method = req->method,
-                        .url = sb_cstr(&url),
-                        .headers = (const char *const *)headers.items,
-                        .header_count = headers.len,
-                        .body_fd = req->body_fd,
-                        .body_off = req->body_off,
-                        .body_len = req->body_len,
-                        .body = req->body,
-                        .body_size = req->body_size,
-                        .sink_fd = req->sink_fd,
-                        .on_header = on_header,
-                        .user = resp};
-    Error e = http_perform(ctx, &http, &resp->http, err);
-    strlist_free(&headers);
-    sb_free(&uri);
-    sb_free(&query);
-    sb_free(&url);
-    return e;
+[[nodiscard]] static Error perform(S3 *s, Cancel *cancel, const Request *req, Response *resp, Err *err) {
+    Arena *arena = resp->arena;
+    String uri = canonical_uri(arena, s, req);
+    String query = canonical_query(arena, req);
+    String url = str_format(arena, "%.*s://%.*s%.*s%s%.*s", (int)s->scheme.len, s->scheme.data, (int)s->host.len, s->host.data, (int)uri.len, uri.data,
+                            query.len ? "?" : "", (int)query.len, query.data);
+    String payload_hash = req->body_fd >= 0 ? S("UNSIGNED-PAYLOAD") : sigv4_payload_hash(arena, req->body);
+    HttpRequest http = {
+        .method = req->method,
+        .url = url,
+        .headers = signed_headers(arena, s, req, uri, query, payload_hash),
+        .body_fd = req->body_fd,
+        .body_offset = req->body_offset,
+        .body_length = req->body_length,
+        .body = req->body,
+        .sink_fd = req->sink_fd,
+        .on_header = on_header,
+        .context = resp,
+    };
+    return http_perform(cancel, arena, &http, &resp->http, err);
 }
 
-static void response_init(Response *r) {
-    memset(r, 0, sizeof *r);
-    http_response_init(&r->http);
-    r->content_length = -1;
-}
-
-static void response_free(Response *r) { http_response_free(&r->http); }
+static Response response_create(Arena *arena) { return (Response){.arena = arena, .etag = S(""), .meta_sha256 = S(""), .content_length = -1}; }
 
 /* request sends req, retrying transient failures, and leaves the status in resp. */
-[[nodiscard]] static Error request(S3 *s, Ctx *ctx, const Request *req, Response *resp, Err *err) {
+[[nodiscard]] static Error request(S3 *s, Cancel *cancel, const Request *req, Response *resp, Err *err) {
     static const int64_t backoff_ms[MAX_TRIES] = {0, 200, 1000};
     for (int attempt = 0;; attempt++) {
         if (attempt > 0) {
-            if (!ctx_sleep(ctx, backoff_ms[attempt])) return err_set(err, ERR_CANCELLED, "cancelled");
+            if (!cancel_sleep(cancel, backoff_ms[attempt])) return err_set(err, ERR_CANCELLED, "cancelled");
             if (req->sink_fd >= 0) {
-                Error truncated = file_truncate(req->sink_fd, err);
-                if (truncated != ERR_OK) return truncated;
+                Error e = file_truncate(req->sink_fd, 0, err);
+                if (e == ERR_OK) e = file_seek(req->sink_fd, 0, err);
+                if (e != ERR_OK) return e;
             }
         }
-        Error e = perform(s, ctx, req, resp, err);
+        Error e = perform(s, cancel, req, resp, err);
         if (!retryable(e, e == ERR_OK ? resp->http.status : 0) || attempt + 1 == MAX_TRIES) return e;
     }
 }
 
 /* fail_status describes a non-2xx response. */
-[[nodiscard]] static Error fail_status(const Request *req, Response *resp, Err *err) {
+[[nodiscard]] static Error fail_status(const Request *req, const Response *resp, Err *err) {
     if (resp->http.status == 404) return ERR_NOT_FOUND;
-    Arena a;
-    arena_init(&a, 4096);
-    const char *end = resp->http.body.data ? resp->http.body.data + resp->http.body.len : NULL;
-    const char *code = end ? xml_text(&a, resp->http.body.data, end, "Code") : "";
-    const char *message = end ? xml_text(&a, resp->http.body.data, end, "Message") : "";
-    Error e = err_set(err, ERR_REMOTE, "%s %s: HTTP %ld%s%s%s%s", req->method, req->key ? req->key : "/", resp->http.status, *code ? " " : "", code,
-                      *message ? ": " : "", message);
-    arena_free(&a);
-    return e;
+    String code = xml_text(resp->arena, resp->http.body, "Code");
+    String message = xml_text(resp->arena, resp->http.body, "Message");
+    String key = req->key.len > 0 ? req->key : S("/");
+    return err_set(err, ERR_NETWORK, "%.*s %.*s: HTTP %ld%s%.*s%s%.*s", (int)req->method.len, req->method.data, (int)key.len, key.data, resp->http.status,
+                   code.len ? " " : "", (int)code.len, code.data, message.len ? ": " : "", (int)message.len, message.data);
 }
 
 static bool ok_status(long status) { return status >= 200 && status < 300; }
 
 /* ---- the store operations ---- */
 
-static size_t meta_headers(const S3 *s, const Meta *meta, KV out[4], char mtime[32]) {
+static size_t meta_headers(Arena *arena, const S3 *s, Meta meta, Pair out[3]) {
     size_t n = 0;
-    out[n++] = (KV){META_SHA256, meta->sha256};
-    if (meta->mtime_ns != 0) {
-        snprintf(mtime, 32, "%lld", (long long)meta->mtime_ns);
-        out[n++] = (KV){META_MTIME, mtime};
-    }
-    if (*s->storage_class) out[n++] = (KV){"x-amz-storage-class", s->storage_class};
+    out[n++] = (Pair){S(META_SHA256), meta.sha256};
+    if (meta.mtime_ns != 0) out[n++] = (Pair){S(META_MTIME), str_format(arena, "%lld", (long long)meta.mtime_ns)};
+    if (s->storage_class.len > 0) out[n++] = (Pair){S("x-amz-storage-class"), s->storage_class};
     return n;
 }
 
-[[nodiscard]] static Error put_single(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
-    KV headers[4];
-    char mtime[32];
-    Request req = {.method = "PUT", .key = key, .headers = headers, .header_count = meta_headers(s, meta, headers, mtime), .body_fd = fd, .body_len = size, .sink_fd = -1};
-    Response resp;
-    response_init(&resp);
-    Error e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK) {
-        if (ok_status(resp.http.status)) snprintf(etag, ETAG_MAX, "%s", resp.etag);
-        else e = fail_status(&req, &resp, err);
-    }
-    response_free(&resp);
-    return e;
+[[nodiscard]] static Error put_single(S3 *s, Cancel *cancel, Arena *arena, String key, int fd, int64_t size, Meta meta, String *etag, Err *err) {
+    Pair headers[3];
+    Request req = {.method = S("PUT"), .key = key, .headers = headers, .header_count = meta_headers(arena, s, meta, headers), .body_fd = fd, .body_length = size, .sink_fd = -1};
+    Response resp = response_create(arena);
+    Error e = request(s, cancel, &req, &resp, err);
+    if (e != ERR_OK) return e;
+    if (!ok_status(resp.http.status)) return fail_status(&req, &resp, err);
+    *etag = resp.etag;
+    return ERR_OK;
 }
 
-static void abort_upload(S3 *s, Ctx *ctx, const char *key, const char *upload_id) {
-    KV query[] = {{"uploadId", upload_id}};
-    Request req = {.method = "DELETE", .key = key, .query = query, .query_count = 1, .body_fd = -1, .sink_fd = -1};
-    Response resp;
-    response_init(&resp);
-    Err ignored;
-    (void)request(s, ctx, &req, &resp, &ignored);
-    response_free(&resp);
+static void abort_upload(S3 *s, Cancel *cancel, Arena *arena, String key, String upload_id) {
+    Pair query[] = {{S("uploadId"), upload_id}};
+    Request req = {.method = S("DELETE"), .key = key, .query = query, .query_count = 1, .body_fd = -1, .sink_fd = -1};
+    Response resp = response_create(arena);
+    (void)request(s, cancel, &req, &resp, nullptr);
 }
 
-[[nodiscard]] static Error put_multipart(S3 *s, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
-    Arena a;
-    arena_init(&a, 16 * 1024);
-    Response resp;
-    response_init(&resp);
-    KV headers[4];
-    char mtime[32];
-    KV start_query[] = {{"uploads", ""}};
-    Request start = {.method = "POST", .key = key, .query = start_query, .query_count = 1, .headers = headers, .header_count = meta_headers(s, meta, headers, mtime), .body_fd = -1, .sink_fd = -1};
-    Error e = request(s, ctx, &start, &resp, err);
-    if (e != ERR_OK) goto out;
-    if (!ok_status(resp.http.status)) {
-        e = fail_status(&start, &resp, err);
-        goto out;
-    }
-    char *upload_id = xml_text(&a, resp.http.body.data, resp.http.body.data + resp.http.body.len, "UploadId");
-    if (!*upload_id) {
-        e = err_set(err, ERR_REMOTE, "POST %s: no UploadId in response", key);
-        goto out;
-    }
-    StrBuf parts = {0};
-    sb_puts(&parts, "<CompleteMultipartUpload>");
-    for (int64_t off = 0, number = 1; e == ERR_OK && off < size; off += s->part_size, number++) {
-        char num[24];
-        snprintf(num, sizeof num, "%lld", (long long)number);
-        KV query[] = {{"partNumber", num}, {"uploadId", upload_id}};
-        Request part = {.method = "PUT", .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_off = off, .body_len = min_i64(s->part_size, size - off), .sink_fd = -1};
-        e = request(s, ctx, &part, &resp, err);
+[[nodiscard]] static Error put_multipart(S3 *s, Cancel *cancel, Arena *arena, String key, int fd, int64_t size, Meta meta, String *etag, Err *err) {
+    Response resp = response_create(arena);
+    Pair headers[3];
+    Pair start_query[] = {{S("uploads"), S("")}};
+    Request start = {.method = S("POST"), .key = key, .query = start_query, .query_count = 1, .headers = headers, .header_count = meta_headers(arena, s, meta, headers), .body_fd = -1, .sink_fd = -1};
+    Error e = request(s, cancel, &start, &resp, err);
+    if (e != ERR_OK) return e;
+    if (!ok_status(resp.http.status)) return fail_status(&start, &resp, err);
+    String upload_id = xml_text(arena, resp.http.body, "UploadId");
+    if (upload_id.len == 0) return err_set(err, ERR_NETWORK, "POST %.*s: no UploadId in response", (int)key.len, key.data);
+    StringBuilder parts = str_builder_create(arena, 1024);
+    str_builder_append(&parts, S("<CompleteMultipartUpload>"));
+    for (int64_t offset = 0, number = 1; e == ERR_OK && offset < size; offset += s->part_size, number++) {
+        String part_number = str_format(arena, "%lld", (long long)number);
+        Pair query[] = {{S("partNumber"), part_number}, {S("uploadId"), upload_id}};
+        int64_t length = s->part_size < size - offset ? s->part_size : size - offset;
+        Request part = {.method = S("PUT"), .key = key, .query = query, .query_count = 2, .body_fd = fd, .body_offset = offset, .body_length = length, .sink_fd = -1};
+        e = request(s, cancel, &part, &resp, err);
         if (e == ERR_OK && !ok_status(resp.http.status)) e = fail_status(&part, &resp, err);
-        if (e == ERR_OK) sb_printf(&parts, "<Part><PartNumber>%s</PartNumber><ETag>\"%s\"</ETag></Part>", num, resp.etag);
+        if (e == ERR_OK)
+            str_builder_append_format(&parts, "<Part><PartNumber>%.*s</PartNumber><ETag>\"%.*s\"</ETag></Part>", (int)part_number.len, part_number.data, (int)resp.etag.len,
+                                      resp.etag.data);
     }
-    sb_puts(&parts, "</CompleteMultipartUpload>");
+    str_builder_append(&parts, S("</CompleteMultipartUpload>"));
     if (e == ERR_OK) {
-        KV query[] = {{"uploadId", upload_id}};
-        Request complete = {.method = "POST", .key = key, .query = query, .query_count = 1, .body_fd = -1, .body = parts.data, .body_size = parts.len, .sink_fd = -1};
-        e = request(s, ctx, &complete, &resp, err);
+        Pair query[] = {{S("uploadId"), upload_id}};
+        Request complete = {.method = S("POST"), .key = key, .query = query, .query_count = 1, .body_fd = -1, .body = str_builder_finish(&parts), .sink_fd = -1};
+        e = request(s, cancel, &complete, &resp, err);
         if (e == ERR_OK && !ok_status(resp.http.status)) e = fail_status(&complete, &resp, err);
         if (e == ERR_OK) {
-            const char *end = resp.http.body.data + resp.http.body.len;
-            char *code = xml_text(&a, resp.http.body.data, end, "Code");
-            if (*code) {
-                e = err_set(err, ERR_REMOTE, "POST %s: %s: %s", key, code, xml_text(&a, resp.http.body.data, end, "Message"));
+            String code = xml_text(arena, resp.http.body, "Code");
+            if (code.len > 0) {
+                String message = xml_text(arena, resp.http.body, "Message");
+                e = err_set(err, ERR_NETWORK, "POST %.*s: %.*s: %.*s", (int)key.len, key.data, (int)code.len, code.data, (int)message.len, message.data);
             } else {
-                char *tag = xml_text(&a, resp.http.body.data, end, "ETag");
-                strip_quotes(tag);
-                snprintf(etag, ETAG_MAX, "%s", *tag ? tag : resp.etag);
+                String tag = strip_quotes(xml_text(arena, resp.http.body, "ETag"));
+                *etag = tag.len > 0 ? tag : resp.etag;
             }
         }
     }
-    sb_free(&parts);
-    if (e != ERR_OK) abort_upload(s, ctx, key, upload_id);
-out:
-    response_free(&resp);
-    arena_free(&a);
+    if (e != ERR_OK) abort_upload(s, cancel, arena, key, upload_id);
     return e;
 }
 
-[[nodiscard]] static Error s3_put(Store *base, Ctx *ctx, const char *key, int fd, int64_t size, const Meta *meta, char etag[ETAG_MAX], Err *err) {
-    S3 *s = (S3 *)base;
-    if (size < s->part_size) return put_single(s, ctx, key, fd, size, meta, etag, err);
-    return put_multipart(s, ctx, key, fd, size, meta, etag, err);
+[[nodiscard]] static Error s3_put(Store *store, Cancel *cancel, Arena *arena, String key, int fd, int64_t size, Meta meta, String *etag, Err *err) {
+    S3 *s = (S3 *)store;
+    if (size < s->part_size) return put_single(s, cancel, arena, key, fd, size, meta, etag, err);
+    return put_multipart(s, cancel, arena, key, fd, size, meta, etag, err);
 }
 
-static void describe(Object *obj, const char *key, const Response *resp) {
-    memset(obj, 0, sizeof *obj);
-    obj->key = key;
-    obj->size = resp->content_length < 0 ? 0 : resp->content_length;
-    snprintf(obj->etag, sizeof obj->etag, "%s", resp->etag);
-    snprintf(obj->sha256, sizeof obj->sha256, "%s", resp->meta_sha256);
-    obj->mtime_ns = resp->meta_mtime_ns ? resp->meta_mtime_ns : resp->last_modified_ns;
+static Object describe(String key, const Response *resp) {
+    return (Object){
+        .key = key,
+        .size = resp->content_length < 0 ? 0 : resp->content_length,
+        .etag = resp->etag,
+        .sha256 = resp->meta_sha256,
+        .mtime_ns = resp->meta_mtime_ns ? resp->meta_mtime_ns : resp->last_modified_ns,
+    };
 }
 
-[[nodiscard]] static Error s3_get(Store *base, Ctx *ctx, const char *key, Object *obj, int *fd, Err *err) {
-    S3 *s = (S3 *)base;
+[[nodiscard]] static Error s3_get(Store *store, Cancel *cancel, Arena *arena, String key, Object *object, int *fd, Err *err) {
+    S3 *s = (S3 *)store;
     int tmp;
-    Error e = temp_file(s->tmp_dir, &tmp, err);
+    Error e = temp_file(arena, s->tmp_dir, &tmp, err);
     if (e != ERR_OK) return e;
-    Request req = {.method = "GET", .key = key, .body_fd = -1, .sink_fd = tmp};
-    Response resp;
-    response_init(&resp);
-    e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK) {
-        if (ok_status(resp.http.status)) {
-            describe(obj, key, &resp);
-            if (resp.content_length < 0) obj->size = file_position(tmp);
-            (void)file_seek_start(tmp, NULL);
-            *fd = tmp;
-        } else {
-            e = fail_status(&req, &resp, err);
-        }
+    Request req = {.method = S("GET"), .key = key, .body_fd = -1, .sink_fd = tmp};
+    Response resp = response_create(arena);
+    e = request(s, cancel, &req, &resp, err);
+    if (e == ERR_OK && !ok_status(resp.http.status)) e = fail_status(&req, &resp, err);
+    FileInfo info = {0};
+    if (e == ERR_OK && resp.content_length < 0) e = file_info_fd(tmp, &info, err);
+    if (e == ERR_OK) e = file_seek(tmp, 0, err);
+    if (e != ERR_OK) {
+        file_close(tmp);
+        return e;
     }
-    if (e != ERR_OK) file_close(tmp);
-    response_free(&resp);
-    return e;
+    *object = describe(key, &resp);
+    if (resp.content_length < 0) object->size = info.size;
+    *fd = tmp;
+    return ERR_OK;
 }
 
-[[nodiscard]] static Error s3_head(Store *base, Ctx *ctx, const char *key, Object *obj, Err *err) {
-    S3 *s = (S3 *)base;
-    Request req = {.method = "HEAD", .key = key, .body_fd = -1, .sink_fd = -1};
-    Response resp;
-    response_init(&resp);
-    Error e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK) {
-        if (ok_status(resp.http.status)) describe(obj, key, &resp);
-        else if (resp.http.status == 404) e = ERR_NOT_FOUND;
-        else e = err_set(err, ERR_REMOTE, "HEAD %s: HTTP %ld", key, resp.http.status);
-    }
-    response_free(&resp);
-    return e;
+[[nodiscard]] static Error s3_head(Store *store, Cancel *cancel, Arena *arena, String key, Object *object, Err *err) {
+    S3 *s = (S3 *)store;
+    Request req = {.method = S("HEAD"), .key = key, .body_fd = -1, .sink_fd = -1};
+    Response resp = response_create(arena);
+    Error e = request(s, cancel, &req, &resp, err);
+    if (e != ERR_OK) return e;
+    if (resp.http.status == 404) return ERR_NOT_FOUND;
+    if (!ok_status(resp.http.status)) return err_set(err, ERR_NETWORK, "HEAD %.*s: HTTP %ld", (int)key.len, key.data, resp.http.status);
+    *object = describe(key, &resp);
+    return ERR_OK;
 }
 
-[[nodiscard]] static Error s3_delete(Store *base, Ctx *ctx, const char *key, Err *err) {
-    S3 *s = (S3 *)base;
-    Request req = {.method = "DELETE", .key = key, .body_fd = -1, .sink_fd = -1};
-    Response resp;
-    response_init(&resp);
-    Error e = request(s, ctx, &req, &resp, err);
+[[nodiscard]] static Error s3_remove(Store *store, Cancel *cancel, Arena *arena, String key, Err *err) {
+    S3 *s = (S3 *)store;
+    Request req = {.method = S("DELETE"), .key = key, .body_fd = -1, .sink_fd = -1};
+    Response resp = response_create(arena);
+    Error e = request(s, cancel, &req, &resp, err);
     if (e == ERR_OK && !ok_status(resp.http.status) && resp.http.status != 404) e = fail_status(&req, &resp, err);
-    response_free(&resp);
     return e;
 }
 
-[[nodiscard]] static Error s3_list(Store *base, Ctx *ctx, Arena *a, Object **objects, size_t *count, Err *err) {
-    S3 *s = (S3 *)base;
-    size_t n = 0, cap = 256;
-    Object *out = xmalloc(cap * sizeof *out);
-    char *token = NULL;
+/* list_page appends the objects of one ListObjectsV2 response and returns its continuation token, or "" after the last page. */
+static String list_page(Arena *arena, const S3 *s, String body, ObjectList *objects) {
+    String rest = body, item;
+    while (xml_element(rest, "Contents", &item, &rest)) {
+        String key = str_trim_prefix(xml_text(arena, item, "Key"), s->prefix);
+        if (key.len == 0 || str_ends_with(key, S("/"))) continue;
+        int64_t size = 0;
+        objectlist_push(arena, objects,
+                        (Object){
+                            .key = key,
+                            .size = str_parse_i64(xml_text(arena, item, "Size"), &size) ? size : 0,
+                            .etag = strip_quotes(xml_text(arena, item, "ETag")),
+                            .sha256 = S(""),
+                            .mtime_ns = parse_iso8601(xml_text(arena, item, "LastModified")),
+                        });
+    }
+    if (!str_equal(xml_text(arena, body, "IsTruncated"), S("true"))) return S("");
+    return xml_text(arena, body, "NextContinuationToken");
+}
+
+[[nodiscard]] static Error s3_list(Store *store, Cancel *cancel, Arena *arena, ObjectList *objects, Err *err) {
+    S3 *s = (S3 *)store;
+    *objects = (ObjectList){0};
+    /* Each page's response lives only until the next is fetched; the objects go to the caller's arena. */
+    Arena *page = arena_create(LIST_PAGE_BLOCK);
+    String token = S("");
     Error e = ERR_OK;
-    Response resp;
-    response_init(&resp);
-    Arena scratch;
-    arena_init(&scratch, 64 * 1024);
-    for (;;) {
-        KV query[3] = {{"list-type", "2"}, {"prefix", s->prefix}};
-        size_t qn = 2;
-        if (token) query[qn++] = (KV){"continuation-token", token};
-        Request req = {.method = "GET", .query = query, .query_count = qn, .body_fd = -1, .sink_fd = -1};
-        if ((e = request(s, ctx, &req, &resp, err)) != ERR_OK) goto out;
+    do {
+        arena_reset(page);
+        Pair query[3] = {{S("list-type"), S("2")}, {S("prefix"), s->prefix}};
+        size_t n = 2;
+        if (token.len > 0) query[n++] = (Pair){S("continuation-token"), str_copy(page, token)};
+        Request req = {.method = S("GET"), .query = query, .query_count = n, .body_fd = -1, .sink_fd = -1};
+        Response resp = response_create(page);
+        if ((e = request(s, cancel, &req, &resp, err)) != ERR_OK) break;
         if (!ok_status(resp.http.status)) {
             e = fail_status(&req, &resp, err);
-            goto out;
+            break;
         }
-        const char *p = resp.http.body.data, *end = p + resp.http.body.len;
-        for (;;) {
-            const char *item_end;
-            const char *item = xml_element(p, end, "Contents", &item_end);
-            if (!item) break;
-            char *full = xml_text(&scratch, item, item_end, "Key");
-            const char *key = has_prefix(full, s->prefix) ? full + strlen(s->prefix) : full;
-            if (*key && !has_suffix(key, "/")) {
-                if (n == cap) out = xrealloc(out, (cap *= 2) * sizeof *out);
-                Object *o = &out[n++];
-                memset(o, 0, sizeof *o);
-                o->key = arena_strdup(a, key);
-                o->size = strtoll(xml_text(&scratch, item, item_end, "Size"), NULL, 10);
-                char *etag = xml_text(&scratch, item, item_end, "ETag");
-                strip_quotes(etag);
-                snprintf(o->etag, sizeof o->etag, "%s", etag);
-                o->mtime_ns = parse_iso8601(xml_text(&scratch, item, item_end, "LastModified"));
-            }
-            p = item_end;
-        }
-        bool truncated = strcmp(xml_text(&scratch, resp.http.body.data, end, "IsTruncated"), "true") == 0;
-        token = truncated ? xml_text(&scratch, resp.http.body.data, end, "NextContinuationToken") : NULL;
-        if (!token || !*token) break;
-    }
-out:
-    *objects = arena_alloc(a, (n + 1) * sizeof **objects);
-    memcpy(*objects, out, n * sizeof **objects);
-    xfree(out);
-    *count = n;
-    response_free(&resp);
-    arena_free(&scratch);
+        token = list_page(arena, s, resp.http.body, objects);
+    } while (token.len > 0);
+    arena_destroy(page);
     return e;
 }
 
-Error s3_create_bucket(Store *base, Ctx *ctx, Err *err) {
-    S3 *s = (S3 *)base;
-    Request req = {.method = "PUT", .body_fd = -1, .sink_fd = -1};
-    Response resp;
-    response_init(&resp);
-    Error e = request(s, ctx, &req, &resp, err);
-    if (e == ERR_OK && !ok_status(resp.http.status)) {
-        Arena a;
-        arena_init(&a, 4096);
-        const char *code = xml_text(&a, resp.http.body.data, resp.http.body.data + resp.http.body.len, "Code");
-        if (strcmp(code, "BucketAlreadyOwnedByYou") != 0) e = fail_status(&req, &resp, err);
-        arena_free(&a);
-    }
-    response_free(&resp);
+Error s3_create_bucket(Store *store, Cancel *cancel, Arena *scratch, Err *err) {
+    S3 *s = (S3 *)store;
+    Request req = {.method = S("PUT"), .body_fd = -1, .sink_fd = -1};
+    Response resp = response_create(scratch);
+    Error e = request(s, cancel, &req, &resp, err);
+    if (e == ERR_OK && !ok_status(resp.http.status) && !str_equal(xml_text(scratch, resp.http.body, "Code"), S("BucketAlreadyOwnedByYou"))) e = fail_status(&req, &resp, err);
     return e;
 }
 
-static void s3_close(Store *base) {
-    S3 *s = (S3 *)base;
-    xfree(s->bucket);
-    xfree(s->prefix);
-    xfree(s->region);
-    xfree(s->storage_class);
-    xfree(s->access_key);
-    xfree(s->secret_key);
-    xfree(s->session_token);
-    xfree(s->scheme);
-    xfree(s->host);
-    xfree(s->tmp_dir);
-    xfree(s);
-}
-
-static const StoreOps s3_ops = {s3_put, s3_get, s3_head, s3_delete, s3_list, s3_close};
+static const StoreOps s3_ops = {s3_put, s3_get, s3_head, s3_remove, s3_list};
 
 /* ---- credentials ---- */
 
 /* credentials_file reads ~/.aws/credentials for the profile and returns whether it had keys. */
-static bool credentials_file(const char *profile, char **access, char **secret, char **token) {
-    const char *custom = getenv("AWS_SHARED_CREDENTIALS_FILE");
-    char *path = custom && *custom ? xstrdup(custom) : path_join(env_home(), ".aws/credentials");
-    StrBuf raw = {0};
-    Err ignored;
-    Error e = read_file(path, &raw, &ignored);
-    xfree(path);
-    if (e != ERR_OK) return false;
+static bool credentials_file(Arena *arena, String profile, S3 *s) {
+    String path;
+    if (!env_get(arena, S("AWS_SHARED_CREDENTIALS_FILE"), &path) || path.len == 0) path = path_join(arena, env_home(arena), S(".aws/credentials"));
+    String raw;
+    if (file_read_all(arena, path, &raw, nullptr) != ERR_OK) return false;
+    StringList lines = strlist_from_lines(arena, raw);
     bool in_profile = false;
-    char *save = NULL;
-    for (char *line = strtok_r(raw.data, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        while (*line == ' ' || *line == '\t') line++;
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\r' || line[n - 1] == '\t')) line[--n] = '\0';
-        if (*line == '[') {
-            in_profile = n > 1 && strncmp(line + 1, profile, n - 2) == 0 && strlen(profile) == n - 2;
+    String access = S(""), secret = S("");
+    for (size_t i = 0; i < lines.count; i++) {
+        String line = str_trim(lines.items[i]);
+        if (str_starts_with(line, S("["))) {
+            in_profile = str_ends_with(line, S("]")) && str_equal(str_slice(line, 1, line.len - 1), profile);
             continue;
         }
-        if (!in_profile || *line == '#' || *line == ';') continue;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = line, *value = eq + 1;
-        while (*value == ' ' || *value == '\t') value++;
-        size_t k = strlen(key);
-        while (k > 0 && (key[k - 1] == ' ' || key[k - 1] == '\t')) key[--k] = '\0';
-        char **dst = strcmp(key, "aws_access_key_id") == 0 ? access : strcmp(key, "aws_secret_access_key") == 0 ? secret : strcmp(key, "aws_session_token") == 0 ? token : NULL;
-        if (dst) {
-            xfree(*dst);
-            *dst = xstrdup(value);
-        }
+        String key, value;
+        if (!in_profile || str_starts_with(line, S("#")) || str_starts_with(line, S(";")) || !str_cut(line, '=', &key, &value)) continue;
+        key = str_trim(key);
+        value = str_trim(value);
+        if (str_equal(key, S("aws_access_key_id"))) access = value;
+        else if (str_equal(key, S("aws_secret_access_key"))) secret = value;
+        else if (str_equal(key, S("aws_session_token"))) s->session_token = value;
     }
-    sb_free(&raw);
-    return *access && *secret;
+    s->access_key = access;
+    s->secret_key = secret;
+    return access.len > 0 && secret.len > 0;
 }
 
-[[nodiscard]] static Error resolve_credentials(const StoreConfig *cfg, S3 *s, Err *err) {
-    s->session_token = xstrdup("");
-    if (*cfg->access_key) {
-        s->access_key = xstrdup(cfg->access_key);
-        s->secret_key = xstrdup(cfg->secret_key);
+[[nodiscard]] static Error resolve_credentials(Arena *arena, const StoreConfig *config, S3 *s, Err *err) {
+    s->session_token = S("");
+    if (config->access_key.len > 0) {
+        s->access_key = str_copy(arena, config->access_key);
+        s->secret_key = str_copy(arena, config->secret_key);
         return ERR_OK;
     }
-    const char *access = getenv("AWS_ACCESS_KEY_ID"), *secret = getenv("AWS_SECRET_ACCESS_KEY"), *token = getenv("AWS_SESSION_TOKEN");
-    if (access && *access && secret && *secret) {
-        s->access_key = xstrdup(access);
-        s->secret_key = xstrdup(secret);
-        if (token && *token) {
-            xfree(s->session_token);
-            s->session_token = xstrdup(token);
-        }
+    String access, secret, token;
+    if (env_get(arena, S("AWS_ACCESS_KEY_ID"), &access) && access.len > 0 && env_get(arena, S("AWS_SECRET_ACCESS_KEY"), &secret) && secret.len > 0) {
+        s->access_key = access;
+        s->secret_key = secret;
+        if (env_get(arena, S("AWS_SESSION_TOKEN"), &token)) s->session_token = token;
         return ERR_OK;
     }
-    const char *profile = getenv("AWS_PROFILE");
-    char *a = NULL, *k = NULL, *t = NULL;
-    if (credentials_file(profile && *profile ? profile : "default", &a, &k, &t)) {
-        s->access_key = a;
-        s->secret_key = k;
-        if (t) {
-            xfree(s->session_token);
-            s->session_token = t;
-        }
-        return ERR_OK;
-    }
-    xfree(a);
-    xfree(k);
-    xfree(t);
+    String profile;
+    if (!env_get(arena, S("AWS_PROFILE"), &profile) || profile.len == 0) profile = S("default");
+    if (credentials_file(arena, profile, s)) return ERR_OK;
     return err_set(err, ERR_INVALID_ARGUMENT, "no credentials: set access_key and secret_key, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or ~/.aws/credentials");
 }
 
 /* parse_endpoint splits scheme://host[:port][/...] into scheme and host, as it goes in the Host header. */
-[[nodiscard]] static Error parse_endpoint(const char *endpoint, char **scheme, char **host, Err *err) {
-    const char *sep = strstr(endpoint, "://");
-    if (!sep) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %s: want scheme://host[:port]", endpoint);
-    *scheme = xstrndup(endpoint, (size_t)(sep - endpoint));
-    const char *h = sep + 3;
-    const char *end = strchr(h, '/');
-    char *hp = end ? xstrndup(h, (size_t)(end - h)) : xstrdup(h);
-    bool https = strcmp(*scheme, "https") == 0;
-    char *colon = strrchr(hp, ':');
-    if (colon && ((https && strcmp(colon, ":443") == 0) || (!https && strcmp(colon, ":80") == 0))) *colon = '\0';
-    *host = hp;
-    if (!*hp || (strcmp(*scheme, "http") != 0 && !https)) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %s: want http://host or https://host", endpoint);
+[[nodiscard]] static Error parse_endpoint(Arena *arena, String endpoint, S3 *s, Err *err) {
+    int n = (int)endpoint.len;
+    size_t separator;
+    if (!str_find(endpoint, S("://"), &separator)) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %.*s: want scheme://host[:port]", n, endpoint.data);
+    s->scheme = str_copy(arena, str_slice(endpoint, 0, separator));
+    String host, path;
+    str_cut(str_slice(endpoint, separator + 3, endpoint.len), '/', &host, &path);
+    bool https = str_equal(s->scheme, S("https"));
+    if ((https && str_ends_with(host, S(":443"))) || (!https && str_ends_with(host, S(":80")))) host = str_slice(host, 0, host.len - (https ? 4 : 3));
+    s->host = str_copy(arena, host);
+    if (host.len == 0 || (!https && !str_equal(s->scheme, S("http")))) return err_set(err, ERR_INVALID_ARGUMENT, "endpoint %.*s: want http://host or https://host", n, endpoint.data);
     return ERR_OK;
 }
 
-Error s3_open(Ctx *ctx, const StoreConfig *cfg, int64_t part_size, const char *tmp_dir, Store **out, Err *err) {
-    *out = NULL;
-    S3 *s = xcalloc(1, sizeof *s);
+Error s3_open(Arena *arena, const StoreConfig *config, int64_t part_size, String tmp_dir, Store **store, Err *err) {
+    *store = nullptr;
+    S3 *s = arena_push(arena, sizeof *s);
     s->base.ops = &s3_ops;
-    s->bucket = xstrdup(cfg->bucket);
-    s->prefix = xstrdup(cfg->prefix);
-    s->region = xstrdup(cfg->region);
-    s->storage_class = xstrdup(cfg->storage_class);
-    s->path_style = cfg->path_style;
+    s->bucket = str_copy(arena, config->bucket);
+    s->prefix = str_copy(arena, config->prefix);
+    s->region = str_copy(arena, config->region);
+    s->storage_class = str_copy(arena, config->storage_class);
+    s->path_style = config->path_style;
     s->part_size = part_size;
-    s->tmp_dir = xstrdup(tmp_dir);
-    char *endpoint = *cfg->endpoint ? xstrdup(cfg->endpoint) : NULL;
-    if (!endpoint) {
-        StrBuf sb = {0};
-        sb_printf(&sb, "https://s3.%s.amazonaws.com", cfg->region);
-        endpoint = sb.data;
-    }
-    Error e = parse_endpoint(endpoint, &s->scheme, &s->host, err);
-    if (e == ERR_OK) e = resolve_credentials(cfg, s, err);
-    xfree(endpoint);
-    if (e != ERR_OK) {
-        s3_close(&s->base);
-        return e;
-    }
-    if (!s->path_style) {
-        char *virtual_host = s->host;
-        s->host = path_join(s->bucket, virtual_host);
-        s->host[strlen(s->bucket)] = '.';
-        xfree(virtual_host);
-    }
-    *out = &s->base;
+    s->tmp_dir = str_copy(arena, tmp_dir);
+    String endpoint = config->endpoint.len > 0 ? config->endpoint : str_format(arena, "https://s3.%.*s.amazonaws.com", (int)config->region.len, config->region.data);
+    Error e = parse_endpoint(arena, endpoint, s, err);
+    if (e == ERR_OK) e = resolve_credentials(arena, config, s, err);
+    if (e != ERR_OK) return e;
+    if (!s->path_style) s->host = str_format(arena, "%.*s.%.*s", (int)s->bucket.len, s->bucket.data, (int)s->host.len, s->host.data);
+    *store = &s->base;
     return ERR_OK;
 }

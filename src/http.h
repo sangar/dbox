@@ -1,52 +1,40 @@
-#ifndef DBOX_HTTP_H
-#define DBOX_HTTP_H
+#pragma once
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
-#include "ctx.h"
-#include "error.h"
-#include "strbuf.h"
+#include "mc/concurrency/cancel.h"
 
 /*
  * The HTTP client, and the only module that talks to libcurl. A request
- * sends a memory or file body and either stores the response body in memory
+ * sends a memory or file body and either keeps the response body in memory
  * or, for a 2xx response, writes it to a descriptor.
  */
 
-/* HttpHeaderFn receives each response header, trimmed; a new status line arrives as a NULL name. */
-typedef void (*HttpHeaderFn)(void *user, const char *name, size_t name_len, const char *value);
+/* HttpHeaderFn receives each response header, trimmed; an empty name says a new status line began. */
+typedef void (*HttpHeaderFn)(void *context, String name, String value);
 
-typedef struct {
-    const char *method;
-    const char *url;
-    const char *const *headers; /* "Name: value" lines */
-    size_t header_count;
-    int body_fd; /* -1 for a memory body or none */
-    int64_t body_off, body_len;
-    const char *body;
-    size_t body_size;
+typedef struct HttpRequest {
+    String method;
+    String url;
+    StringList headers; /* "Name: value" lines */
+    int body_fd;        /* -1 sends body from memory */
+    int64_t body_offset, body_length;
+    String body;
     int sink_fd; /* where a 2xx body goes; -1 keeps it in memory */
     HttpHeaderFn on_header;
-    void *user;
+    void *context;
     long timeout_ms; /* 0 means a 15s connect timeout and giving up below 1 byte/s for 60s */
 } HttpRequest;
 
-typedef struct {
+typedef struct HttpResponse {
     long status;
-    StrBuf body; /* the body unless it went to sink_fd */
+    String body; /* the body unless it went to sink_fd */
 } HttpResponse;
 
 /* http_global_init readies the client; main calls it once before any thread starts. */
 void http_global_init(void);
-void http_response_init(HttpResponse *r);
-void http_response_free(HttpResponse *r);
 /*
- * http_perform sends one request and fills resp. The status is not an error
- * here: a transport failure is ERR_REMOTE, a cancelled ctx ERR_CANCELLED and
- * a failed write to sink_fd ERR_IO.
+ * http_perform sends one request and fills response, with its body in the
+ * arena. The status is not an error here: a transport failure is
+ * ERR_NETWORK, a cancelled run ERR_CANCELLED and a failed write to sink_fd
+ * ERR_IO. cancel may be nullptr.
  */
-[[nodiscard]] Error http_perform(Ctx *ctx, const HttpRequest *req, HttpResponse *resp, Err *err);
-
-#endif
+[[nodiscard]] Error http_perform(Cancel *cancel, Arena *arena, const HttpRequest *request, HttpResponse *response, Err *err);

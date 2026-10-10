@@ -1,154 +1,143 @@
 #include "http.h"
 
 #include <curl/curl.h>
+#include <stdio.h>
 #include <string.h>
-
-#include "platform/platform.h"
-#include "util.h"
 
 void http_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
-void http_response_init(HttpResponse *r) { memset(r, 0, sizeof *r); }
-
-void http_response_free(HttpResponse *r) { sb_free(&r->body); }
-
 typedef struct {
     int fd;
-    int64_t off, len, pos;
-    const char *mem;
-    size_t mem_len;
+    int64_t offset, length, position;
+    String memory;
 } BodySource;
 
-static size_t read_body(char *buf, size_t size, size_t nitems, void *userdata) {
-    BodySource *src = userdata;
-    size_t want = size * nitems;
-    if (src->mem) {
-        size_t n = min_size(want, src->mem_len - (size_t)src->pos);
-        memcpy(buf, src->mem + src->pos, n);
-        src->pos += (int64_t)n;
+static size_t read_body(char *buffer, size_t size, size_t count, void *context) {
+    BodySource *source = context;
+    size_t want = size * count;
+    if (source->fd < 0) {
+        size_t n = min_size(want, source->memory.len - (size_t)source->position);
+        if (n == 0) return 0;
+        memcpy(buffer, source->memory.data + source->position, n);
+        source->position += (int64_t)n;
         return n;
     }
-    int64_t remaining = src->len - src->pos;
+    int64_t remaining = source->length - source->position;
     if (remaining <= 0) return 0;
     size_t n;
-    if (file_pread(src->fd, buf, min_size(want, (size_t)remaining), src->off + src->pos, &n, NULL) != ERR_OK) return CURL_READFUNC_ABORT;
-    src->pos += (int64_t)n;
+    if (file_pread(source->fd, buffer, min_size(want, (size_t)remaining), source->offset + source->position, &n, nullptr) != ERR_OK)
+        return CURL_READFUNC_ABORT;
+    source->position += (int64_t)n;
     return n;
 }
 
-static int seek_body(void *userdata, curl_off_t offset, int origin) {
-    BodySource *src = userdata;
+static int seek_body(void *context, curl_off_t offset, int origin) {
+    BodySource *source = context;
     if (origin != SEEK_SET) return CURL_SEEKFUNC_CANTSEEK;
-    src->pos = offset;
+    source->position = offset;
     return CURL_SEEKFUNC_OK;
 }
 
 typedef struct {
     CURL *curl;
-    HttpResponse *resp;
+    StringBuilder body;
     int sink_fd;
     bool failed;
 } Sink;
 
-static size_t write_body(char *data, size_t size, size_t nmemb, void *userdata) {
-    Sink *sink = userdata;
-    size_t n = size * nmemb;
+static size_t write_body(char *data, size_t size, size_t count, void *context) {
+    Sink *sink = context;
+    size_t n = size * count;
     long status = 0;
     curl_easy_getinfo(sink->curl, CURLINFO_RESPONSE_CODE, &status);
     if (status >= 200 && status < 300 && sink->sink_fd >= 0) {
-        if (!file_write_all(sink->sink_fd, data, n)) {
+        if (file_write(sink->sink_fd, (String){data, n}, nullptr) != ERR_OK) {
             sink->failed = true;
             return 0;
         }
         return n;
     }
-    sb_append(&sink->resp->body, data, n);
+    str_builder_append(&sink->body, (String){data, n});
     return n;
 }
 
 typedef struct {
-    HttpHeaderFn fn;
-    void *user;
+    HttpHeaderFn on_header;
+    void *context;
 } HeaderSink;
 
-static size_t read_header(char *line, size_t size, size_t nitems, void *userdata) {
-    HeaderSink *h = userdata;
-    size_t n = size * nitems;
-    if (!h->fn) return n;
-    if (n >= 5 && strncmp(line, "HTTP/", 5) == 0) {
-        h->fn(h->user, NULL, 0, NULL);
+static size_t read_header(char *data, size_t size, size_t count, void *context) {
+    HeaderSink *sink = context;
+    size_t n = size * count;
+    if (!sink->on_header) return n;
+    String line = {data, n};
+    if (str_starts_with(line, S("HTTP/"))) {
+        sink->on_header(sink->context, S(""), S(""));
         return n;
     }
-    const char *colon = memchr(line, ':', n);
-    if (!colon) return n;
-    const char *v = colon + 1;
-    const char *end = line + n;
-    while (v < end && (*v == ' ' || *v == '\t')) v++;
-    while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) end--;
-    char value[1024];
-    size_t vlen = min_size((size_t)(end - v), sizeof value - 1);
-    memcpy(value, v, vlen);
-    value[vlen] = '\0';
-    h->fn(h->user, line, (size_t)(colon - line), value);
+    String name, value;
+    if (str_cut(line, ':', &name, &value)) sink->on_header(sink->context, name, str_trim(value));
     return n;
 }
 
-static int check_cancel(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
-    return ctx_done((Ctx *)userdata) ? 1 : 0;
+static int check_cancel(void *context, curl_off_t download_total, curl_off_t downloaded, curl_off_t upload_total, curl_off_t uploaded) {
+    return cancel_requested(context) ? 1 : 0;
 }
 
-Error http_perform(Ctx *ctx, const HttpRequest *req, HttpResponse *resp, Err *err) {
+Error http_perform(Cancel *cancel, Arena *arena, const HttpRequest *request, HttpResponse *response, Err *err) {
+    const char *method = str_cstr(arena, request->method);
+    const char *url = str_cstr(arena, request->url);
     CURL *curl = curl_easy_init();
-    if (!curl) return err_set(err, ERR_REMOTE, "%s %s: cannot create an HTTP handle", req->method, req->url);
-    struct curl_slist *headers = NULL;
-    for (size_t i = 0; i < req->header_count; i++) headers = curl_slist_append(headers, req->headers[i]);
-    BodySource src = {.fd = req->body_fd, .off = req->body_off, .len = req->body_len, .mem = req->body, .mem_len = req->body_size};
-    Sink sink = {.curl = curl, .resp = resp, .sink_fd = req->sink_fd};
-    HeaderSink header_sink = {.fn = req->on_header, .user = req->user};
-    sb_clear(&resp->body);
-    resp->status = 0;
-    curl_easy_setopt(curl, CURLOPT_URL, req->url);
+    if (!curl) return err_set(err, ERR_NETWORK, "%s %s: cannot create an HTTP handle", method, url);
+    struct curl_slist *headers = nullptr;
+    for (size_t i = 0; i < request->headers.count; i++) headers = curl_slist_append(headers, str_cstr(arena, request->headers.items[i]));
+    BodySource source = {.fd = request->body_fd, .offset = request->body_offset, .length = request->body_length, .memory = request->body};
+    Sink sink = {.curl = curl, .body = str_builder_create(arena, 1024), .sink_fd = request->sink_fd};
+    HeaderSink header_sink = {.on_header = request->on_header, .context = request->context};
+    response->status = 0;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, read_header);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &header_sink);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    if (ctx) {
+    if (cancel) {
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, check_cancel);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, ctx);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     }
-    if (req->timeout_ms > 0) {
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, req->timeout_ms);
+    if (request->timeout_ms > 0) {
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, request->timeout_ms);
     } else {
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
         curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
     }
-    if (strcmp(req->method, "HEAD") == 0) {
+    if (str_equal(request->method, S("HEAD"))) {
         curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    } else if (strcmp(req->method, "PUT") == 0) {
+    } else if (str_equal(request->method, S("PUT"))) {
         curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_body);
-        curl_easy_setopt(curl, CURLOPT_READDATA, &src);
+        curl_easy_setopt(curl, CURLOPT_READDATA, &source);
         curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION, seek_body);
-        curl_easy_setopt(curl, CURLOPT_SEEKDATA, &src);
-        curl_off_t size = req->body_fd >= 0 ? req->body_len : (curl_off_t)req->body_size;
+        curl_easy_setopt(curl, CURLOPT_SEEKDATA, &source);
+        curl_off_t size = request->body_fd >= 0 ? request->body_length : (curl_off_t)request->body.len;
         curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, size);
-    } else if (strcmp(req->method, "POST") == 0) {
+    } else if (str_equal(request->method, S("POST"))) {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req->body ? req->body : "");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)req->body_size);
-    } else if (strcmp(req->method, "DELETE") == 0) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, str_cstr(arena, request->body));
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)request->body.len);
+    } else if (str_equal(request->method, S("DELETE"))) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
     }
     CURLcode code = curl_easy_perform(curl);
     Error e = ERR_OK;
-    if (code == CURLE_OK && !sink.failed) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
-    else if (sink.failed) e = err_set(err, ERR_IO, "%s %s: write download failed", req->method, req->url);
+    if (code == CURLE_OK && !sink.failed) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response->status);
+    else if (sink.failed) e = err_set(err, ERR_IO, "%s %s: write download failed", method, url);
     else if (code == CURLE_ABORTED_BY_CALLBACK) e = err_set(err, ERR_CANCELLED, "cancelled");
-    else e = err_set(err, ERR_REMOTE, "%s %s: %s", req->method, req->url, curl_easy_strerror(code));
+    else e = err_set(err, ERR_NETWORK, "%s %s: %s", method, url, curl_easy_strerror(code));
+    response->body = str_builder_finish(&sink.body);
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
     return e;

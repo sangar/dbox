@@ -1,175 +1,185 @@
-#include <stdlib.h>
-#include <string.h>
-
 #include "engine_internal.h"
-#include "platform/platform.h"
+#include "mc/platform/platform.h"
 
-#define MIRROR_BATCH 256
-#define IDLE_NS (5 * NS_PER_SEC)
+enum { MIRROR_BATCH = 256, EVERYTHING_DUE = 1 << 30 };
+
+static const int64_t idle_ns = 5LL * NS_PER_SECOND;
 
 typedef struct {
     size_t mirror;
-    Replica *replica;
+    const Replica *replica;
 } Job;
 
-[[nodiscard]] static Error replicate(Engine *e, size_t mirror, const Replica *r, bool *source_missing, Err *err);
+[[nodiscard]] static Error replicate(Engine *e, Arena *scratch, size_t mirror, const Replica *replica, bool *source_missing, Err *err);
 
-static void record_failure(Engine *e, const Replica *r, bool source_missing, const Err *cause) {
-    int attempts = r->attempts + 1;
+static void record_failure(Engine *e, const Replica *replica, bool source_missing, const Err *cause) {
+    int attempts = replica->attempts + 1;
     /* When neither the primary nor the local folder has the content, retrying cannot help. */
     if (source_missing) attempts = MAX_ATTEMPTS;
-    int64_t retry_at = wall_ns() + retry_delay_ns(attempts);
-    log_warn(e->log, "mirror copy failed", log_str("store", r->store), log_str("path", r->path), log_int("attempt", attempts), log_err(cause), log_end());
+    int64_t retry_at = clock_wall_ns() + retry_delay_ns(attempts);
+    LogAttr attrs[] = {log_string("store", replica->store), log_string("path", replica->path), log_int("attempt", attempts), log_err(cause)};
+    log_warn(e->log, "mirror copy failed", countof(attrs), attrs);
     Err err;
-    if (index_mark_failed(e->idx, r->path, r->store, cause->msg, attempts, retry_at, &err) != ERR_OK) log_error(e->log, "record failure", log_err(&err), log_end());
+    if (index_mark_failed(e->index, replica->path, replica->store, S(cause->msg), attempts, retry_at, &err) != ERR_OK) {
+        LogAttr failed[] = {log_err(&err)};
+        log_error(e->log, "record failure", countof(failed), failed);
+    }
 }
 
 static void replicate_job(Engine *e, void *item) {
     Job *job = item;
+    Arena *scratch = arena_create(SCRATCH_BLOCK);
     Err err;
     bool source_missing = false;
-    if (replicate(e, job->mirror, job->replica, &source_missing, &err) != ERR_OK && !ctx_done(e->ctx)) record_failure(e, job->replica, source_missing, &err);
+    if (replicate(e, scratch, job->mirror, job->replica, &source_missing, &err) != ERR_OK && !cancel_requested(e->cancel)) record_failure(e, job->replica, source_missing, &err);
+    arena_destroy(scratch);
 }
 
 /* mirror_batch handles up to one batch of due replicas with the store's workers and stores how many it handled in *handled. */
 [[nodiscard]] static Error mirror_batch(Engine *e, size_t mirror, size_t *handled, Err *err) {
-    const char *name = e->mirror_names[mirror];
-    Arena a;
-    arena_init(&a, 16 * 1024);
-    Replica *due;
-    size_t n;
+    Arena *arena = arena_create(SCRATCH_BLOCK);
+    ReplicaList due;
     *handled = 0;
-    Error result = index_due(e->idx, &a, name, MIRROR_BATCH, &due, &n, err);
+    Error result = index_due(e->index, arena, e->mirror_names.items[mirror], MIRROR_BATCH, &due, err);
     if (result == ERR_OK) {
-        Job *jobs = arena_calloc(&a, n + 1, sizeof *jobs);
-        void **items = arena_calloc(&a, n + 1, sizeof *items);
-        for (size_t i = 0; i < n; i++) {
-            jobs[i] = (Job){mirror, &due[i]};
+        Job *jobs = arena_push(arena, arena_size_mul(due.count + 1, sizeof *jobs));
+        void **items = arena_push(arena, arena_size_mul(due.count + 1, sizeof *items));
+        for (size_t i = 0; i < due.count; i++) {
+            jobs[i] = (Job){mirror, &due.items[i]};
             items[i] = &jobs[i];
         }
-        run_workers(e, config_store(e->cfg, name)->workers, items, n, replicate_job);
-        *handled = n;
+        engine_parallel(e, e->mirror_pools[mirror], arena, items, due.count, replicate_job);
+        *handled = due.count;
     }
-    arena_free(&a);
+    arena_destroy(arena);
     return result;
 }
 
 void mirror_loop(Engine *e, size_t mirror) {
     while (!engine_done(e)) {
         Err err;
-        size_t n;
-        if (mirror_batch(e, mirror, &n, &err) != ERR_OK && !engine_done(e)) log_error(e->log, "mirror", log_str("store", e->mirror_names[mirror]), log_err(&err), log_end());
-        if (n > 0) continue;
-        ctx_lock(e->ctx);
-        int64_t deadline = monotonic_ns() + IDLE_NS;
-        while (!engine_done(e) && !e->mirror_woken[mirror] && monotonic_ns() < deadline) ctx_wait(e->ctx, deadline);
+        size_t handled;
+        if (mirror_batch(e, mirror, &handled, &err) != ERR_OK && !engine_done(e)) {
+            LogAttr attrs[] = {log_string("store", e->mirror_names.items[mirror]), log_err(&err)};
+            log_error(e->log, "mirror", countof(attrs), attrs);
+        }
+        if (handled > 0) continue;
+        cancel_lock(e->cancel);
+        int64_t deadline = clock_monotonic_ns() + idle_ns;
+        while (!engine_done(e) && !e->mirror_woken[mirror] && clock_monotonic_ns() < deadline) cancel_wait(e->cancel, deadline);
         e->mirror_woken[mirror] = false;
-        ctx_unlock(e->ctx);
+        cancel_unlock(e->cancel);
     }
 }
 
 Error mirror_drain(Engine *e, size_t mirror, Err *err) {
     for (;;) {
-        size_t n;
-        Error result = mirror_batch(e, mirror, &n, err);
-        if (result != ERR_OK || n == 0) return result;
+        size_t handled;
+        Error result = mirror_batch(e, mirror, &handled, err);
+        if (result != ERR_OK || handled == 0) return result;
     }
 }
 
 /* source opens the content a mirror should receive: the primary's copy, or the local file when the primary lacks it but the file is unchanged. */
-[[nodiscard]] static Error source(Engine *e, const IndexFile *f, Meta *meta, int *fd, bool *source_missing, Err *err) {
-    Object obj;
+[[nodiscard]] static Error source(Engine *e, Arena *scratch, const IndexFile *file, Meta *meta, int *fd, bool *source_missing, Err *err) {
+    Object object;
     Err inner;
-    Error result = store_get(e->primary, e->ctx, f->path, &obj, fd, &inner);
-    memset(meta, 0, sizeof *meta);
-    meta->mtime_ns = f->mtime_ns;
+    Error result = store_get(e->primary, e->cancel, scratch, file->path, &object, fd, &inner);
+    *meta = (Meta){.sha256 = file->sha256, .mtime_ns = file->mtime_ns};
     if (result == ERR_OK) {
-        snprintf(meta->sha256, sizeof meta->sha256, "%s", *obj.sha256 ? obj.sha256 : f->sha256);
+        if (object.sha256.len > 0) meta->sha256 = object.sha256;
         return ERR_OK;
     }
     if (result != ERR_NOT_FOUND) return err_set(err, result, "%s", inner.msg);
     LocalFile local;
-    if (engine_local(e, f->path, f, &local, &inner) != ERR_OK || !local.exists || local.changed) {
+    if (engine_local(e, scratch, file->path, file, &local, &inner) != ERR_OK || !local.exists || local.changed) {
         *source_missing = true;
         return err_set(err, ERR_NOT_FOUND, "source missing on primary and locally");
     }
-    char *abs = engine_abs(e, f->path);
+    String abs = engine_abs(scratch, e, file->path);
     result = file_open_read(abs, fd, err);
-    if (result == ERR_NOT_FOUND) result = err_set(err, result, "%s: no such file", abs);
-    xfree(abs);
-    snprintf(meta->sha256, sizeof meta->sha256, "%s", f->sha256);
+    if (result == ERR_NOT_FOUND) result = err_set(err, result, "%.*s: no such file", (int)abs.len, abs.data);
     return result;
 }
 
+/* remove_copy deletes a tombstoned file from the mirror, when deletes travel, and forgets the replica. */
+[[nodiscard]] static Error remove_copy(Engine *e, Arena *scratch, size_t mirror, String path, Err *err) {
+    String name = e->mirror_names.items[mirror];
+    LogAttr attrs[] = {log_string("path", path), log_string("store", name)};
+    if (e->dry_run) {
+        log_info(e->log, "would delete", countof(attrs), attrs);
+        return ERR_OK;
+    }
+    if (e->config->sync.delete_remote) {
+        Err inner;
+        Error result = store_remove(e->mirrors[mirror], e->cancel, scratch, path, &inner);
+        if (result != ERR_OK) return err_set(err, result, "%s", inner.msg);
+        log_info(e->log, "deleted", countof(attrs), attrs);
+    }
+    return index_drop_replica(e->index, path, name, err);
+}
+
 /* replicate makes a mirror match the index for one path: delete a tombstoned file, or copy the current content from the primary and verify it. */
-[[nodiscard]] static Error replicate(Engine *e, size_t mirror, const Replica *r, bool *source_missing, Err *err) {
-    const char *name = e->mirror_names[mirror];
+[[nodiscard]] static Error replicate(Engine *e, Arena *scratch, size_t mirror, const Replica *replica, bool *source_missing, Err *err) {
+    String name = e->mirror_names.items[mirror];
     Store *store = e->mirrors[mirror];
-    Arena a;
-    arena_init(&a, 4096);
-    IndexFile f;
+    IndexFile file;
     bool found;
-    Error result = index_file(e->idx, &a, r->path, &f, &found, err);
-    if (result != ERR_OK) goto out;
-    if (!found) {
-        result = index_drop_replica(e->idx, r->path, name, err);
-        goto out;
-    }
-    if (f.deleted) {
-        if (e->dry_run) {
-            log_info(e->log, "would delete", log_str("path", r->path), log_str("store", name), log_end());
-            goto out;
-        }
-        if (e->cfg->sync.delete_remote) {
-            Err inner;
-            result = store_delete(store, e->ctx, r->path, &inner);
-            if (result != ERR_OK) {
-                result = err_set(err, result, "%s", inner.msg);
-                goto out;
-            }
-            log_info(e->log, "deleted", log_str("path", r->path), log_str("store", name), log_end());
-        }
-        result = index_drop_replica(e->idx, r->path, name, err);
-        goto out;
-    }
+    Error result = index_file(e->index, scratch, replica->path, &file, &found, err);
+    if (result != ERR_OK) return result;
+    if (!found) return index_drop_replica(e->index, replica->path, name, err);
+    if (file.deleted) return remove_copy(e, scratch, mirror, replica->path, err);
 
     Object head;
     Err inner;
-    if (store_head(store, e->ctx, r->path, &head, &inner) == ERR_OK && head.size == f.size && strcmp(head.sha256, f.sha256) == 0) {
-        bool verified;
-        result = index_mark_verified(e->idx, r->path, name, head.etag, f.sha256, &verified, err);
-        goto out;
-    }
+    bool verified;
+    if (store_head(store, e->cancel, scratch, replica->path, &head, &inner) == ERR_OK && head.size == file.size && str_equal(head.sha256, file.sha256))
+        return index_mark_verified(e->index, replica->path, name, head.etag, file.sha256, &verified, err);
+    LogAttr attrs[] = {log_string("path", replica->path), log_string("from", e->primary_name), log_string("to", name)};
     if (e->dry_run) {
-        log_info(e->log, "would copy", log_str("path", r->path), log_str("from", e->primary_name), log_str("to", name), log_end());
-        goto out;
+        log_info(e->log, "would copy", countof(attrs), attrs);
+        return ERR_OK;
     }
 
     Meta meta;
     int body;
-    result = source(e, &f, &meta, &body, source_missing, err);
-    if (result != ERR_OK) goto out;
-    char etag[ETAG_MAX];
-    result = store_put(store, e->ctx, r->path, body, f.size, &meta, etag, &inner);
+    result = source(e, scratch, &file, &meta, &body, source_missing, err);
+    if (result != ERR_OK) return result;
+    String etag;
+    result = store_put(store, e->cancel, scratch, replica->path, body, file.size, meta, &etag, &inner);
     file_close(body);
-    if (result != ERR_OK) {
-        result = err_set(err, result, "%s", inner.msg);
-        goto out;
+    if (result != ERR_OK) return err_set(err, result, "%s", inner.msg);
+    result = store_head(store, e->cancel, scratch, replica->path, &head, &inner);
+    if (result != ERR_OK) return err_set(err, result, "verify: %s", inner.msg);
+    if (!str_equal(head.sha256, meta.sha256))
+        return err_set(err, ERR_NETWORK, "verify: stored sha256 %.*s, expected %.*s", (int)head.sha256.len, head.sha256.data, (int)meta.sha256.len, meta.sha256.data);
+    result = index_mark_verified(e->index, replica->path, name, head.etag, meta.sha256, &verified, err);
+    if (result == ERR_OK && verified) {
+        LogAttr copied[] = {log_string("path", replica->path), log_string("from", e->primary_name), log_string("to", name), log_int("bytes", head.size)};
+        log_info(e->log, "copied", countof(copied), copied);
     }
-    result = store_head(store, e->ctx, r->path, &head, &inner);
-    if (result != ERR_OK) {
-        result = err_set(err, result, "verify: %s", inner.msg);
-        goto out;
+    return result;
+}
+
+/* adopt marks copies already on the mirror verified when they hold the indexed content, and counts them in *adopted. */
+[[nodiscard]] static Error adopt(Engine *e, Arena *arena, size_t mirror, const StrMap *present, int64_t *adopted, Err *err) {
+    String name = e->mirror_names.items[mirror];
+    ReplicaList due;
+    Error result = index_due(e->index, arena, name, EVERYTHING_DUE, &due, err);
+    for (size_t i = 0; result == ERR_OK && i < due.count; i++) {
+        String path = due.items[i].path;
+        const Object *object = strmap_get(present, path);
+        if (!object) continue;
+        IndexFile file;
+        bool found;
+        result = index_file(e->index, arena, path, &file, &found, err);
+        if (result != ERR_OK || !found || file.deleted || file.size != object->size) continue;
+        Object head;
+        if (store_head(e->mirrors[mirror], e->cancel, arena, path, &head, nullptr) != ERR_OK || !str_equal(head.sha256, file.sha256)) continue;
+        bool verified;
+        result = index_mark_verified(e->index, path, name, head.etag, file.sha256, &verified, err);
+        if (result == ERR_OK && verified) (*adopted)++;
     }
-    if (strcmp(head.sha256, meta.sha256) != 0) {
-        result = err_set(err, ERR_REMOTE, "verify: stored sha256 %s, expected %s", head.sha256, meta.sha256);
-        goto out;
-    }
-    bool verified;
-    result = index_mark_verified(e->idx, r->path, name, head.etag, meta.sha256, &verified, err);
-    if (result == ERR_OK && verified) log_info(e->log, "copied", log_str("path", r->path), log_str("from", e->primary_name), log_str("to", name), log_int("bytes", head.size), log_end());
-out:
-    arena_free(&a);
     return result;
 }
 
@@ -179,46 +189,29 @@ out:
  * and verified copies that disappeared go back to pending.
  */
 Error mirror_reconcile(Engine *e, size_t mirror, Err *err) {
-    const char *name = e->mirror_names[mirror];
-    Store *store = e->mirrors[mirror];
-    Arena a;
-    arena_init(&a, 64 * 1024);
-    Object *objects;
-    size_t n;
+    String name = e->mirror_names.items[mirror];
+    Arena *arena = arena_create(SCRATCH_BLOCK);
+    ObjectList objects;
     Err inner;
-    Error result = store_list(store, e->ctx, &a, &objects, &n, &inner);
+    Error result = store_list(e->mirrors[mirror], e->cancel, arena, &objects, &inner);
     if (result != ERR_OK) {
         result = err_set(err, result, "%s", inner.msg);
-        goto out;
+        arena_destroy(arena);
+        return result;
     }
-    StrMap present;
-    strmap_init(&present);
-    for (size_t i = 0; i < n; i++) strmap_put(&present, objects[i].key, &objects[i]);
-    Replica *rows;
-    size_t count;
-    result = index_replicas_on(e->idx, &a, name, &rows, &count, err);
-    for (size_t i = 0; result == ERR_OK && i < count; i++)
-        if (rows[i].state == REPLICA_VERIFIED && !strmap_has(&present, rows[i].path)) result = index_mark_pending(e->idx, rows[i].path, name, err);
-    int64_t added;
-    if (result == ERR_OK) result = index_backfill(e->idx, name, &added, err);
-    if (result == ERR_OK) result = index_due(e->idx, &a, name, 1 << 30, &rows, &count, err);
-    long adopted = 0;
-    for (size_t i = 0; result == ERR_OK && i < count; i++) {
-        const Object *obj = strmap_get(&present, rows[i].path);
-        if (!obj) continue;
-        IndexFile f;
-        bool found;
-        result = index_file(e->idx, &a, rows[i].path, &f, &found, err);
-        if (result != ERR_OK || !found || f.deleted || f.size != obj->size) continue;
-        Object head;
-        if (store_head(store, e->ctx, rows[i].path, &head, &inner) != ERR_OK || strcmp(head.sha256, f.sha256) != 0) continue;
-        bool verified;
-        result = index_mark_verified(e->idx, rows[i].path, name, head.etag, f.sha256, &verified, err);
-        if (result == ERR_OK && verified) adopted++;
+    StrMap *present = strmap_create(arena, objects.count);
+    for (size_t i = 0; i < objects.count; i++) strmap_put(present, objects.items[i].key, &objects.items[i]);
+    ReplicaList rows;
+    result = index_replicas_on(e->index, arena, name, &rows, err);
+    for (size_t i = 0; result == ERR_OK && i < rows.count; i++)
+        if (rows.items[i].state == REPLICA_VERIFIED && !strmap_has(present, rows.items[i].path)) result = index_mark_pending(e->index, rows.items[i].path, name, err);
+    int64_t added, adopted = 0;
+    if (result == ERR_OK) result = index_backfill(e->index, name, &added, err);
+    if (result == ERR_OK) result = adopt(e, arena, mirror, present, &adopted, err);
+    if (adopted > 0) {
+        LogAttr attrs[] = {log_string("store", name), log_int("files", adopted)};
+        log_info(e->log, "adopted existing copies", countof(attrs), attrs);
     }
-    if (adopted > 0) log_info(e->log, "adopted existing copies", log_str("store", name), log_int("files", adopted), log_end());
-    strmap_free(&present);
-out:
-    arena_free(&a);
+    arena_destroy(arena);
     return result;
 }
