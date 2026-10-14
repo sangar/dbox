@@ -45,19 +45,24 @@ target_compile_definitions(sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_THRE
 target_compile_options(sqlite PRIVATE -w)
 set_target_properties(sqlite PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 
-# libmc builds with the same flags as dbox; cyaml, its one dependency, with upstream's.
+# libmc builds with the same flags as dbox; cyaml and yyjson, its dependencies, with upstream's.
 file(GLOB CYAML_SOURCES CONFIGURE_DEPENDS deps/libmc/deps/cyaml/*.c)
 add_library(cyaml STATIC ${CYAML_SOURCES})
 target_include_directories(cyaml PUBLIC deps/libmc/deps/cyaml)
 target_compile_options(cyaml PRIVATE -w)
 set_target_properties(cyaml PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 
+add_library(yyjson STATIC deps/libmc/deps/yyjson/yyjson.c)
+target_include_directories(yyjson PUBLIC deps/libmc/deps/yyjson)
+target_compile_options(yyjson PRIVATE -w)
+set_target_properties(yyjson PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+
 file(GLOB LIBMC_SOURCES CONFIGURE_DEPENDS deps/libmc/src/*/*.c)
 add_library(mc STATIC ${LIBMC_SOURCES})
 target_include_directories(mc PUBLIC deps/libmc/include PRIVATE deps/libmc/src)
 target_compile_options(mc PRIVATE ${DBOX_WARNINGS})
 find_package(Threads REQUIRED)
-target_link_libraries(mc PRIVATE cyaml PUBLIC Threads::Threads m)
+target_link_libraries(mc PRIVATE cyaml yyjson PUBLIC Threads::Threads m)
 if(APPLE)
     target_link_libraries(mc PUBLIC "-framework CoreServices")
 endif()

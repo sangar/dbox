@@ -1,3 +1,3 @@
 # name version url hash
-libmc ce1cc87 https://github.com/sangar/libmc/tree/dbox-support sha256:b700567cd13c7f5e568b2e2d80b491494040b692f977323d33638dfc0a740ea9
+libmc e5fbe4c https://github.com/sangar/libmc sha256:cf019c8edc25d9fe11ec7f62fff6b4bc8cf5dae370ed46be5ffbb7f5a42c1b90
 sqlite 3.53.4 https://sqlite.org/2026/sqlite-amalgamation-3530400.zip sha256:1ac04027c567f4e9a595a803e29ea6b959387761f7b9f33a1a1fe7d4594dfd0e
