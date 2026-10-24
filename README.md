@@ -53,18 +53,22 @@ launchd agent or a systemd user unit. Warnings are errors, and the test suite
 also runs under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 libmc and SQLite are vendored under `deps/` at the versions pinned in
-`deps.lock` and built from source with the project. libcurl is the one system
-library, because it carries the platform's TLS stack and certificate store,
-which should track OS security updates rather than a pinned copy.
+`deps.lock` and built from source with the project. libmc's own build fetches
+the libraries it pins, curl, mbedTLS, nghttp2 and zlib among them, so the
+first build needs the network and nothing else needs installing. TLS runs on
+that pinned mbedTLS, so its security fixes arrive with a libmc update rather
+than an OS update; the trusted roots are still the system's, with Mozilla's
+built into libmc only where the system has none.
 
 ## Build
 
-Requires clang 18 or gcc 14, CMake 3.25, Ninja and libcurl. On macOS it also
-links CoreServices for FSEvents.
+Requires clang 18 or gcc 14, CMake 3.25, Ninja, and `curl` and `tar` for the
+first build to fetch libmc's dependencies. On macOS it also links CoreServices
+for FSEvents and SystemConfiguration for curl.
 
 ```sh
-brew install cmake ninja                                       # macOS; libcurl ships with the system
-sudo apt install clang-18 cmake ninja-build libcurl4-openssl-dev   # Debian, Ubuntu
+brew install cmake ninja                             # macOS
+sudo apt install clang-18 cmake ninja-build curl     # Debian, Ubuntu
 
 cmake --preset release && cmake --build --preset release      # out/release/dbox
 cmake --preset release -DDBOX_VERSION=1.2.3                   # what `dbox version` prints (default: git describe)
@@ -206,8 +210,8 @@ out/debug/dbox run --config dev.config.yml   # daemon syncing ./tmp/box
 ```
 
 CI runs the same steps on linux-x86_64, linux-aarch64 and macos-aarch64, each
-built natively: the macOS target needs the FSEvents SDK, and libcurl comes from
-the system on every target, so nothing is cross-compiled.
+built natively: the macOS target needs the FSEvents SDK, so nothing is
+cross-compiled.
 
 ## Compared with the Go version
 
@@ -216,11 +220,11 @@ before the C rewrite. The C version keeps the command line, config file,
 index database, object layout and metadata, so either binary can take over a
 folder and its stores from the other. Where they differ:
 
-- **S3 client.** libcurl behind `src/http.c`, with a hand-written Signature
-  V4 signer instead of the AWS SDK. Credentials come from the config, `AWS_ACCESS_KEY_ID` and
+- **S3 client.** libmc's `mc/net/s3.h`, on curl and its own Signature V4
+  signer, instead of the AWS SDK. Credentials come from the config, `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
   `~/.aws/credentials`; instance metadata and SSO are not supported.
-  Requests are retried three times on transport errors and 5xx responses.
+  Requests are tried three times on transport errors and 429 and 5xx responses.
 - **Downloads are staged.** `Get` on an S3 store downloads to a temp file
   under `<root>/.dbox/tmp` and hands back a descriptor, so a mirror copy
   passes through local disk once. Multipart uploads send their parts one

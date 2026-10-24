@@ -28,9 +28,19 @@ Error store_open_all(Arena *arena, const Config *config, StoreSet *set, Err *err
         String name = set->names.items[i];
         Err inner;
         Error e = store_open(arena, config_store(config, name), config->sync.part_size, tmp, &set->stores[i], &inner);
-        if (e != ERR_OK) return err_set(err, e, "store %.*s: %s", (int)name.len, name.data, inner.msg);
+        if (e != ERR_OK) {
+            storeset_close(set);
+            return err_set(err, e, "store %.*s: %s", (int)name.len, name.data, inner.msg);
+        }
     }
     return ERR_OK;
+}
+
+void storeset_close(StoreSet *set) {
+    for (size_t i = 0; i < set->names.count; i++) {
+        store_close(set->stores[i]);
+        set->stores[i] = nullptr;
+    }
 }
 
 Store *storeset_get(const StoreSet *set, String name) {

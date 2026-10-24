@@ -3,7 +3,6 @@
 #include <stdlib.h>
 
 #include "config.h"
-#include "http.h"
 #include "store.h"
 
 /* T is one test run: its counters, the shared cancellation token and the staging directory. */
@@ -12,6 +11,8 @@ typedef struct {
     Arena *arena;
     Cancel cancel;
     String tmp_dir;
+    Store *opened[8];
+    size_t opened_count;
 } T;
 
 /* The check macros stay macros for __FILE__, __LINE__ and the expression text. */
@@ -55,10 +56,11 @@ static Store *minio(T *t, const char *endpoint) {
         fprintf(stderr, "%s: %s\n", endpoint, err.msg);
         exit(1);
     }
-    if (s3_create_bucket(s, &t->cancel, t->arena, &err) != ERR_OK) {
+    if (s3_store_create_bucket(s, &t->cancel, t->arena, &err) != ERR_OK) {
         fprintf(stderr, "%s: %s (run `tools/minio.sh`)\n", endpoint, err.msg);
         exit(1);
     }
+    if (t->opened_count < countof(t->opened)) t->opened[t->opened_count++] = s;
     return s;
 }
 
@@ -151,7 +153,9 @@ static void test_multipart_copy_between_stores(T *t) {
     if (!ok) fprintf(stderr, "copy put: %s\n", err.msg);
     file_close(body);
     Object head;
-    CHECK(store_head(b, &t->cancel, t->arena, key, &head, &err) == ERR_OK);
+    ok = store_head(b, &t->cancel, t->arena, key, &head, &err) == ERR_OK;
+    CHECK(ok);
+    if (!ok) fprintf(stderr, "head: %s\n", err.msg);
     CHECK(head.size == size);
     CHECK_STR(head.sha256, S("big"));
     CHECK(store_remove(a, &t->cancel, t->arena, key, &err) == ERR_OK);
@@ -178,12 +182,12 @@ static void test_keys_with_special_characters(T *t) {
 
 int main(void) {
     T t = {.arena = arena_create(0)};
-    http_global_init();
     cancel_init(&t.cancel);
     if (dir_create_temp(t.arena, S("dbox-s3-test-"), &t.tmp_dir, nullptr) != ERR_OK) return 1;
     test_round_trip_keeps_metadata(&t);
     test_multipart_copy_between_stores(&t);
     test_keys_with_special_characters(&t);
+    for (size_t i = 0; i < t.opened_count; i++) store_close(t.opened[i]);
     (void)dir_remove_all(t.tmp_dir, nullptr);
     fprintf(stderr, "%d checks, %d failures\n", t.checks, t.failures);
     cancel_destroy(&t.cancel);

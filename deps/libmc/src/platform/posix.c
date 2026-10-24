@@ -5,6 +5,7 @@
 #include "mc/platform/platform.h"
 
 #include "mc/text/path.h"
+#include "posix_shared.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -19,9 +20,11 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -75,8 +78,7 @@ typedef struct {
     return code == ENOENT || code == ENOTDIR ? ERR_NOT_FOUND : ERR_IO;
 }
 
-// fail_errno records the message followed by the description of errno, and maps errno to an Error.
-[[nodiscard]] [[gnu::format(printf, 2, 3)]] static Error fail_errno(Err *err, const char *format, ...)
+Error posix_fail_errno(Err *err, const char *format, ...)
 {
     int saved = errno;
     Error code = error_from_errno(saved);
@@ -386,7 +388,7 @@ static FileInfo describe(const struct stat *st)
     if (errno == ENOENT || errno == ENOTDIR) {
         return ERR_OK;
     }
-    return fail_errno(err, "stat %s", cpath.text);
+    return posix_fail_errno(err, "stat %s", cpath.text);
 }
 
 Error file_info(String path, FileInfo *info, Err *err)
@@ -404,7 +406,7 @@ Error file_info_fd(int fd, FileInfo *info, Err *err)
     *info = (FileInfo){ 0 };
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        return fail_errno(err, "stat descriptor %d", fd);
+        return posix_fail_errno(err, "stat descriptor %d", fd);
     }
     *info = describe(&st);
     return ERR_OK;
@@ -425,7 +427,7 @@ Error file_open_read(String path, int *fd, Err *err)
         return e;
     }
     *fd = open(cpath.text, O_RDONLY | O_CLOEXEC);
-    return *fd >= 0 ? ERR_OK : fail_errno(err, "open %s", cpath.text);
+    return *fd >= 0 ? ERR_OK : posix_fail_errno(err, "open %s", cpath.text);
 }
 
 Error file_open_append(String path, int *fd, Err *err)
@@ -437,7 +439,7 @@ Error file_open_append(String path, int *fd, Err *err)
         return e;
     }
     *fd = open(cpath.text, O_RDWR | O_APPEND | O_CLOEXEC);
-    return *fd >= 0 ? ERR_OK : fail_errno(err, "open %s", cpath.text);
+    return *fd >= 0 ? ERR_OK : posix_fail_errno(err, "open %s", cpath.text);
 }
 
 Error file_create(String path, unsigned mode, int *fd, Err *err)
@@ -449,7 +451,77 @@ Error file_create(String path, unsigned mode, int *fd, Err *err)
         return e;
     }
     *fd = open(cpath.text, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (mode_t)mode);
-    return *fd >= 0 ? ERR_OK : fail_errno(err, "create %s", cpath.text);
+    return *fd >= 0 ? ERR_OK : posix_fail_errno(err, "create %s", cpath.text);
+}
+
+Error file_lock(String path, int *fd, Err *err)
+{
+    *fd = -1;
+    CPath cpath;
+    Error e = to_cpath(path, &cpath, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    int opened = open(cpath.text, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (opened < 0) {
+        return posix_fail_errno(err, "open %s", cpath.text);
+    }
+    while (flock(opened, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            Error failed = posix_fail_errno(err, "lock %s", cpath.text);
+            close(opened);
+            return failed;
+        }
+    }
+    *fd = opened;
+    return ERR_OK;
+}
+
+Error file_try_lock(String path, int *fd, bool *locked, Err *err)
+{
+    *fd = -1;
+    *locked = false;
+    CPath cpath;
+    Error e = to_cpath(path, &cpath, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    int opened = open(cpath.text, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (opened < 0) {
+        return posix_fail_errno(err, "open %s", cpath.text);
+    }
+    while (flock(opened, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK) {
+            close(opened);
+            return ERR_OK;
+        }
+        if (errno != EINTR) {
+            Error failed = posix_fail_errno(err, "lock %s", cpath.text);
+            close(opened);
+            return failed;
+        }
+    }
+    *fd = opened;
+    *locked = true;
+    return ERR_OK;
+}
+
+bool file_find_upward(Arena *arena, String directory, StringList names, String *path)
+{
+    for (;;) {
+        for (size_t i = 0; i < names.count; i++) {
+            String candidate = path_join(arena, directory, names.items[i]);
+            if (file_exists(candidate)) {
+                *path = candidate;
+                return true;
+            }
+        }
+        String parent = path_dir(directory);
+        if (parent.len == 0 || str_equal(parent, directory)) {
+            return false;
+        }
+        directory = parent;
+    }
 }
 
 Error file_create_unique(Arena *arena, String pattern, String *path, int *fd, Err *err)
@@ -462,7 +534,7 @@ Error file_create_unique(Arena *arena, String pattern, String *path, int *fd, Er
     }
     *fd = mkostemp(cpath.text, O_CLOEXEC);
     if (*fd < 0) {
-        return fail_errno(err, "create %s", cpath.text);
+        return posix_fail_errno(err, "create %s", cpath.text);
     }
     *path = str_copy(arena, S(cpath.text));
     return ERR_OK;
@@ -485,7 +557,7 @@ Error file_read(int fd, void *buffer, size_t capacity, size_t *got, Err *err)
         }
         if (errno != EINTR) {
             *got = 0;
-            return fail_errno(err, "read");
+            return posix_fail_errno(err, "read");
         }
     }
 }
@@ -500,7 +572,7 @@ Error file_pread(int fd, void *buffer, size_t capacity, int64_t offset, size_t *
         }
         if (errno != EINTR) {
             *got = 0;
-            return fail_errno(err, "read");
+            return posix_fail_errno(err, "read");
         }
     }
 }
@@ -514,7 +586,7 @@ Error file_write(int fd, String data, Err *err)
             if (errno == EINTR) {
                 continue;
             }
-            return fail_errno(err, "write");
+            return posix_fail_errno(err, "write");
         }
         written += (size_t)n;
     }
@@ -523,12 +595,12 @@ Error file_write(int fd, String data, Err *err)
 
 Error file_seek(int fd, int64_t offset, Err *err)
 {
-    return lseek(fd, (off_t)offset, SEEK_SET) < 0 ? fail_errno(err, "seek") : ERR_OK;
+    return lseek(fd, (off_t)offset, SEEK_SET) < 0 ? posix_fail_errno(err, "seek") : ERR_OK;
 }
 
 Error file_truncate(int fd, int64_t size, Err *err)
 {
-    return ftruncate(fd, (off_t)size) != 0 ? fail_errno(err, "truncate") : ERR_OK;
+    return ftruncate(fd, (off_t)size) != 0 ? posix_fail_errno(err, "truncate") : ERR_OK;
 }
 
 Error file_rename(String from, String to, Err *err)
@@ -542,7 +614,7 @@ Error file_rename(String from, String to, Err *err)
     if (e != ERR_OK) {
         return e;
     }
-    return rename(cfrom.text, cto.text) == 0 ? ERR_OK : fail_errno(err, "rename %s to %s", cfrom.text, cto.text);
+    return rename(cfrom.text, cto.text) == 0 ? ERR_OK : posix_fail_errno(err, "rename %s to %s", cfrom.text, cto.text);
 }
 
 Error file_remove(String path, Err *err)
@@ -552,7 +624,7 @@ Error file_remove(String path, Err *err)
     if (e != ERR_OK) {
         return e;
     }
-    return unlink(cpath.text) == 0 ? ERR_OK : fail_errno(err, "remove %s", cpath.text);
+    return unlink(cpath.text) == 0 ? ERR_OK : posix_fail_errno(err, "remove %s", cpath.text);
 }
 
 Error file_set_mtime(String path, int64_t mtime_ns, Err *err)
@@ -565,7 +637,7 @@ Error file_set_mtime(String path, int64_t mtime_ns, Err *err)
     struct timespec times[2];
     times[0].tv_sec = times[1].tv_sec = (time_t)(mtime_ns / NS_PER_SECOND);
     times[0].tv_nsec = times[1].tv_nsec = (long)(mtime_ns % NS_PER_SECOND);
-    return utimensat(AT_FDCWD, cpath.text, times, 0) == 0 ? ERR_OK : fail_errno(err, "set mtime %s", cpath.text);
+    return utimensat(AT_FDCWD, cpath.text, times, 0) == 0 ? ERR_OK : posix_fail_errno(err, "set mtime %s", cpath.text);
 }
 
 Error file_read_all(Arena *arena, String path, String *contents, Err *err)
@@ -642,11 +714,11 @@ Error file_write_atomic(String path, String contents, unsigned mode, Err *err)
     memcpy(temp.text + path.len, suffix, sizeof suffix);
     int fd = mkstemp(temp.text);
     if (fd < 0) {
-        return fail_errno(err, "create %s", temp.text);
+        return posix_fail_errno(err, "create %s", temp.text);
     }
     String temp_path = S(temp.text);
     if (fchmod(fd, (mode_t)mode) != 0) {
-        e = fail_errno(err, "chmod %s", temp.text);
+        e = posix_fail_errno(err, "chmod %s", temp.text);
     }
     if (e == ERR_OK) {
         e = file_write(fd, contents, err);
@@ -672,11 +744,11 @@ Error file_map(String path, FileMap *map, Err *err)
     struct stat st;
     void *data = nullptr;
     if (fstat(fd, &st) != 0) {
-        e = fail_errno(err, "stat %.*s", (int)path.len, path.data);
+        e = posix_fail_errno(err, "stat %.*s", (int)path.len, path.data);
     } else if (st.st_size > 0) {
         data = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if (data == MAP_FAILED) {
-            e = fail_errno(err, "map %.*s", (int)path.len, path.data);
+            e = posix_fail_errno(err, "map %.*s", (int)path.len, path.data);
         }
     }
     close(fd);
@@ -720,7 +792,7 @@ Error dir_create(String path, unsigned mode, Err *err)
     if (e != ERR_OK) {
         return e;
     }
-    return make_directory(cpath.text, mode) ? ERR_OK : fail_errno(err, "create directory %s", cpath.text);
+    return make_directory(cpath.text, mode) ? ERR_OK : posix_fail_errno(err, "create directory %s", cpath.text);
 }
 
 Error dir_create_all(String path, unsigned mode, Err *err)
@@ -737,7 +809,7 @@ Error dir_create_all(String path, unsigned mode, Err *err)
         char saved = cpath.text[i];
         cpath.text[i] = '\0';
         if (!make_directory(cpath.text, mode)) {
-            return fail_errno(err, "create directory %s", cpath.text);
+            return posix_fail_errno(err, "create directory %s", cpath.text);
         }
         cpath.text[i] = saved;
     }
@@ -751,7 +823,7 @@ Error dir_remove(String path, Err *err)
     if (e != ERR_OK) {
         return e;
     }
-    return rmdir(cpath.text) == 0 ? ERR_OK : fail_errno(err, "remove directory %s", cpath.text);
+    return rmdir(cpath.text) == 0 ? ERR_OK : posix_fail_errno(err, "remove directory %s", cpath.text);
 }
 
 static bool is_dot_or_dot_dot(const char *name)
@@ -764,14 +836,14 @@ static bool is_dot_or_dot_dot(const char *name)
 {
     struct stat st;
     if (lstat(path->text, &st) != 0) {
-        return errno == ENOENT ? ERR_OK : fail_errno(err, "stat %s", path->text);
+        return errno == ENOENT ? ERR_OK : posix_fail_errno(err, "stat %s", path->text);
     }
     if (!S_ISDIR(st.st_mode)) {
-        return unlink(path->text) == 0 ? ERR_OK : fail_errno(err, "remove %s", path->text);
+        return unlink(path->text) == 0 ? ERR_OK : posix_fail_errno(err, "remove %s", path->text);
     }
     DIR *dir = opendir(path->text);
     if (dir == nullptr) {
-        return fail_errno(err, "open directory %s", path->text);
+        return posix_fail_errno(err, "open directory %s", path->text);
     }
     Error e = ERR_OK;
     struct dirent *entry;
@@ -793,7 +865,7 @@ static bool is_dot_or_dot_dot(const char *name)
     if (e != ERR_OK) {
         return e;
     }
-    return rmdir(path->text) == 0 ? ERR_OK : fail_errno(err, "remove directory %s", path->text);
+    return rmdir(path->text) == 0 ? ERR_OK : posix_fail_errno(err, "remove directory %s", path->text);
 }
 
 Error dir_remove_all(String path, Err *err)
@@ -815,7 +887,7 @@ Error dir_list(Arena *arena, String path, StringList *names, Err *err)
     }
     DIR *dir = opendir(cpath.text);
     if (dir == nullptr) {
-        return fail_errno(err, "open directory %s", cpath.text);
+        return posix_fail_errno(err, "open directory %s", cpath.text);
     }
     StringList found = { 0 };
     struct dirent *entry;
@@ -842,7 +914,7 @@ static void append_entry(Arena *arena, DirEntryList *entries, const char *name, 
     int fd = dup(dir_fd);
     DIR *dir = fd >= 0 ? fdopendir(fd) : nullptr;
     if (dir == nullptr) {
-        Error e = fail_errno(err, "open directory %s", cpath);
+        Error e = posix_fail_errno(err, "open directory %s", cpath);
         if (fd >= 0) {
             close(fd);
         }
@@ -854,7 +926,7 @@ static void append_entry(Arena *arena, DirEntryList *entries, const char *name, 
         struct dirent *entry = readdir(dir);
         if (entry == nullptr) {
             if (errno != 0) {
-                e = fail_errno(err, "read directory %s", cpath);
+                e = posix_fail_errno(err, "read directory %s", cpath);
             }
             break;
         }
@@ -887,7 +959,7 @@ static void append_entry(Arena *arena, DirEntryList *entries, const char *name, 
         int count = getattrlistbulk(dir_fd, &request, buffer, sizeof buffer, 0);
         if (count < 0) {
             *unsupported = first && (errno == ENOTSUP || errno == EINVAL);
-            return *unsupported ? ERR_OK : fail_errno(err, "read directory %s", cpath);
+            return *unsupported ? ERR_OK : posix_fail_errno(err, "read directory %s", cpath);
         }
         if (count == 0) {
             return ERR_OK;
@@ -964,7 +1036,7 @@ Error dir_read(Arena *arena, String path, DirEntryList *entries, Err *err)
     }
     int fd = open(cpath.text, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) {
-        return fail_errno(err, "open directory %s", cpath.text);
+        return posix_fail_errno(err, "open directory %s", cpath.text);
     }
 #ifdef __APPLE__
     bool unsupported;
@@ -989,7 +1061,7 @@ Error dir_create_temp(Arena *arena, String prefix, String *path, Err *err)
                                 (int)prefix.len, prefix.data);
     char *text = (char *)pattern.data;
     if (mkdtemp(text) == nullptr) {
-        return fail_errno(err, "create directory %s", text);
+        return posix_fail_errno(err, "create directory %s", text);
     }
     *path = pattern;
     return ERR_OK;
@@ -1006,7 +1078,7 @@ Error path_resolve(Arena *arena, String path, String *resolved, Err *err)
     }
     char buffer[PATH_LIMIT];
     if (realpath(cpath.text, buffer) == nullptr) {
-        return fail_errno(err, "resolve %s", cpath.text);
+        return posix_fail_errno(err, "resolve %s", cpath.text);
     }
     *resolved = str_copy(arena, S(buffer));
     return ERR_OK;
@@ -1131,7 +1203,7 @@ static bool would_block(void)
             if (errno == EINTR) {
                 continue;
             }
-            Error e = fail_errno(err, "poll");
+            Error e = posix_fail_errno(err, "poll");
             close_pipes(&stdin_fd, &stdout_fd, &stderr_fd);
             return e;
         }
@@ -1147,7 +1219,7 @@ static bool would_block(void)
                     // The child exited or closed its input without reading all of it.
                     close_if_open(&stdin_fd);
                 } else if (n < 0 && !would_block()) {
-                    Error e = fail_errno(err, "write to process");
+                    Error e = posix_fail_errno(err, "write to process");
                     close_pipes(&stdin_fd, &stdout_fd, &stderr_fd);
                     return e;
                 }
@@ -1164,7 +1236,7 @@ static bool would_block(void)
             } else if (n == 0) {
                 close_if_open(is_stdout ? &stdout_fd : &stderr_fd);
             } else if (!would_block()) {
-                Error e = fail_errno(err, "read from process");
+                Error e = posix_fail_errno(err, "read from process");
                 close_pipes(&stdin_fd, &stdout_fd, &stderr_fd);
                 return e;
             }
@@ -1188,7 +1260,7 @@ static void record_status(int status, int *exit_code, int *signal_number)
 {
     while (waitpid(pid, status, 0) < 0) {
         if (errno != EINTR) {
-            return fail_errno(err, "wait for process %d", (int)pid);
+            return posix_fail_errno(err, "wait for process %d", (int)pid);
         }
     }
     return ERR_OK;
@@ -1203,8 +1275,7 @@ static void close_pipe_pairs(int in_pipe[2], int out_pipe[2], int err_pipe[2])
     }
 }
 
-// open_pipe keeps both ends out of every child; spawning dup2s the child's end to a standard stream.
-static bool open_pipe(int fds[2])
+bool posix_open_pipe(int fds[2])
 {
 #ifdef __linux__
     return pipe2(fds, O_CLOEXEC) == 0;
@@ -1214,7 +1285,7 @@ static bool open_pipe(int fds[2])
 #endif
 }
 
-static bool make_nonblocking(int fd)
+bool posix_make_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
@@ -1280,14 +1351,14 @@ Error process_run(Arena *arena, StringList argv, String stdin_text, ProcessResul
     int in_pipe[2] = { -1, -1 };
     int out_pipe[2] = { -1, -1 };
     int err_pipe[2] = { -1, -1 };
-    if (!open_pipe(in_pipe) || !open_pipe(out_pipe) || !open_pipe(err_pipe)) {
-        Error e = fail_errno(err, "pipe");
+    if (!posix_open_pipe(in_pipe) || !posix_open_pipe(out_pipe) || !posix_open_pipe(err_pipe)) {
+        Error e = posix_fail_errno(err, "pipe");
         close_pipe_pairs(in_pipe, out_pipe, err_pipe);
         return e;
     }
-    if (!make_nonblocking(in_pipe[1]) || !make_nonblocking(out_pipe[0]) || !make_nonblocking(err_pipe[0]) ||
+    if (!posix_make_nonblocking(in_pipe[1]) || !posix_make_nonblocking(out_pipe[0]) || !posix_make_nonblocking(err_pipe[0]) ||
         !disable_sigpipe(in_pipe[1])) {
-        Error e = fail_errno(err, "configure pipe");
+        Error e = posix_fail_errno(err, "configure pipe");
         close_pipe_pairs(in_pipe, out_pipe, err_pipe);
         return e;
     }
@@ -1357,22 +1428,13 @@ Error process_run_interactive(Arena *scratch, StringList argv, int *exit_code, E
     return ERR_OK;
 }
 
-bool process_look_path(Arena *arena, String name, String *path)
+bool posix_look_path(Arena *arena, String name, String path_list, String *path)
 {
-    size_t slash;
-    if (str_find_char(name, '/', &slash)) {
-        if (!path_is_executable(name)) {
-            return false;
-        }
-        *path = str_copy(arena, name);
-        return true;
-    }
-    const char *list = getenv("PATH");
-    if (list == nullptr || name.len == 0) {
+    if (name.len == 0) {
         return false;
     }
-    String rest = S(list);
-    bool more = true;
+    String rest = path_list;
+    bool more = path_list.len > 0;
     while (more) {
         String dir;
         more = str_cut(rest, ':', &dir, &rest);
@@ -1387,6 +1449,19 @@ bool process_look_path(Arena *arena, String name, String *path)
     return false;
 }
 
+bool process_look_path(Arena *arena, String name, String *path)
+{
+    size_t slash;
+    if (str_find_char(name, '/', &slash)) {
+        if (!path_is_executable(name)) {
+            return false;
+        }
+        *path = str_copy(arena, name);
+        return true;
+    }
+    return posix_look_path(arena, name, S(getenv("PATH")), path);
+}
+
 Error process_executable_path(Arena *arena, String *path, Err *err)
 {
     char buffer[PATH_LIMIT];
@@ -1398,7 +1473,7 @@ Error process_executable_path(Arena *arena, String *path, Err *err)
 #else
     ssize_t n = readlink("/proc/self/exe", buffer, sizeof buffer - 1);
     if (n < 0) {
-        return fail_errno(err, "read /proc/self/exe");
+        return posix_fail_errno(err, "read /proc/self/exe");
     }
     buffer[n] = '\0';
 #endif
@@ -1421,6 +1496,23 @@ static void *reap_child(void *argument)
     while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
     }
     return nullptr;
+}
+
+// reap_in_background waits for child on a thread of its own, so it does not
+// linger as a zombie. The thread blocks every signal: it outlives the call,
+// and a signal the kernel handed to it would never reach a thread the program
+// started later to take that signal with sigwait.
+static void reap_in_background(pid_t child)
+{
+    sigset_t all;
+    sigfillset(&all);
+    sigset_t previous;
+    pthread_sigmask(SIG_BLOCK, &all, &previous);
+    Thread reaper;
+    if (thread_start(&reaper, reap_child, (void *)(intptr_t)child, nullptr) == ERR_OK) {
+        thread_detach(&reaper);
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, nullptr);
 }
 
 Error process_open_default(String path, Err *err)
@@ -1453,11 +1545,78 @@ Error process_open_default(String path, Err *err)
     if (rc != 0) {
         return err_set(err, rc == ENOENT ? ERR_NOT_FOUND : ERR_PLATFORM, "start %s: %s", opener, strerror(rc));
     }
-    // A thread waits for the opener so it does not linger as a zombie.
-    Thread reaper;
-    if (thread_start(&reaper, reap_child, (void *)(intptr_t)pid, nullptr) == ERR_OK) {
-        thread_detach(&reaper);
+    reap_in_background(pid);
+    return ERR_OK;
+}
+
+// detach_child gives the child its own session, no blocked signals and the
+// default action for every signal this library or its caller may change.
+[[nodiscard]] static int detach_child(posix_spawnattr_t *attributes)
+{
+    sigset_t none;
+    sigemptyset(&none);
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    const int changed[] = { SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGWINCH, SIGCHLD };
+    for (size_t i = 0; i < countof(changed); i++) {
+        sigaddset(&defaults, changed[i]);
     }
+    int rc = posix_spawnattr_setsigmask(attributes, &none);
+    if (rc == 0) {
+        rc = posix_spawnattr_setsigdefault(attributes, &defaults);
+    }
+    if (rc == 0) {
+        rc = posix_spawnattr_setflags(attributes,
+                                      (short)(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSID));
+    }
+    return rc;
+}
+
+Error process_spawn_detached(Arena *scratch, StringList argv, String output_path, int *pid, Err *err)
+{
+    *pid = 0;
+    if (argv.count == 0) {
+        return err_set(err, ERR_INVALID_ARGUMENT, "spawn: no program");
+    }
+    CPath output;
+    Error e = to_cpath(output_path.len > 0 ? output_path : S("/dev/null"), &output, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    char **items = build_argv(scratch, argv);
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) {
+        return err_set(err, ERR_PLATFORM, "spawn %s: %s", items[0], strerror(rc));
+    }
+    rc = posix_spawnattr_init(&attributes);
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return err_set(err, ERR_PLATFORM, "spawn %s: %s", items[0], strerror(rc));
+    }
+    rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (rc == 0) {
+        rc = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, output.text, O_WRONLY | O_CREAT | O_APPEND,
+                                              0600);
+    }
+    if (rc == 0) {
+        rc = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+    }
+    if (rc == 0) {
+        rc = detach_child(&attributes);
+    }
+    pid_t child;
+    if (rc == 0) {
+        rc = posix_spawnp(&child, items[0], &actions, &attributes, items, environ);
+    }
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        return spawn_failed(err, rc, items[0]);
+    }
+    reap_in_background(child);
+    *pid = (int)child;
     return ERR_OK;
 }
 
@@ -1523,7 +1682,7 @@ Error env_set(String name, String value, Err *err)
     if (e != ERR_OK) {
         return e;
     }
-    return setenv(cname.text, cvalue.text, 1) == 0 ? ERR_OK : fail_errno(err, "set %s", cname.text);
+    return setenv(cname.text, cvalue.text, 1) == 0 ? ERR_OK : posix_fail_errno(err, "set %s", cname.text);
 }
 
 void env_unset(String name)
@@ -1566,6 +1725,38 @@ String host_short_name(Arena *arena)
     return str_copy(arena, name);
 }
 
+Error dir_runtime(Arena *arena, String name, String *path, Err *err)
+{
+    String base;
+    String runtime;
+    if (env_get(arena, S("XDG_RUNTIME_DIR"), &runtime) && runtime.len > 0) {
+        base = path_join(arena, runtime, name);
+    } else {
+        String temporary;
+        if (!env_get(arena, S("TMPDIR"), &temporary) || temporary.len == 0) {
+            temporary = S("/tmp");
+        }
+        base = path_join(arena, temporary, str_format(arena, "%.*s-%d", (int)name.len, name.data, (int)getuid()));
+    }
+    CPath cpath;
+    Error e = to_cpath(base, &cpath, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    if (mkdir(cpath.text, 0700) != 0 && errno != EEXIST) {
+        return posix_fail_errno(err, "create %s", cpath.text);
+    }
+    struct stat st;
+    if (lstat(cpath.text, &st) != 0) {
+        return posix_fail_errno(err, "stat %s", cpath.text);
+    }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077) != 0) {
+        return err_set(err, ERR_IO, "%s is not a private directory of this user", cpath.text);
+    }
+    *path = base;
+    return ERR_OK;
+}
+
 // ---- signals ----
 
 static void stop_and_reload(sigset_t *set)
@@ -1593,6 +1784,53 @@ Signal signals_wait(void)
             return number == SIGHUP ? SIGNAL_RELOAD : SIGNAL_STOP;
         }
     }
+}
+
+struct SignalWatch {
+    Arena *arena;
+    void (*on_signal)(void *context, Signal signal);
+    void *context;
+    Thread thread;
+    atomic_bool closing;
+};
+
+// watch_signals ends on the first signal after closing, which signal_watch_stop sends to this thread alone.
+static void *watch_signals(void *argument)
+{
+    SignalWatch *watch = argument;
+    for (;;) {
+        Signal signal = signals_wait();
+        if (atomic_load(&watch->closing)) {
+            return nullptr;
+        }
+        watch->on_signal(watch->context, signal);
+    }
+}
+
+Error signal_watch_start(void (*on_signal)(void *context, Signal signal), void *context, SignalWatch **watch,
+                         Err *err)
+{
+    Arena *arena = arena_create(0);
+    SignalWatch *w = arena_push(arena, sizeof *w);
+    w->arena = arena;
+    w->on_signal = on_signal;
+    w->context = context;
+    atomic_init(&w->closing, false);
+    Error e = thread_start(&w->thread, watch_signals, w, err);
+    if (e != ERR_OK) {
+        arena_destroy(arena);
+        return e;
+    }
+    *watch = w;
+    return ERR_OK;
+}
+
+void signal_watch_stop(SignalWatch *watch)
+{
+    atomic_store(&watch->closing, true);
+    pthread_kill(*as_thread(&watch->thread), SIGHUP);
+    thread_join(&watch->thread);
+    arena_destroy(watch->arena);
 }
 
 Error process_signal(int pid, Signal signal, Err *err)
@@ -1798,7 +2036,7 @@ Error net_set_timeouts(int fd, int timeout_ms, Err *err)
     struct timeval timeout = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout) != 0) {
-        return fail_errno(err, "set socket timeouts");
+        return posix_fail_errno(err, "set socket timeouts");
     }
     return ERR_OK;
 }
@@ -1835,15 +2073,15 @@ Error net_listen_unix(String path, unsigned mode, int *fd, Err *err)
     }
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
-        return fail_errno(err, "listen %s", address.sun_path);
+        return posix_fail_errno(err, "listen %s", address.sun_path);
     }
     if (!prepare_socket(sock) || bind(sock, (struct sockaddr *)&address, sizeof address) != 0) {
-        e = fail_errno(err, "listen %s", address.sun_path);
+        e = posix_fail_errno(err, "listen %s", address.sun_path);
         close(sock);
         return e;
     }
     if (chmod(address.sun_path, (mode_t)mode) != 0 || listen(sock, 64) != 0) {
-        e = fail_errno(err, "listen %s", address.sun_path);
+        e = posix_fail_errno(err, "listen %s", address.sun_path);
         close(sock);
         unlink(address.sun_path);
         return e;

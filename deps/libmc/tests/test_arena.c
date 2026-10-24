@@ -134,6 +134,9 @@ const AbortCase ABORT_CASES[] = {
     { "concat_past_size_max", concat_past_size_max },
     { "push_size_max", push_size_max },
     { "grow_past_size_max", grow_past_size_max },
+    { "terminal_round_trip", terminal_round_trip },
+    { "signal_watch_round_trip", signal_watch_round_trip },
+    { "reaper_round_trip", reaper_round_trip },
     { nullptr, nullptr },
 };
 

@@ -1,6 +1,6 @@
 #include "daemon.h"
 
-#include "http.h"
+#include "mc/net/http.h"
 #include "mc/encoding/json.h"
 
 enum { REQUEST_LIMIT = 8192, CLIENT_TIMEOUT_MS = 5000, REQUEST_BLOCK = 64 * 1024 };
@@ -92,16 +92,15 @@ Error daemon_serve(Cancel *cancel, String address, MetricsFn metrics, BacklogFn 
 
 bool daemon_ask(Arena *scratch, String address, int64_t *backlog) {
     if (address.len == 0) return false;
-    HttpRequest request = {
-        .method = S("GET"),
-        .url = str_format(scratch, "http://%.*s/status", (int)address.len, address.data),
-        .body_fd = -1,
-        .sink_fd = -1,
-        .timeout_ms = 2000,
-    };
+    HttpClientConfig config = {.timeout_ms = 2000, .allow_plain_http = true};
+    HttpClient *client;
+    if (http_client_create(&config, &client, nullptr) != ERR_OK) return false;
+    HttpRequest request = {.url = str_format(scratch, "http://%.*s/status", (int)address.len, address.data)};
     HttpResponse response;
+    Error e = http_send(client, scratch, &request, &response, nullptr);
+    http_client_destroy(client);
     Node *status;
-    if (http_perform(nullptr, scratch, &request, &response, nullptr) != ERR_OK || response.status != 200) return false;
+    if (e != ERR_OK || response.status != 200) return false;
     if (json_parse(scratch, response.body, &status, nullptr) != ERR_OK) return false;
     const Node *count = node_get(status, S("backlog"));
     if (!count || count->kind != NODE_INT) return false;
