@@ -99,7 +99,8 @@ typedef struct {
     return ERR_OK;
 }
 
-static void bind_text(Stmt *s, String v) { sqlite3_bind_text(s->stmt, s->next++, v.data ? v.data : "", (int)v.len, SQLITE_TRANSIENT); }
+/* SQLITE_TRANSIENT is sqlite's own sentinel, the integer -1 cast to a destructor pointer. */
+static void bind_text(Stmt *s, String v) { sqlite3_bind_text(s->stmt, s->next++, v.data ? v.data : "", (int)v.len, SQLITE_TRANSIENT); } // NOLINT(performance-no-int-to-ptr)
 static void bind_int(Stmt *s, int64_t v) { sqlite3_bind_int64(s->stmt, s->next++, v); }
 
 /* step_done runs a statement to completion and reports how many rows changed. */

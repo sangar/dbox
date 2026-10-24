@@ -67,7 +67,8 @@ static int fail(const Err *err) {
     va_list args;
     va_start(args, format);
     fputs("dbox: ", stderr);
-    vfprintf(stderr, format, args);
+    /* clang-analyzer does not model C23's one-argument va_start; 22 names the check security.VAList. */
+    vfprintf(stderr, format, args); // NOLINT(clang-analyzer-valist.Uninitialized,clang-analyzer-security.VAList)
     fputs(" (see dbox --help)\n", stderr);
     va_end(args);
     return EXIT_USAGE;

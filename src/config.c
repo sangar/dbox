@@ -8,6 +8,9 @@
 #include "mc/text/fmt.h"
 #include "mc/text/path.h"
 
+/* TREE_BLOCK is the arena block for a config file's parsed tree. */
+enum { TREE_BLOCK = 16 * 1024 };
+
 static const char starter_yml[] =
     "# dbox configuration. Every key: https://github.com/OWNER/dbox/blob/master/docs/configuration.md\n"
     "#\n"
@@ -297,7 +300,8 @@ typedef struct {
     char message[400];
     va_list args;
     va_start(args, format);
-    vsnprintf(message, sizeof message, format, args);
+    /* clang-analyzer does not model C23's one-argument va_start; 22 names the check security.VAList. */
+    vsnprintf(message, sizeof message, format, args); // NOLINT(clang-analyzer-valist.Uninitialized,clang-analyzer-security.VAList)
     va_end(args);
     if (line > 0) (void)err_set(d->err, ERR_INVALID_ARGUMENT, "line %zu: %s", line, message);
     else (void)err_set(d->err, ERR_INVALID_ARGUMENT, "%s", message);
@@ -508,7 +512,7 @@ Error config_parse(Arena *arena, String path, String text, StringList environmen
     config_init(arena, config);
     config->path = str_copy(arena, path);
     int n = (int)path.len;
-    Arena *tree = arena_create(16 * 1024);
+    Arena *tree = arena_create(TREE_BLOCK);
     Err inner;
     Node *root;
     Error e = yaml_parse(tree, text, &root, &inner);

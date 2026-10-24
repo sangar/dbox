@@ -1,13 +1,27 @@
 # The checks dbox holds its own sources to. Vendored code under deps/ is not analysed.
+# Left out because they fight C rather than find bugs in it:
+#   readability-implicit-bool-conversion  C's &&, || and ?: work in int, so every bool
+#                                          expression and {0} initializer is flagged
+#   misc-unused-parameters                 store and callback signatures are fixed; the
+#                                          build already passes -Wno-unused-parameter
+#   ...DeprecatedOrUnsafeBufferHandling   asks for Annex K's memcpy_s and fprintf_s,
+#                                          which glibc and macOS do not have
+#   bugprone-multi-level-implicit-pointer-conversion
+#                                          asks for a cast on the void * an arena returns
 Checks: >
   bugprone-*,
   clang-analyzer-*,
   misc-*,
   performance-*,
-  readability-implicit-bool-conversion,
   -bugprone-easily-swappable-parameters,
   -bugprone-assignment-in-if-condition,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -misc-include-cleaner,
-  -misc-no-recursion
+  -misc-no-recursion,
+  -misc-unused-parameters
+CheckOptions:
+  # sizeof *items is right for an array of pointers.
+  bugprone-sizeof-expression.WarnOnSizeOfPointerToAggregate: false
 WarningsAsErrors: '*'
 HeaderFilterRegex: '^src/'
