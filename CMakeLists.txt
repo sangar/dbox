@@ -98,9 +98,17 @@ set_tests_properties(integration PROPERTIES LABELS integration)
 # ---- check: static analysis over the project's own sources ----
 
 find_program(CLANG_TIDY clang-tidy)
+# A clang-tidy from Homebrew's LLVM does not know where the macOS SDK is.
+set(CLANG_TIDY_SYSROOT)
+if(APPLE)
+    execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE MACOS_SDK OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(MACOS_SDK)
+        set(CLANG_TIDY_SYSROOT --extra-arg=-isysroot --extra-arg=${MACOS_SDK})
+    endif()
+endif()
 if(CLANG_TIDY)
     add_custom_target(check
-        COMMAND ${CLANG_TIDY} -p ${CMAKE_BINARY_DIR} --warnings-as-errors=* ${DBOX_SOURCES} ${CMAKE_SOURCE_DIR}/src/main.c
+        COMMAND ${CLANG_TIDY} -p ${CMAKE_BINARY_DIR} --warnings-as-errors=* ${CLANG_TIDY_SYSROOT} ${DBOX_SOURCES} ${CMAKE_SOURCE_DIR}/src/main.c
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "clang-tidy over src/"
         VERBATIM)

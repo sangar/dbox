@@ -3,7 +3,7 @@
 #include "http.h"
 #include "mc/encoding/json.h"
 
-enum { REQUEST_LIMIT = 8192, CLIENT_TIMEOUT_MS = 5000 };
+enum { REQUEST_LIMIT = 8192, CLIENT_TIMEOUT_MS = 5000, REQUEST_BLOCK = 64 * 1024 };
 
 Error daemon_write_pid(Arena *scratch, String path, Err *err) {
     int pid;
@@ -78,7 +78,7 @@ Error daemon_serve(Cancel *cancel, String address, MetricsFn metrics, BacklogFn 
     int fd;
     Error e = net_listen(address, &fd, err);
     if (e != ERR_OK) return e;
-    Arena *arena = arena_create(64 * 1024);
+    Arena *arena = arena_create(REQUEST_BLOCK);
     while (!cancel_requested(cancel)) {
         int client;
         if (!net_accept(fd, 200, &client)) continue;
