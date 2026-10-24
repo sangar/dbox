@@ -115,7 +115,7 @@ out:
     return e;
 }
 
-static const StoreOps disk_ops = {disk_put, disk_get, disk_head, disk_remove, disk_list};
+static const StoreOps disk_ops = {disk_put, disk_get, disk_head, disk_remove, disk_list, nullptr};
 
 Store *disk_open(Arena *arena, String root, String prefix) {
     Disk *disk = arena_push(arena, sizeof *disk);

@@ -7,7 +7,8 @@
  * A Store is the backend a folder is synced to: an S3-compatible bucket or a
  * directory. Keys are paths relative to the synced root with forward
  * slashes; each store applies its own prefix. Stores live in the arena they
- * were opened in and hold no other resources.
+ * were opened in; store_close releases what else they hold, such as an S3
+ * store's connections.
  */
 
 /* Object describes a stored file. sha256 is empty in List results from S3, which does not return metadata there; Head fills it in. */
@@ -44,6 +45,8 @@ typedef struct StoreOps {
     Error (*head)(Store *store, Cancel *cancel, Arena *arena, String key, Object *object, Err *err);
     Error (*remove)(Store *store, Cancel *cancel, Arena *arena, String key, Err *err);
     Error (*list)(Store *store, Cancel *cancel, Arena *arena, ObjectList *objects, Err *err);
+    /* close releases what the store holds besides its arena; nullptr when nothing. */
+    void (*close)(Store *store);
 } StoreOps;
 
 struct Store {
@@ -66,6 +69,10 @@ struct Store {
     return store->ops->list(store, cancel, arena, objects, err);
 }
 
+static inline void store_close(Store *store) {
+    if (store && store->ops->close) store->ops->close(store);
+}
+
 void objectlist_push(Arena *arena, ObjectList *list, Object object);
 
 /* store_open builds the store described by config in the arena; S3 stores stage downloads in tmp_dir. */
@@ -79,14 +86,15 @@ typedef struct StoreSet {
 
 [[nodiscard]] Error store_open_all(Arena *arena, const Config *config, StoreSet *set, Err *err);
 Store *storeset_get(const StoreSet *set, String name);
+void storeset_close(StoreSet *set);
 
 /* store_check writes, reads back and deletes a probe object. */
 [[nodiscard]] Error store_check(Cancel *cancel, Arena *scratch, Store *store, Err *err);
 
 Store *disk_open(Arena *arena, String root, String prefix);
 [[nodiscard]] Error s3_open(Arena *arena, const StoreConfig *config, int64_t part_size, String tmp_dir, Store **store, Err *err);
-/* s3_create_bucket creates the bucket if it does not exist yet. */
-[[nodiscard]] Error s3_create_bucket(Store *store, Cancel *cancel, Arena *scratch, Err *err);
+/* s3_store_create_bucket creates an S3 store's bucket if it does not exist yet. */
+[[nodiscard]] Error s3_store_create_bucket(Store *store, Cancel *cancel, Arena *scratch, Err *err);
 
 /* temp_file creates an unlinked temporary file in dir, open for reading and writing. */
 [[nodiscard]] Error temp_file(Arena *scratch, String dir, int *fd, Err *err);

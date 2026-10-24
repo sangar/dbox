@@ -5,7 +5,6 @@
 #include "config.h"
 #include "daemon.h"
 #include "engine.h"
-#include "http.h"
 #include "index.h"
 #include "mc/platform/service.h"
 #include "mc/text/fmt.h"
@@ -223,6 +222,7 @@ typedef Error (*EngineFn)(Engine *engine, Index *index, Cancel *cancel, const Co
         result = run(engine, index, cancel, config, app->log, err);
         engine_destroy(engine);
     }
+    storeset_close(&stores);
     index_close(index);
     return result;
 }
@@ -472,6 +472,7 @@ static int cmd_check(Arena *arena, int argc, char **argv) {
     Err inner;
     Error checked = store_check(&cancel, arena, store, &inner);
     cancel_destroy(&cancel);
+    store_close(store);
     if (checked != ERR_OK) {
         (void)err_set(&err, checked, "%.*s: %s", (int)name.len, name.data, inner.msg);
         return fail(&err);
@@ -640,7 +641,6 @@ static int dispatch(App *app, int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    http_global_init();
     App app = {.arena = arena_create(0)};
     int rc = dispatch(&app, argc, argv);
     if (app.log) logger_destroy(app.log);

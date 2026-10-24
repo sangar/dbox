@@ -44,4 +44,14 @@ extern const TestCase ENCODING_TESTS[];
 extern const TestCase LOG_TESTS[];
 extern const TestCase WATCH_TESTS[];
 extern const TestCase SERVICE_TESTS[];
+extern const TestCase PTY_TESTS[];
+extern const TestCase SYSINFO_TESTS[];
+extern const TestCase HTTP_TESTS[];
+extern const TestCase SMTP_TESTS[];
+extern const TestCase S3_TESTS[];
 extern const AbortCase ABORT_CASES[];
+
+// Abort cases that live with the tests that run them.
+void terminal_round_trip(void);
+void signal_watch_round_trip(void);
+void reaper_round_trip(void);

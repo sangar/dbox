@@ -5,7 +5,6 @@
 #include "config.h"
 #include "daemon.h"
 #include "engine.h"
-#include "http.h"
 #include "ignore.h"
 #include "index.h"
 #include "mc/text/glob.h"
@@ -620,7 +619,7 @@ typedef struct {
     return ERR_OK;
 }
 
-static const StoreOps wrapped_ops = {w_put, w_get, w_head, w_remove, w_list};
+static const StoreOps wrapped_ops = {w_put, w_get, w_head, w_remove, w_list, nullptr};
 
 static Wrapped *wrap(T *t, Machine *m, const char *name) {
     Wrapped *w = arena_push(t->arena, sizeof *w);
@@ -979,7 +978,6 @@ int main(void) {
     if (!null_out) return 1;
     t.discard = logger_create(LOG_ERROR, LOG_TEXT, null_out);
     t.verbose = logger_create(LOG_DEBUG, LOG_TEXT, stderr);
-    http_global_init();
     env_unset(S("DBOX_CONFIG"));
 
     test_config_loads_stores_with_defaults_and_expanded_secrets(&t);

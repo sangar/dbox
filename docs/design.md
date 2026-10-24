@@ -311,13 +311,12 @@ dbox/
   src/index.c               SQLite: files, replicas, upload failures
   src/store.h               the Store interface; disk.c and s3.c implement it
   src/content.c             copying and hashing file content
-  src/http.c                the HTTP client: the one module that talks to libcurl
-  src/s3.c                  S3 over http.c: Signature V4, metadata, multipart above part_size, paginated listing
+  src/s3.c                  the S3 store over libmc's S3 client: prefix, metadata, downloads staged in temp files
   src/pathqueue.c           the de-duplicating path queue and per-path locks
   src/engine.c              reconcile, the primary workers, the watcher thread, poll, conflicts, downloads
   src/mirror.c              mirror workers, backfill adoption, verification
   src/daemon.c              pid file, /healthz /metrics /status listener, status client
-  deps/libmc                arenas, strings, errors, containers, YAML and JSON, logging, threads, file watching, login services and every OS call
+  deps/libmc                arenas, strings, errors, containers, YAML and JSON, logging, threads, file watching, login services, HTTP, S3 and every OS call
   deps/sqlite               vendored at the version in deps.lock
   tests/test_dbox.c         config, index, ignore, engine scenarios, daemon
   tests/test_s3.c           the S3 store against the compose MinIOs
@@ -339,7 +338,8 @@ work gets a scratch arena that is destroyed when it is done, so nothing is
 freed piecemeal.
 
 `src/store.h` exposes a five-method interface (`put`, `get`, `remove`, `list`,
-`head`) with `s3` and `disk` implementations. Unit tests use `disk`
+`head`), plus `close` for what a store holds besides its arena, with `s3` and
+`disk` implementations. Unit tests use `disk`
 stores in temp directories; MinIO is only needed for the integration suite. Mirror copy
 is `Get` from one store piped into `Put` on another, so adding a new backend
 kind (SFTP, WebDAV) is one file and never touches the sync logic.
@@ -348,8 +348,8 @@ kind (SFTP, WebDAV) is one file and never touches the sync logic.
 
 | Purpose | Library | From |
 |---|---|---|
-| foundation | [libmc](https://github.com/sangar/libmc): arenas, `String`, `Error`, YAML (on cyaml), JSON, logging, threads, SHA-256 and Signature V4, file watching on inotify and FSEvents, login services | `deps/libmc`, pinned in `deps.lock` |
-| HTTP | libcurl, wrapped by `src/http.c` | the system, for its TLS stack and certificate store |
+| foundation | [libmc](https://github.com/sangar/libmc): arenas, `String`, `Error`, YAML (on cyaml), JSON, logging, threads, SHA-256, file watching on inotify and FSEvents, login services | `deps/libmc`, pinned in `deps.lock` |
+| HTTP and S3 | libmc's `mc/net/http.h` and `mc/net/s3.h`, on curl, mbedTLS and nghttp2 that libmc pins and its build fetches; the S3 client signs with Signature V4, retries, and uploads in parts | `deps/libmc` |
 | index | SQLite, wrapped by `src/index.c` | `deps/sqlite`, pinned in `deps.lock` |
 
 Everything else is C23. libmc is the project's vocabulary and is included
@@ -357,7 +357,7 @@ wherever it is needed; every other library is included from exactly one
 wrapper module, so swapping one changes one file. Credentials come from the config,
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`), or
 `~/.aws/credentials`; instance metadata and SSO are not supported. Requests
-are retried three times on transport errors and 5xx responses.
+are tried three times on transport errors and 429 and 5xx responses.
 
 ## Running as a daemon
 

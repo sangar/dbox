@@ -27,8 +27,6 @@ if(DBOX_VERSION STREQUAL "")
     endif()
 endif()
 
-find_package(CURL REQUIRED)
-
 set(DBOX_WARNINGS -Wall -Wextra -Werror -Wconversion -Wshadow -Wvla -Wstrict-prototypes -Wimplicit-fallthrough -Wno-unused-parameter)
 
 if(DBOX_SANITIZE)
@@ -45,27 +43,47 @@ target_compile_definitions(sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_THRE
 target_compile_options(sqlite PRIVATE -w)
 set_target_properties(sqlite PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 
-# libmc builds with the same flags as dbox; cyaml and yyjson, its dependencies, with upstream's.
-file(GLOB CYAML_SOURCES CONFIGURE_DEPENDS deps/libmc/deps/cyaml/*.c)
-add_library(cyaml STATIC ${CYAML_SOURCES})
-target_include_directories(cyaml PUBLIC deps/libmc/deps/cyaml)
-target_compile_options(cyaml PRIVATE -w)
-set_target_properties(cyaml PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
-
-add_library(yyjson STATIC deps/libmc/deps/yyjson/yyjson.c)
-target_include_directories(yyjson PUBLIC deps/libmc/deps/yyjson)
-target_compile_options(yyjson PRIVATE -w)
-set_target_properties(yyjson PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
-
-file(GLOB LIBMC_SOURCES CONFIGURE_DEPENDS deps/libmc/src/*/*.c)
-add_library(mc STATIC ${LIBMC_SOURCES})
-target_include_directories(mc PUBLIC deps/libmc/include PRIVATE deps/libmc/src)
-target_compile_options(mc PRIVATE ${DBOX_WARNINGS})
-find_package(Threads REQUIRED)
-target_link_libraries(mc PRIVATE cyaml yyjson PUBLIC Threads::Threads m)
-if(APPLE)
-    target_link_libraries(mc PUBLIC "-framework CoreServices")
+# libmc builds with its own build program, which fetches the libraries it
+# pins in deps/libmc/deps.lock, curl and mbedTLS among them, on the first
+# build; that one needs the network. It builds a copy in the build directory,
+# since it writes the fetched libraries and its output beside its sources, and
+# deps/libmc must keep the content deps.lock pins. A sanitized dbox links
+# libmc's debug build, which has the same sanitizers.
+set(LIBMC_DIR ${CMAKE_SOURCE_DIR}/deps/libmc)
+set(LIBMC_BUILD_DIR ${CMAKE_BINARY_DIR}/libmc)
+if(DBOX_SANITIZE)
+    set(LIBMC_MODE)
+    set(LIBMC_ARCHIVE ${LIBMC_BUILD_DIR}/out/debug/libmc.a)
+else()
+    set(LIBMC_MODE release)
+    set(LIBMC_ARCHIVE ${LIBMC_BUILD_DIR}/out/release/libmc.a)
 endif()
+file(MAKE_DIRECTORY ${LIBMC_BUILD_DIR})
+file(GLOB_RECURSE LIBMC_INPUTS CONFIGURE_DEPENDS ${LIBMC_DIR}/src/* ${LIBMC_DIR}/include/*)
+add_custom_command(
+    OUTPUT ${LIBMC_ARCHIVE}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${LIBMC_DIR}/src ${LIBMC_BUILD_DIR}/src
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${LIBMC_DIR}/include ${LIBMC_BUILD_DIR}/include
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${LIBMC_DIR}/tools ${LIBMC_BUILD_DIR}/tools
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${LIBMC_DIR}/tests ${LIBMC_BUILD_DIR}/tests
+    COMMAND ${CMAKE_COMMAND} -E copy ${LIBMC_DIR}/deps.lock ${LIBMC_BUILD_DIR}/deps.lock
+    COMMAND ${CMAKE_C_COMPILER} tools/build.c -o nob
+    COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER} ./nob ${LIBMC_MODE}
+    DEPENDS ${LIBMC_INPUTS} ${LIBMC_DIR}/tools/build.c ${LIBMC_DIR}/deps.lock
+    WORKING_DIRECTORY ${LIBMC_BUILD_DIR}
+    COMMENT "Building libmc"
+    VERBATIM)
+add_custom_target(libmc_build DEPENDS ${LIBMC_ARCHIVE})
+
+find_package(Threads REQUIRED)
+add_library(mc STATIC IMPORTED GLOBAL)
+set_target_properties(mc PROPERTIES IMPORTED_LOCATION ${LIBMC_ARCHIVE})
+target_include_directories(mc INTERFACE ${LIBMC_DIR}/include)
+target_link_libraries(mc INTERFACE Threads::Threads m)
+if(APPLE)
+    target_link_libraries(mc INTERFACE "-framework CoreServices" "-framework SystemConfiguration" "-framework CoreFoundation")
+endif()
+add_dependencies(mc libmc_build)
 
 # ---- dbox ----
 
@@ -75,7 +93,7 @@ list(REMOVE_ITEM DBOX_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
 add_library(dbox_core STATIC ${DBOX_SOURCES})
 target_include_directories(dbox_core PUBLIC src)
 target_compile_options(dbox_core PUBLIC ${DBOX_WARNINGS})
-target_link_libraries(dbox_core PUBLIC mc sqlite CURL::libcurl)
+target_link_libraries(dbox_core PUBLIC mc sqlite)
 
 add_executable(dbox src/main.c)
 target_link_libraries(dbox PRIVATE dbox_core)

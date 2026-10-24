@@ -25,7 +25,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build libcurl4-openssl-dev
+          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build
           echo "CC=clang-18" >> "$GITHUB_ENV"
           sudo ln -sf /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy
 
