@@ -1,3 +1,3 @@
 # name version url hash
-libmc d6bdb3b https://github.com/sangar/libmc/tree/s3 sha256:d14d216eb32e1e36e77d01cdb19e5b5ceb02607e20b6a840dda15452b5dc5362
+libmc 3722a56 https://github.com/sangar/libmc sha256:d14d216eb32e1e36e77d01cdb19e5b5ceb02607e20b6a840dda15452b5dc5362
 sqlite 3.53.4 https://sqlite.org/2026/sqlite-amalgamation-3530400.zip sha256:1ac04027c567f4e9a595a803e29ea6b959387761f7b9f33a1a1fe7d4594dfd0e
