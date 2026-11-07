@@ -77,23 +77,39 @@ Arena *arena_create(size_t block_size)
     return arena;
 }
 
-void arena_destroy(Arena *arena)
+static void free_from(Block *block)
 {
-    if (arena == nullptr) {
-        return;
-    }
-    Block *block = arena->first;
     while (block != nullptr) {
         Block *next = block->next;
         free(block);
         block = next;
     }
+}
+
+void arena_destroy(Arena *arena)
+{
+    if (arena == nullptr) {
+        return;
+    }
+    free_from(arena->first);
     free(arena);
 }
 
 static size_t align_up(size_t value, size_t alignment)
 {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// hand_out gives out the block's bytes from start to end, clearing those
+// that were handed out before.
+static void *hand_out(Block *block, size_t start, size_t end)
+{
+    block->used = end;
+    if (start < block->dirty) {
+        memset(block->data + start, 0, min_size(end, block->dirty) - start);
+    }
+    block->dirty = max_size(block->dirty, end);
+    return block->data + start;
 }
 
 // Blocks after the current one are empty: a later allocation moved past them
@@ -106,15 +122,8 @@ void *arena_push_aligned(Arena *arena, size_t size, size_t alignment)
         uintptr_t base = (uintptr_t)block->data;
         size_t start = align_up(base + block->used, alignment) - base;
         if (start <= block->capacity && size <= block->capacity - start) {
-            size_t end = start + size;
-            block->used = end;
             arena->current = block;
-            void *memory = block->data + start;
-            if (start < block->dirty) {
-                memset(memory, 0, min_size(end, block->dirty) - start);
-            }
-            block->dirty = max_size(block->dirty, end);
-            return memory;
+            return hand_out(block, start, start + size);
         }
         if (block->next == nullptr) {
             block->next = block_create(max_size(arena_size_add(size, alignment), arena->block_size));
@@ -128,13 +137,31 @@ void *arena_push(Arena *arena, size_t size)
     return arena_push_aligned(arena, size, alignof(max_align_t));
 }
 
+// extend_in_place grows the arena's newest allocation, which ends at end, by
+// extra bytes when its block has room.
+static bool extend_in_place(Arena *arena, const unsigned char *end, size_t extra)
+{
+    Block *block = arena->current;
+    if (end != block->data + block->used || extra > block->capacity - block->used) {
+        return false;
+    }
+    hand_out(block, block->used, block->used + extra);
+    return true;
+}
+
 void *arena_grow(Arena *arena, void *items, size_t *capacity, size_t count, size_t item_size)
 {
     if (count < *capacity) {
         return items;
     }
     size_t grown = *capacity > 0 ? arena_size_mul(*capacity, 2) : 8;
-    void *fresh = arena_push(arena, arena_size_mul(grown, item_size));
+    size_t size = *capacity * item_size;
+    size_t grown_size = arena_size_mul(grown, item_size);
+    if (items != nullptr && extend_in_place(arena, (unsigned char *)items + size, grown_size - size)) {
+        *capacity = grown;
+        return items;
+    }
+    void *fresh = arena_push(arena, grown_size);
     if (count > 0) {
         memcpy(fresh, items, count * item_size);
     }
@@ -149,9 +176,12 @@ static void clear_from(Block *block)
     }
 }
 
+// A burst would otherwise stay allocated for as long as the arena lives.
 void arena_reset(Arena *arena)
 {
-    clear_from(arena->first);
+    free_from(arena->first->next);
+    arena->first->next = nullptr;
+    arena->first->used = 0;
     arena->current = arena->first;
 }
 

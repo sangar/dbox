@@ -3,11 +3,13 @@
 #include "mc/text/path.h"
 #include "mc/platform/frame.h"
 #include "mc/platform/platform.h"
+#include "mc/platform/poll.h"
 #include "mc/platform/terminal.h"
 
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void files_round_trip_in_a_temp_dir(Test *test)
 {
@@ -96,6 +98,23 @@ static void file_read_all_sizes_its_buffer(Test *test)
     test_check(test, dir_remove_all(dir, &err) == ERR_OK, "remove the tree");
 }
 
+static void file_sync_makes_writes_durable(Test *test)
+{
+    Arena *a = test->arena;
+    Err err = { 0 };
+    String dir;
+    test_check(test, dir_create_temp(a, S("mc-test-"), &dir, &err) == ERR_OK, "create a temp dir");
+    String file = path_join(a, dir, S("durable"));
+    int fd = -1;
+    test_check(test, file_create(file, 0600, &fd, &err) == ERR_OK, "create a file");
+    test_check(test, file_write(fd, S("blåbær"), &err) == ERR_OK && file_sync(fd, &err) == ERR_OK, err.msg);
+    file_close(fd);
+    test_check(test, dir_sync(dir, &err) == ERR_OK, err.msg);
+    test_check(test, dir_sync(path_join(a, dir, S("missing")), &err) == ERR_NOT_FOUND, "a missing directory");
+    test_check(test, dir_sync(file, &err) != ERR_OK, "a file is not a directory");
+    test_check(test, dir_remove_all(dir, &err) == ERR_OK, "remove the tree");
+}
+
 static void file_create_unique_validates_its_pattern(Test *test)
 {
     Arena *a = test->arena;
@@ -119,6 +138,23 @@ static void file_create_unique_validates_its_pattern(Test *test)
                "file_info accepts the returned path");
     test_check(test, file_remove(path, &err) == ERR_OK, "file_remove accepts the returned path");
     test_check(test, dir_remove_all(dir, &err) == ERR_OK, "remove the tree");
+}
+
+// A stream has no size to read by, as standard input from a pipe has none.
+static void file_read_to_end_reads_a_stream(Test *test)
+{
+    Arena *a = test->arena;
+    Err err = { 0 };
+    int fds[2];
+    test_check(test, net_pair(fds, &err) == ERR_OK, "a socket pair");
+    String text = str_repeat(a, S("æøå\n"), 1000);
+    test_check(test, file_write(fds[0], text, &err) == ERR_OK, "write more than the first buffer holds");
+    file_close(fds[0]);
+    String read;
+    test_check(test, file_read_to_end(a, fds[1], &read, &err) == ERR_OK && str_equal(read, text),
+               "everything up to the end comes back");
+    test_check(test, terminal_columns(fds[1]) == 80, "a socket is no terminal, so 80 columns");
+    file_close(fds[1]);
 }
 
 static void dir_create_needs_a_directory(Test *test)
@@ -239,6 +275,24 @@ static void processes_stream_more_than_a_pipe_holds(Test *test)
     test_check(test, signal(SIGPIPE, inherited) == SIG_DFL, "the process keeps its SIGPIPE handling");
 }
 
+static void processes_time_out_with_their_children(Test *test)
+{
+    Arena *a = test->arena;
+    Err err = { 0 };
+    ProcessResult result;
+    const char *const quick[] = { "sh", "-c", "echo done" };
+    test_check(test, process_run_timeout(a, strlist_of(a, countof(quick), quick), S(""), 5000, &result, &err) == ERR_OK,
+               "a child that finishes in time runs");
+    test_check_str(test, result.stdout_text, S("done\n"), "its output comes back");
+
+    // The grandchild holds stdout open, so only killing the whole group ends the wait.
+    const char *const slow[] = { "sh", "-c", "sleep 30 | cat" };
+    int64_t started = clock_monotonic_ns();
+    test_check(test, process_run_timeout(a, strlist_of(a, countof(slow), slow), S(""), 200, &result, &err) == ERR_TIMEOUT,
+               "a child that runs too long is ERR_TIMEOUT");
+    test_check(test, clock_monotonic_ns() - started < 5000000000, "the timeout ends the wait");
+}
+
 static void environment_reads_and_writes(Test *test)
 {
     Arena *a = test->arena;
@@ -303,6 +357,17 @@ static void threads_share_state_under_a_mutex(Test *test)
     mutex_destroy(&shared.mutex);
 }
 
+static void random_bytes_differ_each_time(Test *test)
+{
+    uint8_t first[1000] = { 0 };
+    uint8_t second[1000] = { 0 };
+    Err err = { 0 };
+    test_check(test, random_bytes(first, sizeof first, &err) == ERR_OK, err.msg);
+    test_check(test, random_bytes(second, sizeof second, &err) == ERR_OK, err.msg);
+    test_check(test, memcmp(first, second, sizeof first) != 0, "two fills differ");
+    test_check(test, memcmp(first + 900, second + 900, 100) != 0, "past 256 bytes too");
+}
+
 static void clock_moves_forward(Test *test)
 {
     int64_t before = clock_monotonic_ns();
@@ -318,6 +383,40 @@ static void network_rejects_a_bad_address(Test *test)
     test_check(test, net_listen(S("no-port"), &fd, &err) == ERR_INVALID_ARGUMENT, "listen wants host:port");
     test_check(test, net_connect(S("127.0.0.1"), S("1"), 1000, &fd, &err) == ERR_NETWORK,
                "connecting to a closed port is ERR_NETWORK");
+}
+
+static bool connects(Test *test, String host, String port)
+{
+    int fd = -1;
+    bool connected = net_connect(host, port, 1000, &fd, nullptr) == ERR_OK;
+    if (connected) {
+        net_close(fd);
+    }
+    return connected;
+}
+
+// network_listens_on_ipv4_and_ipv6_with_no_host checks IPv6 only where the
+// system has it, as some containers do not.
+static void network_listens_on_ipv4_and_ipv6_with_no_host(Test *test)
+{
+    int listener = -1;
+    int probe = -1;
+    String address = { 0 };
+    size_t colon = 0;
+    Err err = { 0 };
+    test_check(test, net_listen(S(":0"), &listener, &err) == ERR_OK, "listen with no host");
+    if (listener < 0) {
+        return;
+    }
+    test_check(test, net_local_address(test->arena, listener, &address, &err) == ERR_OK, "its address");
+    String port = str_find_last_char(address, ':', &colon) ? str_slice(address, colon + 1, address.len) : S("");
+    test_check(test, connects(test, S("127.0.0.1"), port), "an IPv4 client connects");
+    bool has_ipv6 = net_listen(S("::1:0"), &probe, nullptr) == ERR_OK;
+    if (has_ipv6) {
+        net_close(probe);
+        test_check(test, connects(test, S("::1"), port), "an IPv6 client connects");
+    }
+    net_close(listener);
 }
 
 static const DirEntry *find_entry(const DirEntryList *entries, String name)
@@ -444,6 +543,13 @@ static void unix_sockets_carry_bytes(Test *test)
     size_t got;
     test_check(test, net_receive(server, buffer, sizeof buffer, &got, &err) == ERR_OK, "receive");
     test_check_str(test, (String){ buffer, got }, S("ping"), "the bytes arrive");
+    net_shutdown_write(client);
+    test_check(test, net_receive(server, buffer, sizeof buffer, &got, &err) == ERR_OK && got == 0,
+               "shutting down writing ends what the peer reads");
+    test_check(test, net_send(server, S("pong"), &err) == ERR_OK &&
+                         net_receive(client, buffer, sizeof buffer, &got, &err) == ERR_OK &&
+                         str_equal((String){ buffer, got }, S("pong")),
+               "and still receives");
 
     Receiver receiver = { .fd = server, .got = 99 };
     Thread thread;
@@ -464,6 +570,139 @@ static void unix_sockets_carry_bytes(Test *test)
     test_check(test, net_connect_unix(path, &client, &err) == ERR_NETWORK, "nothing listens any more");
     test_check(test, process_user_id() >= 0, "a user id");
     test_check(test, dir_remove_all(dir, &err) == ERR_OK, "clean up");
+}
+
+static void socket_pairs_carry_bytes_without_waiting(Test *test)
+{
+    Err err = { 0 };
+    int fds[2];
+    test_check(test, net_pair(fds, &err) == ERR_OK, "create a pair");
+    char buffer[16];
+    size_t got = 99;
+    test_check(test, net_receive_nowait(fds[1], buffer, sizeof buffer, &got, &err) == ERR_OK && got == 0,
+               "nothing has arrived");
+    test_check(test, net_send(fds[0], S("blåbærsyltetøy"), &err) == ERR_OK, "send");
+    char text[32];
+    size_t len = 0;
+    while (len < sizeof text && net_receive_nowait(fds[1], text + len, sizeof text - len, &got, &err) == ERR_OK &&
+           got > 0) {
+        len += got;
+    }
+    test_check_str(test, (String){ text, len }, S("blåbærsyltetøy"), "the bytes arrive");
+    net_close(fds[0]);
+    test_check(test, net_receive_nowait(fds[1], buffer, sizeof buffer, &got, &err) == ERR_OK && got == 0,
+               "a closed peer reads as nothing");
+    test_check(test, net_send(fds[1], S("data"), nullptr) == ERR_NETWORK, "sending to a closed peer fails");
+    net_close(fds[1]);
+}
+
+static void sockets_move_bytes_without_waiting(Test *test)
+{
+    Err err = { 0 };
+    int listener;
+    test_check(test, net_listen(S("127.0.0.1:0"), &listener, &err) == ERR_OK, "listen");
+    test_check(test, net_set_nonblocking(listener, &err) == ERR_OK, "make the listener non-blocking");
+    int server = -1;
+    test_check(test, !net_try_accept(listener, &server), "nobody is waiting");
+    String address = S("");
+    size_t colon = 0;
+    test_check(test, net_local_address(test->arena, listener, &address, &err) == ERR_OK &&
+                         str_find_last_char(address, ':', &colon),
+               "ask where it listens");
+    int client = -1;
+    test_check(test, net_connect(S("127.0.0.1"), str_slice(address, colon + 1, address.len), 1000, &client, &err) == ERR_OK,
+               "connect");
+    bool accepted = false;
+    for (int i = 0; i < 100 && !accepted; i++) {
+        accepted = net_try_accept(listener, &server);
+        clock_sleep_ms(accepted ? 0 : 10);
+    }
+    test_check(test, accepted, "accept the waiting connection");
+
+    char buffer[32];
+    size_t got = 99;
+    test_check(test, net_try_receive(server, buffer, sizeof buffer, &got) == NET_WOULD_BLOCK && got == 0,
+               "nothing has arrived");
+    size_t sent = 0;
+    test_check(test, net_try_send(client, S("blåbær"), &sent) == NET_DONE && sent == S("blåbær").len, "send");
+    size_t len = 0;
+    for (int i = 0; i < 100 && len < sent; i++) {
+        if (net_try_receive(server, buffer + len, sizeof buffer - len, &got) == NET_DONE) {
+            len += got;
+        } else {
+            clock_sleep_ms(10);
+        }
+    }
+    test_check_str(test, (String){ buffer, len }, S("blåbær"), "the bytes arrive");
+    net_close(client);
+    NetResult result = NET_WOULD_BLOCK;
+    for (int i = 0; i < 100 && result == NET_WOULD_BLOCK; i++) {
+        result = net_try_receive(server, buffer, sizeof buffer, &got);
+        clock_sleep_ms(result == NET_WOULD_BLOCK ? 10 : 0);
+    }
+    test_check(test, result == NET_CLOSED, "a closed peer reads as closed");
+    NetResult send_result = NET_DONE;
+    // The first send after the close succeeds; the peer's reset fails a later one.
+    for (int i = 0; i < 100 && send_result == NET_DONE; i++) {
+        send_result = net_try_send(server, S("data"), &sent);
+        clock_sleep_ms(send_result == NET_DONE ? 10 : 0);
+    }
+    test_check(test, send_result == NET_CLOSED, "sending to a closed peer fails without SIGPIPE");
+    net_close(server);
+    net_close(listener);
+}
+
+static void poller_reports_ready_sockets(Test *test)
+{
+    Err err = { 0 };
+    Poller *poller = nullptr;
+    test_check(test, poller_create(&poller, &err) == ERR_OK, "create a poller");
+    int fds[2];
+    test_check(test, net_pair(fds, &err) == ERR_OK, "create a pair");
+    int reader_data = 0;
+    int writer_data = 0;
+    void *ready[4];
+    test_check(test, poller_watch(poller, fds[1], POLL_READ, &reader_data, &err) == ERR_OK, "watch for reading");
+    test_check(test, poller_wait(poller, ready, countof(ready), 0) == 0, "nothing to read yet");
+    test_check(test, net_send(fds[0], S("æøå"), &err) == ERR_OK, "send");
+    test_check(test, poller_wait(poller, ready, countof(ready), 1000) == 1 && ready[0] == &reader_data,
+               "the reader is ready");
+    test_check(test, poller_wait(poller, ready, countof(ready), 0) == 1, "and stays ready until read");
+    test_check(test, poller_watch(poller, fds[1], POLL_NONE, &reader_data, &err) == ERR_OK, "stop watching");
+    test_check(test, poller_wait(poller, ready, countof(ready), 50) == 0, "unwatched data is not reported");
+    test_check(test, poller_watch(poller, fds[0], POLL_WRITE, &writer_data, &err) == ERR_OK, "watch for writing");
+    test_check(test, poller_wait(poller, ready, countof(ready), 1000) == 1 && ready[0] == &writer_data,
+               "the writer is ready");
+    net_close(fds[0]);
+    net_close(fds[1]);
+    poller_destroy(poller);
+}
+
+static void *wake_poller_later(void *argument)
+{
+    clock_sleep_ms(50);
+    poller_wake(argument);
+    return nullptr;
+}
+
+static void poller_wakes_from_another_thread(Test *test)
+{
+    Err err = { 0 };
+    Poller *poller = nullptr;
+    test_check(test, poller_create(&poller, &err) == ERR_OK, "create a poller");
+    void *ready[4];
+    poller_wake(poller);
+    test_check(test, poller_wait(poller, ready, countof(ready), 1000) == 1 && ready[0] == nullptr,
+               "a wake before the wait is kept");
+    test_check(test, poller_wait(poller, ready, countof(ready), 0) == 0, "and taken once");
+    Thread thread;
+    test_check(test, thread_start(&thread, wake_poller_later, poller, &err) == ERR_OK, "start a waker");
+    int64_t start = clock_monotonic_ns();
+    size_t count = poller_wait(poller, ready, countof(ready), 5000);
+    int64_t elapsed_ms = (clock_monotonic_ns() - start) / 1000000;
+    test_check(test, count == 1 && ready[0] == nullptr && elapsed_ms < 4000, "another thread wakes the wait");
+    thread_join(&thread);
+    poller_destroy(poller);
 }
 
 static void network_reports_the_port_it_chose(Test *test)
@@ -645,6 +884,31 @@ void signal_watch_round_trip(void)
     }
 }
 
+// children_round_trip blocks the signals, as a program that watches them
+// does, and runs children that interrupt themselves. It aborts once the
+// interrupt ended both: a child that inherited the blocked signals would
+// exit 0.
+void children_round_trip(void)
+{
+    signals_block();
+    Arena *a = arena_create(0);
+    const char *const interrupted[] = { "sh", "-c", "kill -INT $$; exit 0" };
+    StringList argv = strlist_of(a, countof(interrupted), interrupted);
+    ProcessResult result;
+    bool captured_ended = process_run(a, argv, S(""), &result, nullptr) == ERR_OK && result.signal == SIGINT;
+    int exit_code = 0;
+    bool interactive_ended =
+        process_run_interactive(a, argv, &exit_code, nullptr) == ERR_OK && exit_code == 128 + SIGINT;
+    if (captured_ended && interactive_ended) {
+        abort();
+    }
+}
+
+static void children_start_with_default_signals(Test *test)
+{
+    test_check_aborts(test, "children_round_trip", "a child ends on an interrupt its parent blocks");
+}
+
 static void signal_watch_calls_back(Test *test)
 {
     test_check_aborts(test, "signal_watch_round_trip", "a stop signal reaches the callback, and the watch stops");
@@ -724,21 +988,30 @@ static void frames_cross_a_socket_whole(Test *test)
 const TestCase PLATFORM_TESTS[] = {
     { "files_round_trip_in_a_temp_dir", files_round_trip_in_a_temp_dir },
     { "file_read_all_sizes_its_buffer", file_read_all_sizes_its_buffer },
+    { "file_sync_makes_writes_durable", file_sync_makes_writes_durable },
     { "file_create_unique_validates_its_pattern", file_create_unique_validates_its_pattern },
+    { "file_read_to_end_reads_a_stream", file_read_to_end_reads_a_stream },
     { "dir_create_needs_a_directory", dir_create_needs_a_directory },
     { "paths_resolve_against_the_system", paths_resolve_against_the_system },
     { "look_path_survives_long_entries", look_path_survives_long_entries },
     { "processes_capture_output_and_status", processes_capture_output_and_status },
     { "processes_stream_more_than_a_pipe_holds", processes_stream_more_than_a_pipe_holds },
+    { "processes_time_out_with_their_children", processes_time_out_with_their_children },
     { "environment_reads_and_writes", environment_reads_and_writes },
     { "processes_take_signals_and_limits", processes_take_signals_and_limits },
     { "threads_share_state_under_a_mutex", threads_share_state_under_a_mutex },
     { "clock_moves_forward", clock_moves_forward },
+    { "random_bytes_differ_each_time", random_bytes_differ_each_time },
     { "network_rejects_a_bad_address", network_rejects_a_bad_address },
     { "dir_read_describes_each_entry", dir_read_describes_each_entry },
     { "files_map_and_append", files_map_and_append },
     { "unix_sockets_carry_bytes", unix_sockets_carry_bytes },
+    { "socket_pairs_carry_bytes_without_waiting", socket_pairs_carry_bytes_without_waiting },
     { "network_reports_the_port_it_chose", network_reports_the_port_it_chose },
+    { "sockets_move_bytes_without_waiting", sockets_move_bytes_without_waiting },
+    { "network_listens_on_ipv4_and_ipv6_with_no_host", network_listens_on_ipv4_and_ipv6_with_no_host },
+    { "poller_reports_ready_sockets", poller_reports_ready_sockets },
+    { "poller_wakes_from_another_thread", poller_wakes_from_another_thread },
     { "file_lock_keeps_out_a_second_holder", file_lock_keeps_out_a_second_holder },
     { "detached_processes_lead_a_session_and_write_to_a_file", detached_processes_lead_a_session_and_write_to_a_file },
     { "detached_processes_leave_signals_to_the_program", detached_processes_leave_signals_to_the_program },
@@ -746,6 +1019,7 @@ const TestCase PLATFORM_TESTS[] = {
     { "file_find_upward_climbs", file_find_upward_climbs },
     { "dir_runtime_is_private", dir_runtime_is_private },
     { "signal_watch_calls_back", signal_watch_calls_back },
+    { "children_start_with_default_signals", children_start_with_default_signals },
     { "frames_cross_a_socket_whole", frames_cross_a_socket_whole },
     { nullptr, nullptr },
 };

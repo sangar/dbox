@@ -4,34 +4,32 @@ libmc is the foundation library for C projects under the `modern-c` contract. A 
 
 It is not a port of Foundation's API, not a shared library with a stable ABI, and not for Windows until `src/platform/` has a Windows implementation. This file covers one repository, [sangar/libmc](https://github.com/sangar/libmc).
 
-Checked on 2026-10-24
+Checked on 2026-10-26
 
 ## Focus
 
-libmc is in use by projects under the `modern-c` contract, such as dbox and bprocs, and is where they get shared code. JSON, YAML, CSV, Markdown, XML and the HTTP client are in. What moves it forward now are the pieces those projects reach for next, in this order:
+libmc is in use by projects under the `modern-c` contract, such as dbox and bprocs, and is where they get shared code. JSON, YAML, CSV, Markdown, XML, the HTTP and S3 clients, mail and FTP are in. What moves it forward now is the piece those projects reach for next:
 
-1. **Mail and file transfer:** sending mail over SMTP and moving files over FTP, both through the curl libmc already pins. See [Mail and file transfer](#mail-and-file-transfer).
-2. **SSH and SFTP:** waits for libssh2 to build with mbedTLS 4. See [SSH and SFTP](#ssh-and-sftp).
+1. **SSH and SFTP:** waits for libssh2 to build with mbedTLS 4. See [SSH and SFTP](#ssh-and-sftp).
+2. **HTTP server:** for web apps written in C, served directly. See [HTTP server](#http-server).
 
-After them come the ideas [worth doing soon](#worth-doing-soon). Small items, such as the unmerged commit on `terminal-width`, wait unless they block one of these.
+While SSH is blocked, the HTTP server is the next piece. Small items wait unless they block one of these.
 
 ## Principles
 
 - **Nothing to install.** `deps.lock` pins every dependency by the hash of its content and the build fetches it from this repository's `deps-<name>-<version>` releases. A fresh clone needs a C compiler, `curl` and `tar`; see `modern-c` rule 10.
 - **One branch per capability.** HTTP, Markdown, XML, SMTP, FTP and SSH each land through their own branch and pull request. Everything HTTP, HTTP/2 and response compression included, belongs to `http-client`.
-- **curl before another library.** A protocol curl speaks is turned on in [`tools/curl-config.sh`](tools/curl-config.sh), not added as a new dependency. curl already carries the code for SMTP, FTP, WebSocket and URL parsing; it is compiled out today.
+- **curl before another library.** A protocol curl speaks is turned on in [`tools/curl-config.sh`](tools/curl-config.sh), not added as a new dependency. curl already carries the code for WebSocket, compiled out today, and for URL parsing.
 - **Safe defaults for input from the network.** HTTPS only unless a test asks for plain HTTP, allowed hosts checked on every redirect, and limits on time and size. Markdown from users renders without raw HTML.
 - **A new dependency needs an approved decision report.** Each one is chosen with a `c-libraries` report, as `modern-c` rule 11 requires.
 
 ## Where we are
 
-`master` is at `37d58b8` from 24 October 2026, with the HTTP client (PR #19), Mozilla's trusted roots for systems without their own (PR #20), Markdown (PR #21) and XML (PR #22) merged. Sending mail is on `smtp`. The branches already merged or superseded were deleted on GitHub on 24 October 2026.
+`master` is at `bfc56d7` from 25 October 2026, with the HTTP client (PR #19), Mozilla's trusted roots for systems without their own (PR #20), Markdown (PR #21), XML (PR #22), text measured in terminal columns (PR #23), sending mail (PR #24), an S3 client (PR #25), moving files over FTPS (PR #26), socket pairs (PR #27) and `assert` kept in release builds (PR #28) merged. PR #25 also streams HTTP bodies through files, with cancellation and per-request timeouts. The branches already merged or superseded were deleted on GitHub on 24 October 2026.
 
 | Branch | State | Last commit | Tests |
 |---|---|---|---|
-| `master` | Merged | `37d58b8`, 24 Oct 2026, PR #22 | GitHub CI passes on macOS, Linux x86_64 and aarch64 with clang 18 and gcc 14, and the cross builds |
-| `smtp` | Not merged | On top of `37d58b8` | `./nob test` passes on macOS |
-| `terminal-width` | One commit not merged, local only | `b30d282`, "Measure the terminal width of UTF-8 text" | Not run |
+| `master` | Merged | `bfc56d7`, 25 Oct 2026, PR #28 | GitHub CI passes on macOS, Linux x86_64 and aarch64 with clang 18 and gcc 14, and the cross builds |
 
 On 24 October 2026 dependencies stopped being committed. curl and mbedTLS would have added 13.7 MB of source, 5.5 MB in git, to every clone and to every project that pins libmc. `deps.lock` now pins each dependency by content hash, the build fetches it, and cyaml, yyjson, utf8proc, mbedTLS, curl, nghttp2 and zlib are published as `deps-*` releases.
 
@@ -59,16 +57,28 @@ Done. Merged on 24 October 2026 through PRs #21 and #22: the two formats project
 
 ## Mail and file transfer
 
-Now, each on its own branch. Both are in the curl libmc already pins and are turned off in `tools/curl-config.sh`; each turns its protocol on and regenerates `src/net/curl/<os>/curl_config.h`.
+Done. Merged on 24 October 2026 through PRs #24 and #26. Both use the curl libmc already pins, each with its protocol turned on in `tools/curl-config.sh`.
 
-- [x] **Send mail with attachments.** Done on 24 October 2026 on `smtp`. Go's `net/smtp` is frozen and takes the message as raw bytes, leaving MIME to the caller; Python's `email` package and Node's nodemailer build it from fields, and so does `smtp_send`: from, to, cc and bcc, a UTF-8 subject and names as RFC 2047 words, the text with an HTML alternative, and attachments with UTF-8 file names as RFC 2231 has them. It sends over SMTPS or STARTTLS only, and refuses a server that offers no STARTTLS before the password or the mail leaves. SMTP and MIME are on in `tools/curl-config.sh`. Tested against a server in the tests, not yet against a real provider.
-- [ ] **Upload and download files over FTP.** `mc/net/ftp.h`, on a branch `ftp`: FTPS by default, and plain FTP only when the caller asks, as `allow_plain_http` does for HTTP. It turns on FTP.
+- [x] **Send mail with attachments.** Merged on 24 October 2026 through PR #24. Go's `net/smtp` is frozen and takes the message as raw bytes, leaving MIME to the caller; Python's `email` package and Node's nodemailer build it from fields, and so does `smtp_send`: from, to, cc and bcc, a UTF-8 subject and names as RFC 2047 words, the text with an HTML alternative, and attachments with UTF-8 file names as RFC 2231 has them. It sends over SMTPS or STARTTLS only, and refuses a server that offers no STARTTLS before the password or the mail leaves. SMTP and MIME are on in `tools/curl-config.sh`. Tested against a server in the tests, not yet against a real provider.
+- [x] **Upload and download files over FTP.** Merged on 24 October 2026 through PR #26. Python's `ftplib` and Go's `jlaffaye/ftp` keep a connection open across calls, and so does an `FtpClient` in `mc/net/ftp.h`: it uploads, downloads and lists, streaming between the server and local files, and takes a `Cancel` as the S3 client does. It requires TLS, through AUTH TLS for `ftp://` or from the start for `ftps://`, for the data connections too; plain FTP only when the caller sets `allow_plain_ftp`. FTP is on in `tools/curl-config.sh`. Tested against a server in the tests, and once against vsftpd 3.0.5 in `ubuntu:24.04` in both modes, with its default of requiring TLS session reuse on data connections.
 
 ## SSH and SFTP
 
-After mail and file transfer, and blocked. curl speaks SSH and SFTP through libssh2 (BSD), which needs a crypto library underneath. [libssh2 1.11.1 does not build with mbedTLS 4.x](https://github.com/libssh2/libssh2/pull/2284), and the pull request that moves its mbedTLS backend to the PSA API is open and, by its author on 5 October 2026, needs a heavy rework or a fresh start.
+Now, and blocked. curl speaks SSH and SFTP through libssh2 (BSD), which needs a crypto library underneath. [libssh2 1.11.1 does not build with mbedTLS 4.x](https://github.com/libssh2/libssh2/pull/2284), and the pull request that moves its mbedTLS backend to the PSA API is open and, by its author on 5 October 2026, needs a heavy rework or a fresh start.
 
 - [ ] **Run commands and move files over SSH.** `mc/net/ssh.h` on a branch `ssh`, once a libssh2 release builds with mbedTLS 4. Check each libssh2 release until then.
+
+## HTTP server
+
+Now. Web apps in C, such as those the `c-web-apps` skill builds, should be served by their own binary, with what [Thruster](https://github.com/basecamp/thruster) puts in front of Rails: HTTP/2, Let's Encrypt, compression and caching. It is built and tested in the httpbed testbed first, where a conformance suite and a differential fuzzer hold it to libmicrohttpd and llhttp, and moves here one module at a time.
+
+- [ ] **Wait on many sockets.** `mc/platform/poll.h` on kqueue and epoll, and `net_try_accept`, `net_try_receive` and `net_try_send` in `platform.h`, in PR #32. A decision report, our own poller against libuv, approved on 26 October 2026: libuv's completion model fits mbedTLS and nghttp2 less well than readiness does, and Windows is not a target.
+- [ ] **Serve HTTP/1.1.** `mc/net/http_server.h`: event loops own the connections, worker threads run the handler. A decision report, llhttp against picohttpparser, approved on 26 October 2026: llhttp frames bodies itself, where request smuggling happens. llhttp is pinned as `deps-llhttp-9.4.3-single-spaces`, with the testbed's patch that refuses extra spaces in the request line. On a branch `http-server`, after `poll`.
+- [ ] **Serve files,** with ranges, ETag and 304, and `sendfile` over plain HTTP.
+- [ ] **TLS and HTTP/2,** on the mbedTLS and nghttp2 libmc already pins.
+- [ ] **Let's Encrypt,** an ACME client on the HTTP client, mbedTLS and JSON.
+- [ ] **Compression,** gzip with Thruster's BREACH mitigations, and precompressed files.
+- [ ] **A response cache,** for `Cache-Control: public` responses, when a project needs one.
 
 ## Feature ideas
 

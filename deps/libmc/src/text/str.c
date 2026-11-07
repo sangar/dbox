@@ -158,7 +158,8 @@ String str_slice(String s, size_t start, size_t end)
 {
     end = min_size(end, s.len);
     start = min_size(start, end);
-    return (String){ .data = s.data + start, .len = end - start };
+    // The empty String { 0 } has no data to offset.
+    return (String){ .data = start == 0 ? s.data : s.data + start, .len = end - start };
 }
 
 String str_trim(String s)
@@ -394,6 +395,37 @@ String str_percent_encode(Arena *arena, String s, bool keep_slash)
         str_builder_append_char(&builder, hex[byte & 15]);
     }
     return str_builder_finish(&builder);
+}
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+bool str_percent_decode(Arena *arena, String s, String *decoded)
+{
+    StringBuilder builder = str_builder_create(arena, s.len);
+    for (size_t i = 0; i < s.len; i++) {
+        if (s.data[i] != '%') {
+            str_builder_append_char(&builder, s.data[i]);
+            continue;
+        }
+        int high = i + 2 < s.len ? hex_value(s.data[i + 1]) : -1;
+        int low = high >= 0 ? hex_value(s.data[i + 2]) : -1;
+        if (low < 0) {
+            return false;
+        }
+        str_builder_append_char(&builder, (char)(high << 4 | low));
+        i += 2;
+    }
+    *decoded = str_builder_finish(&builder);
+    return true;
 }
 
 StringList str_split(Arena *arena, String s, char separator)

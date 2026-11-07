@@ -7,7 +7,8 @@ A small foundation library for C: arenas, length-carrying strings, one error mod
 - **Arena allocation.** Allocations are freed together, and scratch work is undone with mark and release.
 - **Strings as views.** A `String` is a pointer and a length, and every function that allocates one takes an `Arena`.
 - **One error model.** Fallible functions return an `Error` code and can fill in an optional message.
-- **Nothing to install** beyond libc, libm and pthreads, and no global state for the caller to manage. Its libraries, [yyjson](https://github.com/ibireme/yyjson) for JSON, [cyaml](https://github.com/andrewmd5/cyaml) for YAML, [utf8proc](https://github.com/JuliaStrings/utf8proc) for Unicode, [md4c](https://github.com/mity/md4c) for Markdown, [Expat](https://libexpat.github.io) for XML and [curl](https://curl.se) on [mbedTLS](https://github.com/Mbed-TLS/mbedtls), [nghttp2](https://nghttp2.org) and [zlib](https://zlib.net) for HTTP and mail, with [Mozilla's trusted roots](https://curl.se/docs/caextract.html) for systems that have none, are pinned in `deps.lock`, fetched by the build and built into `libmc.a`.
+- **Nothing to install** beyond libc, libm and pthreads, and no global state for the caller to manage. Its libraries, [yyjson](https://github.com/ibireme/yyjson) for JSON, [cyaml](https://github.com/andrewmd5/cyaml) for YAML, [utf8proc](https://github.com/JuliaStrings/utf8proc) for Unicode, [md4c](https://github.com/mity/md4c) for Markdown, [Expat](https://libexpat.github.io) for XML, [llhttp](https://github.com/nodejs/llhttp) for the HTTP server and [curl](https://curl.se) on [mbedTLS](https://github.com/Mbed-TLS/mbedtls), [nghttp2](https://nghttp2.org) and [zlib](https://zlib.net) for HTTP, mail and FTP, with [Mozilla's trusted roots](https://curl.se/docs/caextract.html) for systems that have none, are pinned in `deps.lock`, fetched by the build and built into `libmc.a`.
+- **Terminal output** with colours that fall back to what the terminal shows, boxes and joins as in Lip Gloss, spinners, springs, progress bars and lists redrawn in place, and a full-screen cell grid with graphs.
 - **A platform layer** for the clock, threads, files, directories, processes, environment, signals, sockets, file watching, login services, the terminal, pseudo-terminals and system statistics.
 - **JSON and YAML** parsing into one document tree, and JSON encoding back, with numbers read the same whatever locale the program set.
 
@@ -40,14 +41,16 @@ Then:
 | `./nob` | Debug library with AddressSanitizer and UBSan: `out/debug/libmc.a` |
 | `./nob release` | Optimised library: `out/release/libmc.a` |
 | `./nob test` | Builds and runs the tests under the sanitizers |
-| `./nob check` | Runs the `modern-c` contract checker, then the tests (see below) |
+| `./nob check` | Runs the `modern-c` contract checker, then the tests, then the tests again under ThreadSanitizer (see below) |
+| `./nob tsan` | Library under ThreadSanitizer, for a consumer's threaded tests: `out/tsan/libmc.a` |
+| `./nob fuzz` | Library instrumented for libFuzzer with AddressSanitizer and UBSan, for a consumer's fuzzer; `$CC` must be a clang that has libFuzzer: `out/fuzz/libmc.a` |
 | `./nob cross` | Release library for every platform: `out/<platform>/release/libmc.a` |
 | `./nob clean` | Removes `out/` |
 | `./nob hash <dir>` | Prints the `deps.lock` hash of a directory |
 
 The dependencies are not committed. Every build but `clean` checks `deps/<name>` against the hash in `deps.lock` and, when it is missing or differs, fetches it with `curl` from this repository's release `deps-<name>-<version>`, so the first build needs the network. To update one, put the new source in `deps/<name>`, trimmed to what the build compiles plus its license, update its line with the version, the new release URL and `./nob hash deps/<name>`, and publish it with `tools/publish-dep.sh`. `tools/cacert.sh` writes a newer extract of Mozilla's roots into `deps/cacert`.
 
-Host builds use `$CC`, or `cc` when it is unset: `CC=gcc-14 ./nob test`. Each build records the compiler version and flags in `out/<build>/fingerprint` and recompiles everything when they change.
+Host builds use `$CC`, or `cc` when it is unset: `CC=gcc-14 ./nob test`. Each build records the compiler version, every compile command, `deps.lock` and the dependencies' configuration under `src/` in `out/<build>/fingerprint`, and recompiles everything when they change. Otherwise each dependency is compiled once, and a libmc source is recompiled when it or one of libmc's headers changes. The tests are one translation unit: `tests/main.c` includes every test file and is compiled on every `./nob test`.
 
 CI runs `./nob test` and `./nob release` with clang 18 and gcc 14 on Linux x86_64 and aarch64 and with clang on macOS aarch64, and `./nob cross` with the pinned zig; see `.github/workflows/ci.yml`.
 
@@ -55,7 +58,7 @@ CI runs `./nob test` and `./nob release` with clang 18 and gcc 14 on Linux x86_6
 
 ## Usage
 
-Link `libmc.a` with `-lpthread -lm`, and on macOS `-framework CoreServices` for file watching and `-framework SystemConfiguration -framework CoreFoundation` for HTTP and mail, and add `include/` to the include path. To build it with your project, pin this repository as a dependency and run `./nob release` in it, which fetches libmc's own dependencies. Headers are included by area and module:
+Link `libmc.a` with `-lpthread -lm`, and on macOS `-framework CoreServices` for file watching and `-framework SystemConfiguration -framework CoreFoundation` for HTTP, mail and FTP, and add `include/` to the include path. To build it with your project, pin this repository as a dependency and run `./nob release` in it, which fetches libmc's own dependencies. Headers are included by area and module:
 
 ```c
 #include <stdio.h>
@@ -109,6 +112,7 @@ The library exports plain C functions and fixed-layout structs, so any language 
 - **Strings.** A `String` is a view and owns nothing. Functions that take an `Arena` return NUL-terminated strings allocated in it.
 - **Memory.** Arena memory comes back zeroed. Use `arena_mark` and `arena_release` for temporary allocations. Only `src/core/arena.c` calls `malloc`, apart from cyaml, whose allocations stay inside `src/encoding/yaml.c`. `src/text/unicode.c` calls only the utf8proc functions that write into a buffer it passes, never the ones that allocate. yyjson allocates from a scratch arena that `json_parse` frees before it returns.
 - **Errors.** A function that can fail for reasons outside the caller's control, such as I/O, the network or a child process, returns `Error` and is marked `[[nodiscard]]`. Results come back through out-parameters. The last parameter is an optional `Err *` that receives a human-readable message; pass `nullptr` to ignore it. Parsers and lookups, for which "no" is an ordinary answer, return `bool` instead. Running out of memory, an allocation size that overflows, or a failed mutex or condition variable call aborts.
+- **Assertions stay on.** A broken invariant, such as an index out of range, is an `assert`, and `./nob release` keeps it: the build never defines `NDEBUG`.
 - **Ownership is in the signature.** A function that allocates takes an `Arena *`. A function without one returns a view or nothing.
 - **No global state.** The exceptions are `env_set`, which changes the process environment, and the C locale that `float_parse` and `float_format` create once and share. `process_run` blocks `SIGPIPE` only in the calling thread while it feeds the child, and discards any `SIGPIPE` that leaves pending.
 - **Bundled libraries.** A dependency is bundled when it serves a capability that libmc exposes through its own types, and never on its own terms. yyjson and cyaml both feed one `Node` tree, so JSON and YAML stay in one library and a program pays for only the parser it calls: `libmc.a` is a static archive, each parser is its own translation unit, and the linker pulls in only what is referenced. Splitting the library would buy nothing.
@@ -132,17 +136,21 @@ Headers live in `include/mc/<area>/` and their sources in `src/<area>/`.
 | | `mc/text/table.h` | Aligned columns like Go's tabwriter |
 | container | `mc/container/strmap.h` | String-keyed open-addressing hash map with removal |
 | | `mc/container/idtable.h` | Hash set of ids whose keys live elsewhere, four bytes a slot |
+| | `mc/container/pool.h` | Items of one size freed one at a time, named by handles that go stale when freed |
 | | `mc/container/hash.h` | FNV-1a hashing |
 | | `mc/container/sort.h` | Stable merge sort and top-k selection with a comparator context |
-| crypto | `mc/crypto/sha256.h` | SHA-256, HMAC-SHA256, hex encoding |
-| | `mc/crypto/sigv4.h` | AWS Signature Version 4 request signing |
-| platform | `mc/platform/platform.h` | Clock, locale-independent floats, threads, files and mappings, directories with metadata, advisory file locks, a search for a file up through parent directories, a private per-user runtime directory, processes (also detached into a session of their own), environment, signals and a thread that watches for them, TCP and Unix sockets |
+| crypto | `mc/crypto/sha256.h` | SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256, hex encoding |
+| | `mc/crypto/md5.h` | MD5, for checksums that protocols still name, such as S3's ETag |
+| | `mc/crypto/crc32.h` | CRC-32 (IEEE, as zlib's) and CRC-32C (Castagnoli) |
+| | `mc/crypto/sigv4.h` | AWS Signature Version 4 request signing, and the signing key it derives |
+| platform | `mc/platform/platform.h` | Clock, secure random bytes, locale-independent floats, threads, files and mappings, writes made durable with `F_FULLFSYNC` on macOS, reading a descriptor to its end, directories with metadata, advisory file locks, a search for a file up through parent directories, a private per-user runtime directory, processes (also detached into a session of their own), environment, signals and a thread that watches for them, TCP and Unix sockets, non-blocking accepts, sends and receives, and socket pairs for driving a server in-process |
 | | `mc/platform/frame.h` | Length-prefixed frames of a header and a body on a stream socket |
+| | `mc/platform/poll.h` | An event loop's wait on many sockets, on kqueue and epoll, with a wake from other threads; the `net_try_*` calls move bytes without waiting |
 | | `mc/platform/watch.h` | Recursive file watching on FSEvents and inotify, in settled batches of paths |
 | | `mc/platform/service.h` | Per-user login services: launchd agents and systemd user units |
-| | `mc/platform/terminal.h` | The controlling terminal in raw mode, its size, and waits that wake on input, resizes or another thread |
+| | `mc/platform/terminal.h` | The controlling terminal in raw mode, its size and the width of any terminal descriptor, and waits that wake on input, resizes or another thread |
 | | `mc/platform/pty.h` | Programs run on a pseudo-terminal of their own: output, typed input, resizing, signals to the whole process group |
-| | `mc/platform/sysinfo.h` | CPU ticks per core, memory, swap, network bytes, load and uptime, and the CPU time and memory of a process group |
+| | `mc/platform/sysinfo.h` | CPU ticks per core, memory, swap, network bytes, load and uptime, the CPU time and memory of a process group, and the busy share and rates between two samples |
 | concurrency | `mc/concurrency/cancel.h` | Cancellation token with waits and sleeps that wake on cancel |
 | | `mc/concurrency/debounce.h` | Per-key debouncing: a callback once a key has been quiet for a delay |
 | | `mc/concurrency/outbox.h` | Bytes waiting for a writer thread, with a limit that drops a peer that stopped reading |
@@ -152,15 +160,35 @@ Headers live in `include/mc/<area>/` and their sources in `src/<area>/`.
 | encoding | `mc/encoding/node.h` | Document tree of scalars, sequences and mappings shared by the parsers |
 | | `mc/encoding/json.h` | Strict JSON parsing with line and column errors, encoding and quoting, on yyjson |
 | | `mc/encoding/yaml.h` | YAML 1.2 parsing with core schema typing and shared aliases, on cyaml |
+| | `mc/encoding/base64.h` | RFC 4648 Base64, standard with padding or URL-safe without, decoding only the canonical encoding, or any text leniently as mail needs |
+| | `mc/encoding/gzip.h` | gzip compression with an optional header comment, and decompression bounded in size, on zlib |
 | | `mc/encoding/dotenv.h` | `.env` files into `NAME=value` entries, with quotes and comments and no expansion |
 | | `mc/encoding/markdown.h` | CommonMark with GitHub's tables, task lists, strikethrough and autolinks to HTML, on md4c; raw HTML and script links shown as text unless allowed |
-| | `mc/encoding/xml.h` | XML 1.0 as start tags, end tags and text, on Expat, with entity expansion bounded and external entities never loaded |
+| | `mc/encoding/xml.h` | XML 1.0 as start tags, end tags and text, on Expat, with entity expansion bounded and external entities never loaded; documents written with text and attributes escaped |
 | | `mc/encoding/csv.h` | RFC 4180 records read one at a time: quoted fields with line breaks and `""`, CRLF or LF, a byte order mark; fields are views into the text |
-| net | `mc/net/http.h` | HTTPS requests on libcurl: HTTP/2 where the server offers it, gzip and deflate decoded, allowed hosts checked on every redirect, limits on time and size, bodies streamed from and to files, cancellation, Mozilla's trusted roots where the system has none |
+| | `mc/encoding/mail.h` | Internet mail (RFC 5322 and MIME) read for showing, never failing on malformed mail: header fields unfolded, the subject and display names decoded from RFC 2047, address lists with groups, the date with obsolete zones, message ids, and the leaves of the MIME tree with base64 and quoted-printable decoded, RFC 2231 file names, text in UTF-8, ISO-8859-1, Windows-1252 or ISO-8859-15 converted to UTF-8, and the text and HTML bodies to show; nesting and part counts bounded |
+| net | `mc/net/http.h` | Header lookup ignoring case and HTTP dates, and HTTPS requests on libcurl: HTTP/2 where the server offers it, gzip and deflate decoded, allowed hosts checked on every redirect, limits on time and size, bodies streamed from and to files, cancellation, Mozilla's trusted roots where the system has none |
 | | `mc/net/smtp.h` | Mail over SMTPS or STARTTLS: from, to, cc and bcc, UTF-8 subject and names, text with an HTML alternative, attachments |
+| | `mc/net/http_server.h` | Query parameters and byte ranges read from a request, and an HTTP/1.1 server for web apps on llhttp: event loops own the connections, worker threads run the handler; requests refused unless unambiguous, limits on size, connections and time, pipelining, `100-continue`, a lingering close so that a client still sending reads its response, a graceful stop, and the handler run without a socket for tests, over TLS when given a `TlsServer`, HTTP/2 on nghttp2 when the TLS handshake chooses it, responses gzipped with random padding against BREACH, and bodies streamed each way through a handler that reads uploads as they arrive and writes responses in pieces, with flow control holding back a client faster than its handler |
+| | `mc/net/static_files.h` | A directory's files for a web app: paths kept under the root, types by extension, ETags and 304, gzipped copies, and a memory cache bounded in total and per file |
+| | `mc/net/tls.h` | TLS for servers on mbedTLS: TLS 1.2 and 1.3 with the protocols ALPN offers, h2 and http/1.1 unless told, the certificate swapped while serving for renewals, connections over blocking sockets for servers that read and write in turn, for STARTTLS and for clients that speak their own protocol, and self-signed certificates for development |
+| | `mc/net/acme.h` | Certificates from Let's Encrypt or another ACME CA: HTTP-01 answered on port 80, which otherwise redirects to https, or TLS-ALPN-01 on port 443; account and certificate kept in a storage directory shared by processes, and renewed in the background two thirds into the certificate's lifetime |
 | | `mc/net/s3.h` | S3 and the stores that speak its API: objects in memory or files, multipart uploads, metadata, paged listing, retries with backoff, credentials found as the AWS tools find them; thread-safe, with pooled connections |
+| | `mc/net/sigv4_verify.h` | AWS Signature Version 4 checked as an S3-compatible server does: the Authorization header or a presigned query, clock skew and expiry, the payload hash mode, and bodies read with the aws-chunked framing taken off and each chunk, the trailer or the whole body checked |
+| | `mc/net/ftp.h` | Upload, download and list files over FTPS, streaming to and from local files |
 | log | `mc/log/log.h` | Structured logging like Go's slog, as text or JSON lines |
 | | `mc/log/logfile.h` | Lines appended to a file after their time, rotated at a size limit |
+| term | `mc/term/color.h` | RGB, three-stop gradients, the nearest of the 256 or 16 xterm colours, `#rrggbb` and xterm numbers |
+| | `mc/term/style.h` | Colour depth from the terminal and `NO_COLOR`, `FORCE_COLOR`, `COLORTERM` and `TERM`; styled and gradient text that falls back to what the terminal shows |
+| | `mc/term/ansi.h` | Width, truncation and stripping of text with escape sequences in it |
+| | `mc/term/live.h` | A region redrawn in place below the prompt: only changed lines, cut to the width, one synchronized update a frame |
+| | `mc/term/layout.h` | Boxes with borders, padding, margins and alignment, and blocks joined side by side or above each other, as Lip Gloss does |
+| | `mc/term/spinner.h`, `spring.h`, `progress.h` | Spinners from cli-spinners, damped springs as in Harmonica, progress bars in eighths of a column |
+| | `mc/term/input.h` | Keys, mouse and bracketed paste decoded from a terminal's bytes |
+| | `mc/term/list.h` | A list to pick from, scrolled to keep the cursor in view |
+| | `mc/term/screen.h` | A full-screen grid of cells that writes only what changed, the way btop draws, and takes styled text too, wrapped as in a log view with the theme's 16 colours |
+| | `mc/term/draw.h`, `history.h` | Panels with titles, meters, braille graphs and sparklines of a history of samples |
+| | `mc/term/logbuf.h` | A program's terminal output as lines: colours kept, carriage returns rewriting the line, other control dropped |
 
 The header comments document each function's contract.
 

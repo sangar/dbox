@@ -14,6 +14,8 @@
 #include <locale.h>
 #include <math.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -26,6 +28,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -110,6 +113,20 @@ int64_t clock_wall_ns(void)
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     return (int64_t)now.tv_sec * NS_PER_SECOND + now.tv_nsec;
+}
+
+Error random_bytes(void *buffer, size_t len, Err *err)
+{
+    unsigned char *bytes = buffer;
+    // getentropy gives at most 256 bytes a call.
+    for (size_t done = 0; done < len;) {
+        size_t chunk = len - done < 256 ? len - done : 256;
+        if (getentropy(bytes + done, chunk) != 0) {
+            return err_set(err, ERR_PLATFORM, "getentropy: %s", strerror(errno));
+        }
+        done += chunk;
+    }
+    return ERR_OK;
 }
 
 void clock_sleep_ms(int64_t milliseconds)
@@ -603,6 +620,22 @@ Error file_truncate(int fd, int64_t size, Err *err)
     return ftruncate(fd, (off_t)size) != 0 ? posix_fail_errno(err, "truncate") : ERR_OK;
 }
 
+Error file_sync(int fd, Err *err)
+{
+#ifdef __APPLE__
+    // F_FULLFSYNC fails on file systems that lack it, where fsync is all there is.
+    if (fcntl(fd, F_FULLFSYNC) == 0) {
+        return ERR_OK;
+    }
+#endif
+    while (fsync(fd) != 0) {
+        if (errno != EINTR) {
+            return posix_fail_errno(err, "sync");
+        }
+    }
+    return ERR_OK;
+}
+
 Error file_rename(String from, String to, Err *err)
 {
     CPath cfrom;
@@ -640,16 +673,11 @@ Error file_set_mtime(String path, int64_t mtime_ns, Err *err)
     return utimensat(AT_FDCWD, cpath.text, times, 0) == 0 ? ERR_OK : posix_fail_errno(err, "set mtime %s", cpath.text);
 }
 
-Error file_read_all(Arena *arena, String path, String *contents, Err *err)
+Error file_read_to_end(Arena *arena, int fd, String *contents, Err *err)
 {
     *contents = S("");
-    int fd;
-    Error e = file_open_read(path, &fd, err);
-    if (e != ERR_OK) {
-        return e;
-    }
     FileInfo info;
-    e = file_info_fd(fd, &info, err);
+    Error e = file_info_fd(fd, &info, err);
     size_t capacity = e == ERR_OK && info.size > 0 ? (size_t)info.size + 1 : 4096;
     char *data = arena_push_aligned(arena, capacity, 1);
     size_t len = 0;
@@ -675,12 +703,27 @@ Error file_read_all(Arena *arena, String path, String *contents, Err *err)
         }
         len += got;
     }
+    if (e != ERR_OK) {
+        return e;
+    }
+    data[len] = '\0';
+    *contents = (String){ .data = data, .len = len };
+    return ERR_OK;
+}
+
+Error file_read_all(Arena *arena, String path, String *contents, Err *err)
+{
+    *contents = S("");
+    int fd;
+    Error e = file_open_read(path, &fd, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    e = file_read_to_end(arena, fd, contents, err);
     file_close(fd);
     if (e != ERR_OK) {
         return err_wrap(err, e, "read %.*s", (int)path.len, path.data);
     }
-    data[len] = '\0';
-    *contents = (String){ .data = data, .len = len };
     return ERR_OK;
 }
 
@@ -793,6 +836,22 @@ Error dir_create(String path, unsigned mode, Err *err)
         return e;
     }
     return make_directory(cpath.text, mode) ? ERR_OK : posix_fail_errno(err, "create directory %s", cpath.text);
+}
+
+Error dir_sync(String path, Err *err)
+{
+    CPath cpath;
+    Error e = to_cpath(path, &cpath, err);
+    if (e != ERR_OK) {
+        return e;
+    }
+    int fd = open(cpath.text, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return posix_fail_errno(err, "open %s", cpath.text);
+    }
+    e = file_sync(fd, err);
+    close(fd);
+    return e;
 }
 
 Error dir_create_all(String path, unsigned mode, Err *err)
@@ -1178,10 +1237,11 @@ static bool would_block(void)
     return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
-// pump writes stdin_text to the child and reads its output until both output pipes close.
+// pump writes stdin_text to the child and reads its output until both output pipes close,
+// or fails with ERR_TIMEOUT once the clock_monotonic_ns deadline passes; a negative deadline never does.
 // The descriptors are nonblocking, so a full pipe in one direction never stops the others.
 [[nodiscard]] static Error pump(Arena *arena, int stdin_fd, String stdin_text, int stdout_fd, int stderr_fd,
-                                Capture *out, Capture *errors, Err *err)
+                                int64_t deadline_ns, Capture *out, Capture *errors, Err *err)
 {
     size_t written = 0;
     if (stdin_text.len == 0) {
@@ -1199,7 +1259,16 @@ static bool would_block(void)
         if (stderr_fd >= 0) {
             fds[count++] = (struct pollfd){ .fd = stderr_fd, .events = POLLIN };
         }
-        if (poll(fds, count, -1) < 0) {
+        int wait_ms = -1;
+        if (deadline_ns >= 0) {
+            int64_t left_ns = deadline_ns - clock_monotonic_ns();
+            if (left_ns <= 0) {
+                close_pipes(&stdin_fd, &stdout_fd, &stderr_fd);
+                return err_set(err, ERR_TIMEOUT, "process did not finish in time");
+            }
+            wait_ms = (int)(left_ns / 1000000 + 1);
+        }
+        if (poll(fds, count, wait_ms) < 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -1322,7 +1391,8 @@ static bool disable_sigpipe(int fd)
 // the SIGPIPE a failed write left pending. The rest of the process keeps its
 // own SIGPIPE handling.
 [[nodiscard]] static Error pump_without_sigpipe(Arena *arena, int stdin_fd, String stdin_text, int stdout_fd,
-                                                int stderr_fd, Capture *out, Capture *errors, Err *err)
+                                                int stderr_fd, int64_t deadline_ns, Capture *out, Capture *errors,
+                                                Err *err)
 {
     sigset_t sigpipe_only;
     sigemptyset(&sigpipe_only);
@@ -1332,7 +1402,7 @@ static bool disable_sigpipe(int fd)
     sigset_t pending;
     sigpending(&pending);
     bool was_pending = sigismember(&pending, SIGPIPE);
-    Error e = pump(arena, stdin_fd, stdin_text, stdout_fd, stderr_fd, out, errors, err);
+    Error e = pump(arena, stdin_fd, stdin_text, stdout_fd, stderr_fd, deadline_ns, out, errors, err);
     sigpending(&pending);
     if (!was_pending && sigismember(&pending, SIGPIPE)) {
         int number;
@@ -1342,7 +1412,37 @@ static bool disable_sigpipe(int fd)
     return e;
 }
 
+// default_signals gives the child no blocked signals and the default action
+// for every signal this library or its caller may change, so a caller that
+// blocked them, as signals_block does, still starts children that an
+// interrupt from the terminal ends. flags are more POSIX_SPAWN_* flags.
+[[nodiscard]] static int default_signals(posix_spawnattr_t *attributes, short flags)
+{
+    sigset_t none;
+    sigemptyset(&none);
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    const int changed[] = { SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGWINCH, SIGCHLD };
+    for (size_t i = 0; i < countof(changed); i++) {
+        sigaddset(&defaults, changed[i]);
+    }
+    int rc = posix_spawnattr_setsigmask(attributes, &none);
+    if (rc == 0) {
+        rc = posix_spawnattr_setsigdefault(attributes, &defaults);
+    }
+    if (rc == 0) {
+        rc = posix_spawnattr_setflags(attributes, (short)(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | flags));
+    }
+    return rc;
+}
+
 Error process_run(Arena *arena, StringList argv, String stdin_text, ProcessResult *result, Err *err)
+{
+    return process_run_timeout(arena, argv, stdin_text, -1, result, err);
+}
+
+Error process_run_timeout(Arena *arena, StringList argv, String stdin_text, int64_t timeout_ms,
+                          ProcessResult *result, Err *err)
 {
     *result = (ProcessResult){ .stdout_text = S(""), .stderr_text = S("") };
     if (argv.count == 0) {
@@ -1366,11 +1466,19 @@ Error process_run(Arena *arena, StringList argv, String stdin_text, ProcessResul
     char **items = build_argv(arena, argv);
     pid_t pid;
     posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc == 0) {
-        rc = redirect_child(&actions, in_pipe[0], out_pipe[1], err_pipe[1]);
+        rc = posix_spawnattr_init(&attributes);
         if (rc == 0) {
-            rc = posix_spawnp(&pid, items[0], &actions, nullptr, items, environ);
+            rc = redirect_child(&actions, in_pipe[0], out_pipe[1], err_pipe[1]);
+            if (rc == 0) {
+                rc = default_signals(&attributes, timeout_ms >= 0 ? POSIX_SPAWN_SETPGROUP : 0);
+            }
+            if (rc == 0) {
+                rc = posix_spawnp(&pid, items[0], &actions, &attributes, items, environ);
+            }
+            posix_spawnattr_destroy(&attributes);
         }
         posix_spawn_file_actions_destroy(&actions);
     }
@@ -1386,7 +1494,12 @@ Error process_run(Arena *arena, StringList argv, String stdin_text, ProcessResul
 
     Capture out = { 0 };
     Capture errors = { 0 };
-    Error pumped = pump_without_sigpipe(arena, in_pipe[1], stdin_text, out_pipe[0], err_pipe[0], &out, &errors, err);
+    int64_t deadline_ns = timeout_ms >= 0 ? clock_monotonic_ns() + timeout_ms * 1000000 : -1;
+    Error pumped = pump_without_sigpipe(arena, in_pipe[1], stdin_text, out_pipe[0], err_pipe[0], deadline_ns, &out,
+                                        &errors, err);
+    if (pumped == ERR_TIMEOUT) {
+        kill(-pid, SIGKILL);
+    }
     int status = 0;
     Error waited = wait_for(pid, &status, err);
     if (pumped != ERR_OK) {
@@ -1409,7 +1522,15 @@ Error process_run_interactive(Arena *scratch, StringList argv, int *exit_code, E
     ArenaMark mark = arena_mark(scratch);
     char **items = build_argv(scratch, argv);
     pid_t pid;
-    int rc = posix_spawnp(&pid, items[0], nullptr, nullptr, items, environ);
+    posix_spawnattr_t attributes;
+    int rc = posix_spawnattr_init(&attributes);
+    if (rc == 0) {
+        rc = default_signals(&attributes, 0);
+        if (rc == 0) {
+            rc = posix_spawnp(&pid, items[0], nullptr, &attributes, items, environ);
+        }
+        posix_spawnattr_destroy(&attributes);
+    }
     Error e = rc != 0 ? spawn_failed(err, rc, items[0]) : ERR_OK;
     arena_release(mark);
     if (e != ERR_OK) {
@@ -1549,27 +1670,11 @@ Error process_open_default(String path, Err *err)
     return ERR_OK;
 }
 
-// detach_child gives the child its own session, no blocked signals and the
-// default action for every signal this library or its caller may change.
+// detach_child gives the child its own session and the signal state of
+// default_signals.
 [[nodiscard]] static int detach_child(posix_spawnattr_t *attributes)
 {
-    sigset_t none;
-    sigemptyset(&none);
-    sigset_t defaults;
-    sigemptyset(&defaults);
-    const int changed[] = { SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGWINCH, SIGCHLD };
-    for (size_t i = 0; i < countof(changed); i++) {
-        sigaddset(&defaults, changed[i]);
-    }
-    int rc = posix_spawnattr_setsigmask(attributes, &none);
-    if (rc == 0) {
-        rc = posix_spawnattr_setsigdefault(attributes, &defaults);
-    }
-    if (rc == 0) {
-        rc = posix_spawnattr_setflags(attributes,
-                                      (short)(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSID));
-    }
-    return rc;
+    return default_signals(attributes, POSIX_SPAWN_SETSID);
 }
 
 Error process_spawn_detached(Arena *scratch, StringList argv, String output_path, int *pid, Err *err)
@@ -1876,6 +1981,36 @@ Error net_local_address(Arena *arena, int fd, String *address, Err *err)
     return ERR_OK;
 }
 
+// listen_on listens on the first of addresses of family, or of any family
+// for AF_UNSPEC, that takes it, and gives its socket or -1. An IPv6 socket
+// takes IPv4 connections too, where the system allows it.
+static int listen_on(const struct addrinfo *addresses, int family, int *failure)
+{
+    for (const struct addrinfo *a = addresses; a != nullptr; a = a->ai_next) {
+        if (family != AF_UNSPEC && a->ai_family != family) {
+            continue;
+        }
+        int sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (sock < 0) {
+            *failure = errno;
+            continue;
+        }
+        int one = 1;
+        int zero = 0;
+        if (a->ai_family == AF_INET6) {
+            unused(setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero));
+        }
+        if (!prepare_socket(sock) || setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+            bind(sock, a->ai_addr, a->ai_addrlen) != 0 || listen(sock, 64) != 0) {
+            *failure = errno;
+            close(sock);
+            continue;
+        }
+        return sock;
+    }
+    return -1;
+}
+
 Error net_listen(String address, int *fd, Err *err)
 {
     *fd = -1;
@@ -1899,20 +2034,13 @@ Error net_listen(String address, int *fd, Err *err)
         return err_set(err, ERR_NETWORK, "listen %s:%s: %s", host.text, port.text, gai_strerror(rc));
     }
     int failure = EADDRNOTAVAIL;
-    for (struct addrinfo *a = addresses; a != nullptr && *fd < 0; a = a->ai_next) {
-        int sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (sock < 0) {
-            failure = errno;
-            continue;
-        }
-        int one = 1;
-        if (!prepare_socket(sock) || setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
-            bind(sock, a->ai_addr, a->ai_addrlen) != 0 || listen(sock, 64) != 0) {
-            failure = errno;
-            close(sock);
-            continue;
-        }
-        *fd = sock;
+    // With no host, an IPv6 socket that also takes IPv4 comes first, so both
+    // reach the server; glibc lists IPv4's wildcard first.
+    if (host.text[0] == '\0') {
+        *fd = listen_on(addresses, AF_INET6, &failure);
+    }
+    if (*fd < 0) {
+        *fd = listen_on(addresses, AF_UNSPEC, &failure);
     }
     freeaddrinfo(addresses);
     if (*fd < 0) {
@@ -2149,7 +2277,112 @@ Error net_receive(int fd, void *buffer, size_t capacity, size_t *got, Err *err)
     }
 }
 
+Error net_pair(int fds[2], Err *err)
+{
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        return err_set(err, ERR_NETWORK, "socket pair: %s", strerror(errno));
+    }
+    if (!prepare_socket(fds[0]) || !prepare_socket(fds[1])) {
+        Error e = err_set(err, ERR_NETWORK, "socket pair: %s", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return e;
+    }
+    return ERR_OK;
+}
+
+Error net_set_nonblocking(int fd, Err *err)
+{
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return err_set(err, ERR_NETWORK, "fcntl: %s", strerror(errno));
+    }
+    return ERR_OK;
+}
+
+// net_try_accept leaves out Nagle's delay where it can: a Unix socket has none to turn off.
+bool net_try_accept(int listener, int *client)
+{
+    int fd = -1;
+    do {
+        fd = accept(listener, nullptr, nullptr);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        return false;
+    }
+    if (!prepare_socket(fd) || net_set_nonblocking(fd, nullptr) != ERR_OK) {
+        close(fd);
+        return false;
+    }
+    int one = 1;
+    unused(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one));
+    *client = fd;
+    return true;
+}
+
+NetResult net_try_receive(int fd, void *buffer, size_t capacity, size_t *got)
+{
+    *got = 0;
+    ssize_t n = 0;
+    do {
+        n = recv(fd, buffer, capacity, MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return NET_WOULD_BLOCK;
+    }
+    if (n <= 0) {
+        return NET_CLOSED;
+    }
+    *got = (size_t)n;
+    return NET_DONE;
+}
+
+NetResult net_try_send(int fd, String data, size_t *sent)
+{
+#ifdef MSG_NOSIGNAL
+    int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+#else
+    int flags = MSG_DONTWAIT;
+#endif
+    *sent = 0;
+    ssize_t n = 0;
+    do {
+        n = send(fd, data.data, data.len, flags);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return NET_WOULD_BLOCK;
+    }
+    if (n < 0) {
+        return NET_CLOSED;
+    }
+    *sent = (size_t)n;
+    return NET_DONE;
+}
+
+Error net_receive_nowait(int fd, void *buffer, size_t capacity, size_t *got, Err *err)
+{
+    *got = 0;
+    for (;;) {
+        ssize_t n = recv(fd, buffer, capacity, MSG_DONTWAIT);
+        if (n >= 0) {
+            *got = (size_t)n;
+            return ERR_OK;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return ERR_OK;
+        }
+        if (errno != EINTR) {
+            return err_set(err, ERR_NETWORK, "receive: %s", strerror(errno));
+        }
+    }
+}
+
 void net_shutdown(int fd)
 {
     shutdown(fd, SHUT_RDWR);
+}
+
+void net_shutdown_write(int fd)
+{
+    shutdown(fd, SHUT_WR);
 }

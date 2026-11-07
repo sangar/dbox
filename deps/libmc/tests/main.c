@@ -7,6 +7,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+// The test program is one translation unit: every test file is included here.
+#include "test_acme.c"
+#include "test_arena.c"
+#include "test_concurrency.c"
+#include "test_encoding.c"
+#include "test_http_server.c"
+#include "test_idtable.c"
+#include "test_log.c"
+#include "test_mail.c"
+#include "test_net.c"
+#include "test_platform.c"
+#include "test_pool.c"
+#include "test_pty.c"
+#include "test_s3.c"
+#include "test_service.c"
+#include "test_static_files.c"
+#include "test_str.c"
+#include "test_strmap.c"
+#include "test_sysinfo.c"
+#include "test_term_animation.c"
+#include "test_term_ansi.c"
+#include "test_term_input.c"
+#include "test_term_layout.c"
+#include "test_term_list.c"
+#include "test_term_live.c"
+#include "test_term_log.c"
+#include "test_term_screen.c"
+#include "test_term_style.c"
+#include "test_text.c"
+#include "test_watch.c"
+
 void test_check(Test *test, bool ok, const char *what)
 {
     test->checks++;
@@ -86,9 +117,9 @@ int main(int argc, char **argv)
     if (thread_start(&watchdog, fail_after_timeout, nullptr, nullptr) == ERR_OK) {
         thread_detach(&watchdog);
     }
-    const TestCase *tables[] = { ARENA_TESTS, STR_TESTS, STRMAP_TESTS, IDTABLE_TESTS, TEXT_TESTS, PLATFORM_TESTS, CONCURRENCY_TESTS,
-                                   ENCODING_TESTS, LOG_TESTS, WATCH_TESTS, SERVICE_TESTS, PTY_TESTS, SYSINFO_TESTS, HTTP_TESTS,
-                                   SMTP_TESTS, S3_TESTS };
+    const TestCase *tables[] = { ARENA_TESTS, STR_TESTS, STRMAP_TESTS, IDTABLE_TESTS, POOL_TESTS, TEXT_TESTS, PLATFORM_TESTS, CONCURRENCY_TESTS,
+                                   ENCODING_TESTS, MAIL_TESTS, LOG_TESTS, WATCH_TESTS, SERVICE_TESTS, PTY_TESTS, SYSINFO_TESTS, HTTP_TESTS,
+                                   SMTP_TESTS, S3_TESTS, FTP_TESTS, TERM_STYLE_TESTS, TERM_ANSI_TESTS, TERM_ANIMATION_TESTS, TERM_LIVE_TESTS, TERM_INPUT_TESTS, TERM_LIST_TESTS, TERM_LAYOUT_TESTS, TERM_SCREEN_TESTS, TERM_LOG_TESTS, HTTP_SERVER_TESTS, STATIC_FILES_TESTS, ACME_TESTS };
     unsigned failed = 0;
     unsigned checks = 0;
     for (size_t i = 0; i < countof(tables); i++) {

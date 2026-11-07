@@ -11,6 +11,7 @@ static void str_slicing_and_search(Test *test)
     test_check(test, str_find_last_char(S("a/b/c"), '/', &index) && index == 3, "find_last_char");
     test_check(test, str_starts_with(s, S("doc")) && str_ends_with(s, S(".txt")), "prefix and suffix");
     test_check(test, str_slice(s, 50, 60).len == 0, "slice clamps out-of-range");
+    test_check(test, str_slice((String){ 0 }, 0, 0).len == 0, "slice the empty string with no data");
     test_check(test, str_compare(S("ab"), S("abc")) < 0 && str_compare(S("b"), S("abc")) > 0, "compare orders");
     test_check(test, str_compare_ignore_case(S("Readme"), S("rat")) > 0 && str_compare_ignore_case(S("Readme"), S("rest")) < 0,
                "compare ignoring case folds letters");
@@ -88,6 +89,12 @@ static void str_split_join_replace(Test *test)
     test_check_str(test, str_percent_encode(test->arena, S("a b/c~"), true), S("a%20b/c~"),
                    "percent_encode keeps unreserved and slash");
     test_check_str(test, str_percent_encode(test->arena, S("a/b"), false), S("a%2Fb"), "percent_encode slash");
+    String decoded = { 0 };
+    test_check(test, str_percent_decode(test->arena, S("caf%C3%A9%2fa+b%41"), &decoded), "percent_decode");
+    test_check_str(test, decoded, S("café/a+bA"), "percent_decode keeps + and reads either case");
+    test_check(test, !str_percent_decode(test->arena, S("100%"), &decoded), "a % at the end");
+    test_check(test, !str_percent_decode(test->arena, S("%zz"), &decoded), "a % before no hex digits");
+    test_check(test, !str_percent_decode(test->arena, S("%4"), &decoded), "a % before one hex digit");
 }
 
 static void strlist_sorts_and_contains(Test *test)

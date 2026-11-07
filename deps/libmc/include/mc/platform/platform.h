@@ -15,6 +15,8 @@ int64_t clock_monotonic_ns(void);
 // clock_wall_ns is the time since the Unix epoch.
 int64_t clock_wall_ns(void);
 void clock_sleep_ms(int64_t milliseconds);
+// random_bytes fills buffer from the system's cryptographically secure generator.
+[[nodiscard]] Error random_bytes(void *buffer, size_t len, Err *err);
 // clock_local_offset is the local zone's offset from UTC in seconds east, at a Unix time.
 int32_t clock_local_offset(int64_t unix_seconds);
 
@@ -108,11 +110,17 @@ bool file_find_upward(Arena *arena, String directory, StringList names, String *
 [[nodiscard]] Error file_write(int fd, String data, Err *err);
 [[nodiscard]] Error file_seek(int fd, int64_t offset, Err *err);
 [[nodiscard]] Error file_truncate(int fd, int64_t size, Err *err);
+// file_sync returns once what was written to fd is on stable storage, which
+// on macOS takes F_FULLFSYNC, as fsync there leaves it in the drive's cache.
+[[nodiscard]] Error file_sync(int fd, Err *err);
 [[nodiscard]] Error file_rename(String from, String to, Err *err);
 // file_remove is ERR_NOT_FOUND when nothing was there.
 [[nodiscard]] Error file_remove(String path, Err *err);
 [[nodiscard]] Error file_set_mtime(String path, int64_t mtime_ns, Err *err);
 
+// file_read_to_end reads fd until its end into the arena, NUL-terminated,
+// such as a file or standard input from a pipe.
+[[nodiscard]] Error file_read_to_end(Arena *arena, int fd, String *contents, Err *err);
 // file_read_all reads the whole file into the arena, NUL-terminated.
 [[nodiscard]] Error file_read_all(Arena *arena, String path, String *contents, Err *err);
 [[nodiscard]] Error file_write_all(String path, String contents, unsigned mode, Err *err);
@@ -139,6 +147,9 @@ void file_unmap(FileMap map);
 // file or a broken symlink, is ERR_IO.
 [[nodiscard]] Error dir_create(String path, unsigned mode, Err *err);
 [[nodiscard]] Error dir_create_all(String path, unsigned mode, Err *err);
+// dir_sync makes the entries of the directory at path durable, such as a file
+// created or renamed into it, as file_sync does a file's contents.
+[[nodiscard]] Error dir_sync(String path, Err *err);
 [[nodiscard]] Error dir_remove(String path, Err *err);
 // dir_remove_all removes path and everything below it; a missing path is ERR_OK.
 [[nodiscard]] Error dir_remove_all(String path, Err *err);
@@ -194,6 +205,12 @@ typedef struct ProcessResult {
 // and capturing its output into the arena. A non-zero exit is not an error;
 // a program that cannot be started is ERR_NOT_FOUND or ERR_PLATFORM.
 [[nodiscard]] Error process_run(Arena *arena, StringList argv, String stdin_text, ProcessResult *result, Err *err);
+// process_run_timeout is process_run that gives up after timeout_ms: it then
+// kills the child and every process the child started, which run in a process
+// group of their own, and fails with ERR_TIMEOUT. That group does not get the
+// terminal's interrupt, so a negative timeout_ms runs it as process_run does.
+[[nodiscard]] Error process_run_timeout(Arena *arena, StringList argv, String stdin_text, int64_t timeout_ms,
+                                        ProcessResult *result, Err *err);
 // process_run_interactive runs argv on this process's terminal; *exit_code is 128 plus the signal when one ended it.
 [[nodiscard]] Error process_run_interactive(Arena *scratch, StringList argv, int *exit_code, Err *err);
 bool process_look_path(Arena *arena, String name, String *path);
@@ -254,7 +271,8 @@ void signal_watch_stop(SignalWatch *watch);
 
 // ---- network ----
 
-// net_listen binds host:port, all interfaces when host is empty, and listens.
+// net_listen binds host:port and listens. An empty host is every interface,
+// IPv6 and IPv4 on one socket where the system has IPv6, IPv4 alone where not.
 [[nodiscard]] Error net_listen(String address, int *fd, Err *err);
 // net_local_address is the host:port fd is bound to, with the port chosen
 // when it listened on port 0, in the form net_listen and net_connect take.
@@ -281,6 +299,37 @@ void net_close(int fd);
 [[nodiscard]] Error net_send(int fd, String data, Err *err);
 // net_receive reads up to capacity bytes; *got is 0 once the peer has closed.
 [[nodiscard]] Error net_receive(int fd, void *buffer, size_t capacity, size_t *got, Err *err);
+// net_pair creates two connected stream sockets in this process, for
+// driving a server in-process without a port. Close each with net_close.
+[[nodiscard]] Error net_pair(int fds[2], Err *err);
+// net_receive_nowait reads up to capacity bytes that have already arrived,
+// without waiting: *got is 0 when nothing has, or once the peer has closed.
+[[nodiscard]] Error net_receive_nowait(int fd, void *buffer, size_t capacity, size_t *got, Err *err);
 // net_shutdown ends both directions of fd, which wakes a thread blocked in
 // net_receive on it. The descriptor stays open until net_close.
 void net_shutdown(int fd);
+// net_shutdown_write ends fd's sending side: the peer reads to the end of
+// what was sent, while fd can still receive.
+void net_shutdown_write(int fd);
+
+// NetResult is how far a call that does not wait got, for event loops on
+// mc/platform/poll.h.
+typedef enum NetResult {
+    NET_DONE,        // some bytes moved
+    NET_WOULD_BLOCK, // none can move until the socket is ready
+    NET_CLOSED,      // the peer closed, or the connection failed
+} NetResult;
+
+// net_set_nonblocking makes calls on fd return instead of waiting, as a
+// listener for net_try_accept needs.
+[[nodiscard]] Error net_set_nonblocking(int fd, Err *err);
+// net_try_accept takes a connection that is already waiting and reports
+// whether there was one. The connection is non-blocking, never raises
+// SIGPIPE, and over TCP sends without Nagle's delay.
+bool net_try_accept(int listener, int *client);
+// net_try_receive reads up to capacity bytes that have arrived. Unlike
+// net_receive_nowait it tells a peer that closed from one that is quiet.
+NetResult net_try_receive(int fd, void *buffer, size_t capacity, size_t *got);
+// net_try_send writes what of data the socket takes now. On a socket libmc
+// opened or accepted it never raises SIGPIPE.
+NetResult net_try_send(int fd, String data, size_t *sent);

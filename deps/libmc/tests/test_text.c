@@ -3,12 +3,16 @@
 #include "mc/text/fmt.h"
 #include "mc/text/glob.h"
 #include "mc/text/path.h"
+#include "mc/crypto/crc32.h"
+#include "mc/crypto/md5.h"
 #include "mc/crypto/sha256.h"
 #include "mc/crypto/sigv4.h"
 #include "mc/text/table.h"
 #include "mc/text/unicode.h"
 #include "mc/container/sort.h"
 #include "mc/text/utf8.h"
+
+#include <string.h>
 
 static void utf8_roundtrip_and_validation(Test *test)
 {
@@ -78,6 +82,7 @@ static void unicode_normalizes_and_cases(Test *test)
 
     test_check_str(test, unicode_lower(a, S("BLÅBÆR ØL")), S("blåbær øl"), "lower maps ÆØÅ");
     test_check_str(test, unicode_upper(a, S("blåbær øl")), S("BLÅBÆR ØL"), "upper maps æøå");
+    test_check(test, unicode_lower_codepoint(U'Ø') == U'ø', "lower maps one code point");
     test_check_str(test, unicode_upper(a, S("ß")), S("ẞ"), "upper maps one code point to one");
     test_check(test, unicode_equal_ignore_case(S("ÆØÅ"), S("æøå")), "ÆØÅ equals æøå ignoring case");
     test_check(test, !unicode_equal_ignore_case(S("æøå"), S("æø")), "a longer string is not equal");
@@ -231,11 +236,14 @@ static void sha256_known_vectors(Test *test)
     sha256(S("abc"), digest);
     test_check_str(test, hex_encode(test->arena, digest, SHA256_LEN),
                    S("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "abc");
+    // memset, as str_repeat takes seconds for a million bytes under the sanitizers on slow runners.
+    size_t million = 1000000;
+    char *a = arena_push(test->arena, million);
+    memset(a, 'a', million);
     Sha256 hash;
     sha256_init(&hash);
-    String million = str_repeat(test->arena, S("a"), 1000000);
-    for (size_t at = 0; at < million.len; at += 997) {
-        sha256_update(&hash, million.data + at, min_size(997, million.len - at));
+    for (size_t at = 0; at < million; at += 997) {
+        sha256_update(&hash, a + at, min_size(997, million - at));
     }
     sha256_final(&hash, digest);
     test_check_str(test, hex_encode(test->arena, digest, SHA256_LEN),
@@ -244,6 +252,55 @@ static void sha256_known_vectors(Test *test)
     hmac_sha256(S("Jefe"), S("what do ya want for nothing?"), digest);
     test_check_str(test, hex_encode(test->arena, digest, SHA256_LEN),
                    S("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "RFC 4231 HMAC case 2");
+}
+
+static void pbkdf2_known_vectors(Test *test)
+{
+    uint8_t key[64];
+    pbkdf2_hmac_sha256(S("passwd"), S("salt"), 1, key, 64);
+    test_check_str(test, hex_encode(test->arena, key, 64),
+                   S("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+                     "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"),
+                   "RFC 7914 case 1, two blocks");
+    pbkdf2_hmac_sha256(S("Password"), S("NaCl"), 80000, key, 64);
+    test_check_str(test, hex_encode(test->arena, key, 64),
+                   S("4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56"
+                     "a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"),
+                   "RFC 7914 case 2, 80,000 iterations");
+    pbkdf2_hmac_sha256(S("blåbærsyltetøy"), S("gasamedia"), 1000, key, 40);
+    test_check_str(test, hex_encode(test->arena, key, 40),
+                   S("470b3237cf1ad14895063c30984c2c729f04fb0f2b7e95dcb343f8d8068e1f6d8f26724f43439f67"),
+                   "a UTF-8 password, a key ending mid-block");
+}
+
+static void md5_known_vectors(Test *test)
+{
+    uint8_t digest[MD5_LEN];
+    md5(S(""), digest);
+    test_check_str(test, hex_encode(test->arena, digest, MD5_LEN), S("d41d8cd98f00b204e9800998ecf8427e"), "empty input");
+    md5(S("abc"), digest);
+    test_check_str(test, hex_encode(test->arena, digest, MD5_LEN), S("900150983cd24fb0d6963f7d28e17f72"), "abc");
+    // memset, as str_repeat takes seconds for a million bytes under the sanitizers on slow runners.
+    size_t million = 1000000;
+    char *a = arena_push(test->arena, million);
+    memset(a, 'a', million);
+    Md5 hash;
+    md5_init(&hash);
+    for (size_t at = 0; at < million; at += 997) {
+        md5_update(&hash, a + at, min_size(997, million - at));
+    }
+    md5_final(&hash, digest);
+    test_check_str(test, hex_encode(test->arena, digest, MD5_LEN), S("7707d6ae4e027c70eea2a935c2296f21"),
+                   "a million a's in uneven pieces");
+}
+
+static void crc32_check_values(Test *test)
+{
+    test_check(test, crc32_update(0, "123456789", 9) == 0xcbf43926, "CRC-32 check value");
+    test_check(test, crc32c_update(0, "123456789", 9) == 0xe3069283, "CRC-32C check value");
+    test_check(test, crc32_update(crc32_update(0, "1234", 4), "56789", 5) == 0xcbf43926, "CRC-32 continued");
+    test_check(test, crc32c_update(crc32c_update(0, "1234", 4), "56789", 5) == 0xe3069283, "CRC-32C continued");
+    test_check(test, crc32_update(0, "", 0) == 0 && crc32c_update(0, "", 0) == 0, "nothing");
 }
 
 static int compare_ints(const void *context, const void *a, const void *b)
@@ -372,6 +429,9 @@ const TestCase TEXT_TESTS[] = {
     { "fmt_times_and_numbers", fmt_times_and_numbers },
     { "civil_dates_convert", civil_dates_convert },
     { "sha256_known_vectors", sha256_known_vectors },
+    { "pbkdf2_known_vectors", pbkdf2_known_vectors },
+    { "md5_known_vectors", md5_known_vectors },
+    { "crc32_check_values", crc32_check_values },
     { "sort_orders_and_selects", sort_orders_and_selects },
     { "table_aligns_columns", table_aligns_columns },
     { "sigv4_signs_like_aws", sigv4_signs_like_aws },

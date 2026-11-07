@@ -4,7 +4,9 @@
 #include <math.h>
 
 #include "mc/encoding/csv.h"
+#include "mc/encoding/base64.h"
 #include "mc/encoding/dotenv.h"
+#include "mc/encoding/gzip.h"
 #include "mc/encoding/json.h"
 #include "mc/encoding/markdown.h"
 #include "mc/encoding/xml.h"
@@ -282,6 +284,102 @@ static void yaml_rejects_malformed_input(Test *test)
     test_check_str(test, S(err.msg), S("yaml: line 1, column 14: alias inside the node it names"), "names the alias");
 }
 
+static void base64_round_trips_the_rfc_4648_examples(Test *test)
+{
+    static const struct {
+        const char *data;
+        const char *standard;
+        const char *url;
+    } EXAMPLES[] = {
+        { "", "", "" },
+        { "f", "Zg==", "Zg" },
+        { "fo", "Zm8=", "Zm8" },
+        { "foo", "Zm9v", "Zm9v" },
+        { "foob", "Zm9vYg==", "Zm9vYg" },
+        { "fooba", "Zm9vYmE=", "Zm9vYmE" },
+        { "foobar", "Zm9vYmFy", "Zm9vYmFy" },
+        { "\xfb\xff", "+/8=", "-_8" },
+    };
+    for (size_t i = 0; i < countof(EXAMPLES); i++) {
+        String data = S(EXAMPLES[i].data);
+        test_check_str(test, base64_encode(test->arena, data, BASE64_STANDARD), S(EXAMPLES[i].standard), "standard");
+        test_check_str(test, base64_encode(test->arena, data, BASE64_URL), S(EXAMPLES[i].url), "url");
+        String decoded = { 0 };
+        test_check(test, base64_decode(test->arena, S(EXAMPLES[i].standard), BASE64_STANDARD, &decoded),
+                   "decode standard");
+        test_check_str(test, decoded, data, "decoded standard");
+        test_check(test, base64_decode(test->arena, S(EXAMPLES[i].url), BASE64_URL, &decoded), "decode url");
+        test_check_str(test, decoded, data, "decoded url");
+    }
+}
+
+static void base64_refuses_malformed_text(Test *test)
+{
+    static const struct {
+        const char *text;
+        Base64Alphabet alphabet;
+    } MALFORMED[] = {
+        { "Zg=", BASE64_STANDARD },  { "Zg", BASE64_STANDARD },   { "Zm9v!A==", BASE64_STANDARD },
+        { "-_8=", BASE64_STANDARD }, { "Zh==", BASE64_STANDARD }, { "Zg==Zg==", BASE64_STANDARD },
+        { "Zg==", BASE64_URL },      { "Z", BASE64_URL },         { "+/8", BASE64_URL },
+        { "Zh", BASE64_URL },
+    };
+    for (size_t i = 0; i < countof(MALFORMED); i++) {
+        String decoded = { 0 };
+        test_check(test, !base64_decode(test->arena, S(MALFORMED[i].text), MALFORMED[i].alphabet, &decoded),
+                   MALFORMED[i].text);
+    }
+}
+
+static void base64_decodes_mail_leniently(Test *test)
+{
+    static const struct {
+        const char *text;
+        const char *data;
+    } CASES[] = {
+        { "Zm9v\r\nYmFy\r\n", "foobar" }, { "Zm9vYg", "foob" }, { "Zm9vYg==Zm9v", "foobfoo" },
+        { "Zm 9v!", "foo" },                 { "Zm9vY", "foo" },  { "", "" },
+    };
+    for (size_t i = 0; i < countof(CASES); i++) {
+        test_check_str(test, base64_decode_lenient(test->arena, S(CASES[i].text)), S(CASES[i].data), CASES[i].text);
+    }
+}
+
+static void gzip_round_trips_with_and_without_a_comment(Test *test)
+{
+    String text = str_repeat(test->arena, S("blåbær og bringebær, "), 200);
+    String plain = { 0 };
+    String commented = { 0 };
+    String back = { 0 };
+    Err err = { 0 };
+    GzipOptions comment = { .comment = S("padding") };
+    test_check(test, gzip_compress(test->arena, text, nullptr, &plain, &err) == ERR_OK, err.msg);
+    test_check(test, plain.len > 2 && (uint8_t)plain.data[0] == 0x1f && (uint8_t)plain.data[1] == 0x8b,
+               "gzip's magic number");
+    test_check(test, plain.len < text.len / 10, "repetitive text shrinks");
+    test_check(test, gzip_decompress(test->arena, plain, text.len, &back, &err) == ERR_OK, err.msg);
+    test_check_str(test, back, text, "the text comes back");
+    test_check(test, gzip_compress(test->arena, text, &comment, &commented, &err) == ERR_OK, err.msg);
+    test_check(test, commented.len == plain.len + S("padding").len + 1, "the comment and its NUL are in the header");
+    test_check(test, gzip_decompress(test->arena, commented, text.len, &back, &err) == ERR_OK, err.msg);
+    test_check_str(test, back, text, "the commented text comes back");
+}
+
+static void gzip_refuses_malformed_and_oversized_data(Test *test)
+{
+    String text = str_repeat(test->arena, S("a"), 10000);
+    String compressed = { 0 };
+    String back = { 0 };
+    test_check(test, gzip_compress(test->arena, text, nullptr, &compressed, nullptr) == ERR_OK, "compress");
+    test_check(test, gzip_decompress(test->arena, S("not gzip at all"), 100, &back, nullptr) == ERR_PARSE,
+               "not gzip");
+    test_check(test, gzip_decompress(test->arena, str_slice(compressed, 0, compressed.len - 4), text.len, &back,
+                                     nullptr) == ERR_PARSE,
+               "a truncated stream");
+    test_check(test, gzip_decompress(test->arena, compressed, text.len - 1, &back, nullptr) == ERR_UNSUPPORTED,
+               "more than max_bytes");
+}
+
 static void dotenv_reads_names_and_values(Test *test)
 {
     static const char TEXT[] = "# settings\n"
@@ -526,6 +624,26 @@ static void xml_reads_elements_attributes_and_text(Test *test)
                "events know their line");
 }
 
+static void xml_writes_what_it_reads_back(Test *test)
+{
+    XmlWriter xml = xml_writer_create(test->arena);
+    const XmlAttribute attributes[] = { { S("xmlns"), S("http://s3.amazonaws.com/doc/2006-03-01/") },
+                                        { S("note"), S("\"a\" & 'b'") } };
+    xml_writer_start(&xml, S("ListBucketResult"), attributes, countof(attributes));
+    xml_writer_element(&xml, S("Key"), S("blåbær <og> & bringebær"));
+    xml_writer_start(&xml, S("Empty"), nullptr, 0);
+    xml_writer_end(&xml, S("Empty"));
+    xml_writer_end(&xml, S("ListBucketResult"));
+    String document = xml_writer_finish(&xml);
+    test_check(test, str_starts_with(document, S("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult ")),
+               "the declaration comes first");
+    test_check(test, str_contains(document, S("<Key>blåbær &lt;og&gt; &amp; bringebær</Key>")), "text is escaped");
+    test_check_str(test, xml_outline(test, document),
+                   S("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" note=\"\"a\" & 'b'\">"
+                     "<Key>[blåbær <og> & bringebær]</Key><Empty></Empty></ListBucketResult>"),
+                   "the parser reads back what was written");
+}
+
 static void xml_rejects_malformed_and_hostile_documents(Test *test)
 {
     XmlEvents events = { 0 };
@@ -558,6 +676,11 @@ static void xml_rejects_malformed_and_hostile_documents(Test *test)
 }
 
 const TestCase ENCODING_TESTS[] = {
+    { "base64_round_trips_the_rfc_4648_examples", base64_round_trips_the_rfc_4648_examples },
+    { "base64_refuses_malformed_text", base64_refuses_malformed_text },
+    { "base64_decodes_mail_leniently", base64_decodes_mail_leniently },
+    { "gzip_round_trips_with_and_without_a_comment", gzip_round_trips_with_and_without_a_comment },
+    { "gzip_refuses_malformed_and_oversized_data", gzip_refuses_malformed_and_oversized_data },
     { "json_parses_every_kind", json_parses_every_kind },
     { "json_decodes_strings", json_decodes_strings },
     { "json_rejects_malformed_input", json_rejects_malformed_input },
@@ -578,5 +701,6 @@ const TestCase ENCODING_TESTS[] = {
     { "markdown_keeps_html_and_scripts_out", markdown_keeps_html_and_scripts_out },
     { "xml_reads_elements_attributes_and_text", xml_reads_elements_attributes_and_text },
     { "xml_rejects_malformed_and_hostile_documents", xml_rejects_malformed_and_hostile_documents },
+    { "xml_writes_what_it_reads_back", xml_writes_what_it_reads_back },
     { nullptr, nullptr },
 };

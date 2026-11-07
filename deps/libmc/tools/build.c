@@ -4,8 +4,10 @@
 //
 //     ./nob                 debug library with sanitizers  -> out/debug/libmc.a
 //     ./nob release         optimised library              -> out/release/libmc.a
+//     ./nob fuzz            library instrumented for libFuzzer, $CC a clang that has it -> out/fuzz/libmc.a
+//     ./nob tsan            library under ThreadSanitizer -> out/tsan/libmc.a
 //     ./nob test            build and run the tests (debug)
-//     ./nob check           modern-c contract check, then the tests
+//     ./nob check           modern-c contract check, then the tests, then again under ThreadSanitizer
 //     ./nob cross           compile and archive for every target with zig cc
 //     ./nob clean           remove out/
 //     ./nob hash <dir>      print the deps.lock hash of a directory
@@ -28,7 +30,7 @@
 
 extern char **environ;
 
-enum { MAX_ARGS = 1024, MAX_FILES = 512, MAX_JOBS = 16, PATH_MAX_LEN = 1024, FINGERPRINT_LEN = 4096 };
+enum { MAX_ARGS = 1024, MAX_FILES = 512, MAX_JOBS = 16, PATH_MAX_LEN = 1024, FINGERPRINT_LEN = 16384 };
 
 typedef struct {
     const char *items[MAX_ARGS];
@@ -60,9 +62,15 @@ static const char *const WARNING_FLAGS[] = {
     "-std=c23", "-Wall", "-Wextra", "-Werror", "-Wconversion", "-Wshadow", "-Wvla",
     "-Wstrict-prototypes", "-Wimplicit-fallthrough", "-Wno-unused-parameter",
 };
+// Flavor is how the library is compiled, each into out/<name>/.
+typedef enum { FLAVOR_DEBUG, FLAVOR_RELEASE, FLAVOR_FUZZ, FLAVOR_TSAN } Flavor;
+static const char *const FLAVOR_NAMES[] = { "debug", "release", "fuzz", "tsan" };
 static const char *const DEBUG_FLAGS[] = { "-g", "-O0", "-fsanitize=address,undefined", "-fno-omit-frame-pointer" };
-static const char *const RELEASE_FLAGS[] = { "-O2", "-DNDEBUG" };
-static const char *const AREAS[] = { "core", "text", "container", "crypto", "platform", "concurrency", "encoding", "log", "net" };
+static const char *const RELEASE_FLAGS[] = { "-O2" };
+static const char *const FUZZ_FLAGS[] = { "-g", "-O1", "-fsanitize=fuzzer-no-link,address,undefined",
+                                          "-fno-omit-frame-pointer" };
+static const char *const TSAN_FLAGS[] = { "-g", "-O1", "-fsanitize=thread", "-fno-omit-frame-pointer" };
+static const char *const AREAS[] = { "core", "text", "container", "crypto", "platform", "concurrency", "encoding", "log", "net", "term" };
 
 
 // Dependency is a vendored library, pinned in deps.lock. It compiles in its
@@ -110,6 +118,8 @@ static const char *const ZLIB_DIRECTORIES[] = { "deps/zlib" };
 static const char *const CACERT_DIRECTORIES[] = { "deps/cacert" };
 static const char *const MD4C_DIRECTORIES[] = { "deps/md4c" };
 static const char *const EXPAT_DIRECTORIES[] = { "deps/expat/lib" };
+static const char *const LLHTTP_DIRECTORIES[] = { "deps/llhttp/src" };
+static const char *const LLHTTP_FLAGS[] = { "-std=c11", "-w", "-Ideps/llhttp/include" };
 // xmltok.c includes xmltok_impl.c and xmltok_ns.c, which are kept in lib/included so they are not compiled alone.
 static const char *const EXPAT_FLAGS[] = { "-std=c11", "-w", "-Isrc/encoding", "-Ideps/expat/lib/included" };
 // HAVE_UNISTD_H is what zlib's configure step finds on macOS and Linux.
@@ -130,7 +140,8 @@ static const char *const CURL_FLAGS[] = {
 // server that answers HTTP/2.
 static const char *const LIBMC_FLAGS[] = {
     "-Iinclude", "-Ideps/cyaml", "-Ideps/utf8proc", "-Ideps/yyjson", "-Ideps/curl/include", "-DCURL_STATICLIB",
-    "-Ideps/cacert", "-Ideps/md4c", "-Ideps/expat/lib", MBEDTLS_PUBLIC_FLAGS, NGHTTP2_PUBLIC_FLAGS,
+    "-Ideps/cacert", "-Ideps/md4c", "-Ideps/expat/lib", "-Ideps/llhttp/include", "-Ideps/zlib", MBEDTLS_PUBLIC_FLAGS,
+    NGHTTP2_PUBLIC_FLAGS,
 };
 
 static const Dependency DEPENDENCIES[] = {
@@ -152,15 +163,17 @@ static const Dependency DEPENDENCIES[] = {
       sizeof C11_FLAGS / sizeof *C11_FLAGS, false },
     { EXPAT_DIRECTORIES, sizeof EXPAT_DIRECTORIES / sizeof *EXPAT_DIRECTORIES, EXPAT_FLAGS,
       sizeof EXPAT_FLAGS / sizeof *EXPAT_FLAGS, false },
+    { LLHTTP_DIRECTORIES, sizeof LLHTTP_DIRECTORIES / sizeof *LLHTTP_DIRECTORIES, LLHTTP_FLAGS,
+      sizeof LLHTTP_FLAGS / sizeof *LLHTTP_FLAGS, false },
     { CURL_DIRECTORIES, sizeof CURL_DIRECTORIES / sizeof *CURL_DIRECTORIES, CURL_FLAGS,
       sizeof CURL_FLAGS / sizeof *CURL_FLAGS, true },
 };
 
-// HEADER_DIRECTORIES are the dependency headers whose changes rebuild everything.
-static const char *const HEADER_DIRECTORIES[] = {
-    "deps/cyaml", "deps/utf8proc", "deps/yyjson", "deps/curl/include/curl", "deps/mbedtls/include/mbedtls",
-    "deps/mbedtls/tf-psa-crypto/include/psa", "deps/nghttp2/lib/includes/nghttp2", "deps/zlib", "deps/cacert",
-    "deps/md4c", "deps/expat/lib", "src/encoding", "src/net",
+// DEPENDENCY_INPUTS shape what the dependencies compile to: deps.lock pins their sources and headers, and the
+// rest is their configuration that lives in libmc. A change to any of them rebuilds everything.
+static const char *const DEPENDENCY_INPUTS[] = {
+    "deps.lock", "src/net/mbedtls_user_config.h", "src/encoding/expat_config.h", "src/net/curl/linux/curl_config.h",
+    "src/net/curl/macos/curl_config.h", "src/net/curl/macos/sdk/SystemConfiguration/SCDynamicStoreCopySpecific.h",
 };
 
 static void command_push(Command *command, const char *item)
@@ -251,6 +264,8 @@ static void list_files(FileList *list, const char *directory, const char *extens
     closedir(dir);
 }
 
+// newest_header_mtime is the newest of libmc's own headers. The dependencies' headers change only with
+// deps.lock, which the fingerprint covers.
 static time_t newest_header_mtime(void)
 {
     FileList headers = { 0 };
@@ -261,10 +276,6 @@ static time_t newest_header_mtime(void)
         snprintf(directory, sizeof directory, "src/%s", AREAS[i]);
         list_files(&headers, directory, ".h");
     }
-    for (size_t i = 0; i < sizeof HEADER_DIRECTORIES / sizeof *HEADER_DIRECTORIES; i++) {
-        list_files(&headers, HEADER_DIRECTORIES[i], ".h");
-    }
-    list_files(&headers, "tests", ".h");
     time_t newest = 0;
     for (size_t i = 0; i < headers.count; i++) {
         time_t t = mtime_of(headers.items[i]);
@@ -274,7 +285,7 @@ static time_t newest_header_mtime(void)
 }
 
 typedef struct {
-    bool release;
+    Flavor flavor;
     // dependency is the vendored library being compiled, NULL for libmc's own sources.
     const Dependency *dependency;
     const Target *target;
@@ -307,7 +318,7 @@ static void push_compiler(Command *command, const Build *build)
 // Sanitizers need the host's runtime, so cross builds only compile.
 static bool sanitized(const Build *build)
 {
-    return !build->release && build->target == NULL;
+    return build->flavor != FLAVOR_RELEASE && build->target == NULL;
 }
 
 static void object_path(char *out, const char *obj_dir, const char *source)
@@ -359,12 +370,16 @@ static void push_compile_command(Command *command, const Build *build)
         command_push_many(command, WARNING_FLAGS, sizeof WARNING_FLAGS / sizeof *WARNING_FLAGS);
         command_push_many(command, LIBMC_FLAGS, sizeof LIBMC_FLAGS / sizeof *LIBMC_FLAGS);
     }
-    if (build->release) {
+    if (build->flavor == FLAVOR_RELEASE) {
         command_push_many(command, RELEASE_FLAGS, sizeof RELEASE_FLAGS / sizeof *RELEASE_FLAGS);
-    } else if (sanitized(build)) {
-        command_push_many(command, DEBUG_FLAGS, sizeof DEBUG_FLAGS / sizeof *DEBUG_FLAGS);
-    } else {
+    } else if (!sanitized(build)) {
         command_push(command, "-g");
+    } else if (build->flavor == FLAVOR_FUZZ) {
+        command_push_many(command, FUZZ_FLAGS, sizeof FUZZ_FLAGS / sizeof *FUZZ_FLAGS);
+    } else if (build->flavor == FLAVOR_TSAN) {
+        command_push_many(command, TSAN_FLAGS, sizeof TSAN_FLAGS / sizeof *TSAN_FLAGS);
+    } else {
+        command_push_many(command, DEBUG_FLAGS, sizeof DEBUG_FLAGS / sizeof *DEBUG_FLAGS);
     }
 }
 
@@ -752,8 +767,18 @@ static void fetch_dependencies(void)
     fclose(lock);
 }
 
-// fingerprint describes what shapes objects besides their sources and headers:
-// the compiler's version and the compile command.
+static void append_line(char *out, size_t size, size_t *at, const char *line)
+{
+    int n = snprintf(out + *at, size - *at, "%s\n", line);
+    if (n < 0 || (size_t)n >= size - *at) {
+        fprintf(stderr, "build: fingerprint too long\n");
+        exit(2);
+    }
+    *at += (size_t)n;
+}
+
+// fingerprint describes what shapes objects besides libmc's sources and headers: the compiler's version,
+// every compile command and the DEPENDENCY_INPUTS.
 static void fingerprint(const Build *build, char *out, size_t size)
 {
     // The version does not depend on the target, and zig cc rejects the glibc version in one with --version.
@@ -772,11 +797,25 @@ static void fingerprint(const Build *build, char *out, size_t size)
         version[fread(version, 1, sizeof version - 1, pipe)] = '\0';
         pclose(pipe);
     }
-    Command compile_command = { 0 };
-    push_compile_command(&compile_command, build);
-    char flags[FINGERPRINT_LEN / 2];
-    command_text(&compile_command, flags, sizeof flags);
-    snprintf(out, size, "%s%s\n", version, flags);
+    size_t at = 0;
+    append_line(out, size, &at, version);
+    Build each = *build;
+    size_t dependency_count = sizeof DEPENDENCIES / sizeof *DEPENDENCIES;
+    for (size_t i = 0; i <= dependency_count; i++) {
+        each.dependency = i < dependency_count ? &DEPENDENCIES[i] : NULL;
+        Command compile_command = { 0 };
+        push_compile_command(&compile_command, &each);
+        char text[FINGERPRINT_LEN / 4];
+        command_text(&compile_command, text, sizeof text);
+        append_line(out, size, &at, text);
+    }
+    for (size_t i = 0; i < sizeof DEPENDENCY_INPUTS / sizeof *DEPENDENCY_INPUTS; i++) {
+        char hex[SHA256_HEX_LEN + 1];
+        hash_file(DEPENDENCY_INPUTS[i], hex);
+        char line[PATH_MAX_LEN + SHA256_HEX_LEN + 2];
+        snprintf(line, sizeof line, "%s %s", DEPENDENCY_INPUTS[i], hex);
+        append_line(out, size, &at, line);
+    }
 }
 
 // discard_stale_objects removes the objects when the fingerprint changed since they were built.
@@ -862,10 +901,14 @@ static void jobs_run(Jobs *jobs)
     }
 }
 
-// compile queues a compile of source into object unless object is current.
+// compile queues a compile of source into object unless object is current. A dependency's object is
+// current once it exists: its inputs change only with the fingerprint, which discards it.
 static void compile(const Build *build, const char *source, const char *object, Jobs *jobs)
 {
-    if (mtime_of(object) > mtime_of(source) && mtime_of(object) > build->headers_mtime) {
+    bool current = build->dependency != NULL
+                       ? mtime_of(object) > 0
+                       : mtime_of(object) > mtime_of(source) && mtime_of(object) > build->headers_mtime;
+    if (current) {
         return;
     }
     if (jobs->count == MAX_FILES) {
@@ -957,61 +1000,47 @@ static void build_library(const Build *build, FileList *objects, char *library_o
     write_text(members_path, members);
 }
 
+// The tests are one translation unit, tests/main.c, which includes every test file. Compiling and
+// linking it on every run takes about a second, so nothing tracks what it depends on.
 static int build_and_run_tests(const Build *build)
 {
     FileList objects = { 0 };
     char library[PATH_MAX_LEN];
     build_library(build, &objects, library);
-    Build tests = *build;
-    snprintf(tests.obj_dir, sizeof tests.obj_dir, "%s/tests", build->obj_dir);
-    mkdir_p(tests.obj_dir);
-    FileList test_objects = { 0 };
-    Jobs *jobs = jobs_create();
-    compile_directory(&tests, "tests", &test_objects, jobs);
-    jobs_run(jobs);
-    free(jobs);
-
     char binary[PATH_MAX_LEN];
     snprintf(binary, sizeof binary, "%s/tests", build->out_dir);
-    if (mtime_of(binary) <= newest_of(&test_objects) || mtime_of(binary) <= mtime_of(library)) {
-        Command command = { 0 };
-        push_compiler(&command, build);
-        if (sanitized(build)) {
-            command_push(&command, "-fsanitize=address,undefined");
-        }
-        for (size_t i = 0; i < test_objects.count; i++) {
-            command_push(&command, test_objects.items[i]);
-        }
-        command_push(&command, library);
-        command_push(&command, "-lpthread");
-        command_push(&command, "-lm");
+    Command command = { 0 };
+    push_compile_command(&command, build);
+    command_push(&command, "tests/main.c");
+    command_push(&command, library);
+    command_push(&command, "-lpthread");
+    command_push(&command, "-lm");
 #ifdef __APPLE__
-        // File watching uses CoreServices; curl asks SystemConfiguration for the proxies once, so that
-        // NAT64 address synthesis works.
-        static const char *const FRAMEWORKS[] = { "CoreServices", "SystemConfiguration", "CoreFoundation" };
-        for (size_t i = 0; i < sizeof FRAMEWORKS / sizeof *FRAMEWORKS; i++) {
-            command_push(&command, "-framework");
-            command_push(&command, FRAMEWORKS[i]);
-        }
-#endif
-        command_push(&command, "-o");
-        command_push(&command, binary);
-        run_or_die(&command);
+    // File watching uses CoreServices; curl asks SystemConfiguration for the proxies once, so that
+    // NAT64 address synthesis works.
+    static const char *const FRAMEWORKS[] = { "CoreServices", "SystemConfiguration", "CoreFoundation" };
+    for (size_t i = 0; i < sizeof FRAMEWORKS / sizeof *FRAMEWORKS; i++) {
+        command_push(&command, "-framework");
+        command_push(&command, FRAMEWORKS[i]);
     }
+#endif
+    command_push(&command, "-o");
+    command_push(&command, binary);
+    run_or_die(&command);
     Command run = { 0 };
     command_push(&run, binary);
     return command_run(&run);
 }
 
-static void configure(Build *build, bool release, const Target *target)
+static void configure(Build *build, Flavor flavor, const Target *target)
 {
-    build->release = release;
+    build->flavor = flavor;
     build->dependency = NULL;
     build->target = target;
     snprintf(build->curl_config_flag, sizeof build->curl_config_flag, "-Isrc/net/curl/%s", build_os(build));
     build->headers_mtime = newest_header_mtime();
     snprintf(build->out_dir, sizeof build->out_dir, "out/%s%s%s", target != NULL ? target->name : "",
-             target != NULL ? "/" : "", release ? "release" : "debug");
+             target != NULL ? "/" : "", FLAVOR_NAMES[flavor]);
     snprintf(build->obj_dir, sizeof build->obj_dir, "%s/obj", build->out_dir);
 }
 
@@ -1019,7 +1048,7 @@ static int run_cross(void)
 {
     for (size_t i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++) {
         Build build;
-        configure(&build, true, &TARGETS[i]);
+        configure(&build, FLAVOR_RELEASE, &TARGETS[i]);
         FileList objects = { 0 };
         char library[PATH_MAX_LEN];
         build_library(&build, &objects, library);
@@ -1083,9 +1112,14 @@ int main(int argc, char **argv)
         return run_cross();
     }
 
+    Flavor flavor = FLAVOR_DEBUG;
+    for (size_t i = 0; i < sizeof FLAVOR_NAMES / sizeof *FLAVOR_NAMES; i++) {
+        flavor = strcmp(mode, FLAVOR_NAMES[i]) == 0 ? (Flavor)i : flavor;
+    }
     Build build;
-    configure(&build, strcmp(mode, "release") == 0, NULL);
-    if (strcmp(mode, "build") == 0 || strcmp(mode, "release") == 0) {
+    configure(&build, flavor, NULL);
+    if (strcmp(mode, "build") == 0 || strcmp(mode, "release") == 0 || strcmp(mode, "fuzz") == 0 ||
+        strcmp(mode, "tsan") == 0) {
         FileList objects = { 0 };
         char library[PATH_MAX_LEN];
         build_library(&build, &objects, library);
@@ -1097,9 +1131,12 @@ int main(int argc, char **argv)
     }
     if (strcmp(mode, "check") == 0) {
         int status = run_check();
-        return status != 0 ? status : build_and_run_tests(&build);
+        status = status != 0 ? status : build_and_run_tests(&build);
+        Build threads;
+        configure(&threads, FLAVOR_TSAN, NULL);
+        return status != 0 ? status : build_and_run_tests(&threads);
     }
 
-    fprintf(stderr, "build: unknown mode '%s'\nmodes: build, release, test, check, cross, clean, hash <dir>\n", mode);
+    fprintf(stderr, "build: unknown mode '%s'\nmodes: build, release, fuzz, tsan, test, check, cross, clean, hash <dir>\n", mode);
     return 2;
 }
