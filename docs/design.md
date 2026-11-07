@@ -319,10 +319,10 @@ dbox/
   deps/libmc                arenas, strings, errors, containers, YAML and JSON, logging, threads, file watching, login services, HTTP, S3 and every OS call
   deps/sqlite               vendored at the version in deps.lock
   tests/test_dbox.c         config, index, ignore, engine scenarios, daemon
-  tests/test_s3.c           the S3 store against the compose MinIOs
-  docker-compose.yml        two MinIO instances for local dev and tests
+  tests/test_s3.c           the S3 store against the compose SeaweedFS instances
+  docker-compose.yml        two SeaweedFS instances for local dev and tests
   CMakeLists.txt, CMakePresets.json
-  tools/minio.sh            starts the MinIOs and creates their buckets
+  tools/s3.sh               starts the SeaweedFS instances, which create their buckets
 ```
 
 Threads replace goroutines: a fixed set of primary workers reads the queue,
@@ -340,7 +340,7 @@ freed piecemeal.
 `src/store.h` exposes a five-method interface (`put`, `get`, `remove`, `list`,
 `head`), plus `close` for what a store holds besides its arena, with `s3` and
 `disk` implementations. Unit tests use `disk`
-stores in temp directories; MinIO is only needed for the integration suite. Mirror copy
+stores in temp directories; SeaweedFS is only needed for the integration suite. Mirror copy
 is `Get` from one store piped into `Put` on another, so adding a new backend
 kind (SFTP, WebDAV) is one file and never touches the sync logic.
 
@@ -433,9 +433,9 @@ WantedBy=default.target
   backfill → promote → detach, mirror adopts copies made by other tools,
   mirror falls back to the local file, and the live daemon handling a new
   directory, an editor-style rename save, a remote change and a removed tree.
-- **Integration** (`tools/minio.sh && ctest --preset integration`): the S3 store against
-  both compose MinIOs, metadata round trip, not-found mapping, and a 12 MiB
-  multipart copy streamed from one MinIO's `Get` into the other's `Put`.
+- **Integration** (`tools/s3.sh && ctest --preset integration`): the S3 store against
+  both compose SeaweedFS instances, metadata round trip, not-found mapping, and a 12 MiB
+  multipart copy streamed from one instance's `Get` into the other's `Put`.
 - **Platform:** CI builds and tests on linux-x86_64, linux-aarch64 and macos-aarch64. The watcher
   tests are the only ones that differ meaningfully between inotify and FSEvents.
   The debouncer, the watcher backends and the login services are tested in

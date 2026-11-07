@@ -204,8 +204,8 @@ on Linux a systemd user unit (`journalctl --user -u dbox`). It starts the
 ```sh
 cmake --workflow --preset debug      # configure, build and run the unit tests under ASan and UBSan
 cmake --build --preset check         # clang-tidy over src/
-tools/minio.sh                       # two MinIOs on :9200 and :9300 with a dbox bucket each
-ctest --preset integration           # the S3 store against both MinIOs
+tools/s3.sh                          # two SeaweedFS instances on :9200 and :9300 with a dbox bucket each
+ctest --preset integration           # the S3 store against both of them
 out/debug/dbox run --config dev.config.yml   # daemon syncing ./tmp/box
 ```
 

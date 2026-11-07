@@ -107,7 +107,7 @@ add_executable(test_dbox tests/test_dbox.c)
 target_link_libraries(test_dbox PRIVATE dbox_core)
 add_test(NAME unit COMMAND test_dbox)
 
-# The S3 store against the two MinIOs from docker-compose.yml; `tools/minio.sh` starts them.
+# The S3 store against the two SeaweedFS instances from docker-compose.yml; `tools/s3.sh` starts them.
 add_executable(test_s3 tests/test_s3.c)
 target_link_libraries(test_s3 PRIVATE dbox_core)
 add_test(NAME integration COMMAND test_s3)

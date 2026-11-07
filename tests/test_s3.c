@@ -1,4 +1,4 @@
-/* The S3 store against the two docker-compose MinIOs; run `tools/minio.sh` first. */
+/* The S3 store against the two docker-compose SeaweedFS instances; run `tools/s3.sh` first. */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -35,8 +35,8 @@ typedef struct {
         }                                                                                                                                         \
     } while (0)
 
-/* minio returns a store on the docker-compose MinIO under a fresh prefix. */
-static Store *minio(T *t, const char *endpoint) {
+/* compose_store returns a store on a docker-compose SeaweedFS under a fresh prefix. */
+static Store *compose_store(T *t, const char *endpoint) {
     StoreConfig config = {
         .name = S("m"),
         .kind = KIND_S3,
@@ -45,8 +45,8 @@ static Store *minio(T *t, const char *endpoint) {
         .region = S("us-east-1"),
         .endpoint = S(endpoint),
         .path_style = true,
-        .access_key = S("minioadmin"),
-        .secret_key = S("minioadmin"),
+        .access_key = S("dbox"),
+        .secret_key = S("dbox-secret"),
         .storage_class = S(""),
         .prefix = str_format(t->arena, "test-%lld/", (long long)clock_wall_ns()),
     };
@@ -57,7 +57,7 @@ static Store *minio(T *t, const char *endpoint) {
         exit(1);
     }
     if (s3_store_create_bucket(s, &t->cancel, t->arena, &err) != ERR_OK) {
-        fprintf(stderr, "%s: %s (run `tools/minio.sh`)\n", endpoint, err.msg);
+        fprintf(stderr, "%s: %s (run `tools/s3.sh`)\n", endpoint, err.msg);
         exit(1);
     }
     if (t->opened_count < countof(t->opened)) t->opened[t->opened_count++] = s;
@@ -81,7 +81,7 @@ static String read_fd(T *t, int fd) {
 }
 
 static void test_round_trip_keeps_metadata(T *t) {
-    Store *s = minio(t, "http://localhost:9200");
+    Store *s = compose_store(t, "http://localhost:9200");
     Err err;
     Error checked = store_check(&t->cancel, t->arena, s, &err);
     CHECK(checked == ERR_OK);
@@ -126,7 +126,7 @@ static void test_round_trip_keeps_metadata(T *t) {
 }
 
 static void test_multipart_copy_between_stores(T *t) {
-    Store *a = minio(t, "http://localhost:9200"), *b = minio(t, "http://localhost:9300");
+    Store *a = compose_store(t, "http://localhost:9200"), *b = compose_store(t, "http://localhost:9300");
     const int64_t size = 12 << 20;
     String key = S("big.bin");
     Err err;
@@ -163,7 +163,7 @@ static void test_multipart_copy_between_stores(T *t) {
 }
 
 static void test_keys_with_special_characters(T *t) {
-    Store *s = minio(t, "http://localhost:9200");
+    Store *s = compose_store(t, "http://localhost:9200");
     Err err;
     String key = S("dir with spaces/caf\xc3\xa9 & co+plus=eq.txt");
     int fd = file_with(t, S("x"));

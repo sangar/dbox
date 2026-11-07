@@ -1,25 +1,25 @@
-# Local development against the MinIOs from tools/minio.sh. Run with:
+# Local development against the SeaweedFS instances from tools/s3.sh. Run with:
 #   out/debug/dbox run --config dev.config.yml
 stores:
-  minio-a:
+  s3-a:
     kind: s3
     role: primary
     bucket: dbox
     region: us-east-1
     endpoint: http://localhost:9200
     path_style: true
-    access_key: minioadmin
-    secret_key: minioadmin
+    access_key: dbox
+    secret_key: dbox-secret
 
-  minio-b:
+  s3-b:
     kind: s3
     role: mirror
     bucket: dbox
     region: us-east-1
     endpoint: http://localhost:9300
     path_style: true
-    access_key: minioadmin
-    secret_key: minioadmin
+    access_key: dbox
+    secret_key: dbox-secret
 
 sync:
   root: ./tmp/box

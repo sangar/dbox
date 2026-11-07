@@ -1,29 +1,29 @@
-# Two MinIO instances so migrating between stores can be tried locally.
-# minio-a: API http://localhost:9200, console http://localhost:9201
-# minio-b: API http://localhost:9300, console http://localhost:9301
-# Both use minioadmin / minioadmin. `make minio` starts them and creates a "dbox" bucket in each.
+# Two SeaweedFS instances so migrating between stores can be tried locally.
+# s3-a: http://localhost:9200, s3-b: http://localhost:9300, each with a "dbox" bucket.
+# Both use dbox / dbox-secret. `tools/s3.sh` starts them.
 services:
-  minio-a:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
-    ports: ["9200:9000", "9201:9001"]
-    environment: &creds
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes: [minio-a:/data]
+  s3-a:
+    image: chrislusf/seaweedfs:4.52
+    command: mini -dir=/data
+    ports: ["9200:8333"]
+    environment: &env
+      AWS_ACCESS_KEY_ID: dbox
+      AWS_SECRET_ACCESS_KEY: dbox-secret
+      S3_BUCKET: dbox
+    volumes: [s3-a:/data]
     healthcheck: &health
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-so", "/dev/null", "http://localhost:8333/"]
       interval: 2s
       retries: 30
 
-  minio-b:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
-    ports: ["9300:9000", "9301:9001"]
-    environment: *creds
-    volumes: [minio-b:/data]
+  s3-b:
+    image: chrislusf/seaweedfs:4.52
+    command: mini -dir=/data
+    ports: ["9300:8333"]
+    environment: *env
+    volumes: [s3-b:/data]
     healthcheck: *health
 
 volumes:
-  minio-a:
-  minio-b:
+  s3-a:
+  s3-b:
